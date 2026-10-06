@@ -3,6 +3,7 @@
 
 # ---------- Stage 1: build ----------
 FROM node:22-alpine AS build
+LABEL stage=build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
