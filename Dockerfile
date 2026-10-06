@@ -1,22 +1,27 @@
 # Montage Studio - production image
 # Vite 8 requires Node >= 20.19 / 22.12
-FROM node:22-alpine
 
+# ---------- Stage 1: build ----------
+FROM node:22-alpine AS build
 WORKDIR /app
-
-# Install dependencies (devDependencies are needed: `vite preview` loads vite.config.js)
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
-
-# Copy sources and build the optimized bundle
 COPY . .
 RUN npm run build
 
+# ---------- Stage 2: runtime (slim) ----------
+# Only dist/ + vite (+ react plugin, imported by vite.config.js) are needed:
+# `vite preview` serves the bundle and the media/AI proxy middlewares.
+FROM node:22-alpine
+WORKDIR /app
 ENV NODE_ENV=production
+RUN echo '{"name":"video-montage-editor-runtime","private":true,"type":"module"}' > package.json \
+ && npm install --no-audit --no-fund vite@8.3.2 @vitejs/plugin-react@6.1.1 \
+ && npm cache clean --force
+COPY --from=build /app/dist ./dist
+COPY vite.config.js ./
+RUN mkdir -p projects_media
+
 EXPOSE 4173
-
-# Media downloaded by the app is persisted through a volume
 VOLUME ["/app/projects_media"]
-
-# `vite preview` serves dist/ + the media/AI proxy middlewares from vite.config.js
 CMD ["npx", "vite", "preview", "--host", "0.0.0.0", "--port", "4173"]

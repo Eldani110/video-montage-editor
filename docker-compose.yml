@@ -1,13 +1,22 @@
+version: '3.8'
+
 services:
-  video-montage-editor:
-    build: .
-    image: video-montage-editor:latest
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: video-montage-editor
     restart: unless-stopped
+    # Sin puertos publicados al host: el tráfico entra por nginx-proxy-manager
+    # (80/443) a través de la red interna npm_net -> video-montage-editor:4173
     environment:
-      - NODE_ENV=production
-    # Only bound to localhost: the host reverse proxy (Nginx) publishes it with HTTPS
-    ports:
-      - "127.0.0.1:4173:4173"
+      NODE_ENV: production
     volumes:
+      # Persiste los videos B-roll descargados entre reinicios/redeploys
       - ./projects_media:/app/projects_media
+    networks:
+      - npm_net
+
+networks:
+  npm_net:
+    external: true
