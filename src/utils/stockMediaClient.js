@@ -1,0 +1,369 @@
+/**
+ * Stock Media API Client & Local Disk Downloader
+ * Connects to Pexels / Pixabay APIs via local Vite server proxy,
+ * downloads matching videos/images directly to the project's local disk folder,
+ * and registers them as standard project resources without touching IndexedDB.
+ */
+
+const STORAGE_KEY_STOCK = 'montage_stock_config';
+const API_BASE = typeof window !== 'undefined' ? '' : 'http://localhost:5173';
+
+export function getSavedStockConfig() {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const raw = localStorage.getItem(STORAGE_KEY_STOCK);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        // If preferred provider has no API key set, auto-switch to 'web' (Bing + Wikimedia)
+        // so user receives real matching photos and videos instead of failing searches!
+        if ((!parsed.pexelsApiKey && parsed.preferredProvider === 'pexels') ||
+            (!parsed.pixabayApiKey && parsed.preferredProvider === 'pixabay')) {
+          parsed.preferredProvider = 'web';
+        }
+        return parsed;
+      }
+    }
+  } catch (err) {
+    console.warn('Could not read stock config from localStorage:', err);
+  }
+  return {
+    pexelsApiKey: '',
+    pixabayApiKey: '',
+    preferredProvider: 'web', // Default to 'web' (Bing Images + Wikimedia Commons) - 100% Free & No API Key needed
+    preferredOrientation: 'landscape', // 'landscape' | 'portrait'
+    preferredMediaType: 'mixed', // 'mixed' (Combinada) | 'video' (Solo Videos) | 'image' (Solo Imágenes)
+    targetTrack: 'v2', // 'v2' (Overlay / B-roll track) | 'v1'
+    autoMuteAudio: true
+  };
+}
+
+export function saveStockConfig(config) {
+  try {
+    localStorage.setItem(STORAGE_KEY_STOCK, JSON.stringify(config));
+  } catch (err) {
+    console.warn('Could not save stock config to localStorage:', err);
+  }
+}
+
+/**
+ * Comprehensive semantic dictionary and category matching for stock video catalogs
+ */
+const CATEGORY_MAP = [
+  {
+    regex: /\b(ia|ai|laia|inteligencia artificial|algoritmo|machine learning|c[oó]mputo|computaci[oó]n|red neuronal|gpu|chip|hardware)\b/i,
+    primary: 'artificial intelligence AI technology',
+    composite: 'artificial intelligence'
+  },
+  {
+    regex: /\b(servidor|servidores|data center|centro de datos|rack|fibra|nube|cloud)\b/i,
+    primary: 'data center servers rack technology',
+    composite: 'data center servers'
+  },
+  {
+    regex: /\b(alta tensi[oó]n|el[eé]ctric|energ[ií]a|voltaje|torre el[eé]ctrica|subestaci[oó]n|cables|potencia|solar|e[oó]lica)\b/i,
+    primary: 'power transmission electricity grid',
+    composite: 'power electricity grid'
+  },
+  {
+    regex: /\b(dinero|inversi[oó]n|presupuesto|d[oó]lar|costo|millon|millones|finanzas|financiera|negocio|reuni[oó]n corporativa)\b/i,
+    primary: 'business finance investment office meeting',
+    composite: 'business finance investment'
+  },
+  {
+    regex: /\b(problema|dilema|desaf[ií]o|crisis|obst[aá]culo|cuello de botella|dif[ií]cil|conflicto|riesgo)\b/i,
+    primary: 'technology challenge problem solving decision',
+    composite: 'challenge problem technology'
+  },
+  {
+    regex: /\b(construcci[oó]n|construir|obra|arquitect|ingenier[ií]a|edificio|faena)\b/i,
+    primary: 'construction engineering architecture site',
+    composite: 'construction engineering'
+  },
+  {
+    regex: /\b(persona|personas|gente|sociedad|humano|equipo|ciudad|tr[aá]fico|urbano)\b/i,
+    primary: 'city modern skyline people crowd',
+    composite: 'modern city people'
+  },
+  {
+    regex: /\b(futuro|avance|innovaci[oó]n|ciencia|laboratorio|investigaci[oó]n)\b/i,
+    primary: 'futuristic innovation technology science',
+    composite: 'futuristic technology'
+  },
+  {
+    regex: /\b(computadora|pantalla|pantallas|c[oó]digo|programaci[oó]n|datos|software|gr[aá]fico)\b/i,
+    primary: 'computer code screen analytics programming',
+    composite: 'data screen code'
+  },
+  {
+    regex: /\b(dron|drone|a[eé]re[ao]|panor[aá]mica|cenital|horizonte|vista)\b/i,
+    primary: 'drone aerial view cinematic landscape',
+    composite: 'drone aerial cinematic'
+  }
+];
+
+export function translateQueryForStock(query) {
+  if (!query) return 'technology business abstract';
+  const clean = query.trim().toLowerCase();
+
+  // 1. Detect all matching semantic domains (multi-concept support)
+  const matchedCategories = [];
+  for (const cat of CATEGORY_MAP) {
+    if (cat.regex.test(clean)) {
+      matchedCategories.push(cat);
+    }
+  }
+
+  // If multiple concepts matched (e.g. IA + problema or Servidores + Energía)
+  if (matchedCategories.length >= 2) {
+    const combined = matchedCategories.slice(0, 2).map(c => c.composite).join(' ');
+    return combined;
+  }
+
+  // If a single concept matched, return its rich search string
+  if (matchedCategories.length === 1) {
+    return matchedCategories[0].primary;
+  }
+
+  // 2. Remove common Spanish stop words and keep meaningful terms
+  const stopWords = new Set([
+    'de', 'la', 'que', 'el', 'en', 'y', 'a', 'los', 'del', 'se', 'las', 'por', 'un', 'para', 'con', 'no',
+    'una', 'su', 'al', 'lo', 'como', 'más', 'pero', 'sus', 'le', 'ya', 'o', 'este', 'sí', 'porque', 'esta',
+    'entre', 'cuando', 'muy', 'sin', 'sobre', 'también', 'me', 'hasta', 'hay', 'donde', 'quien', 'desde',
+    'enfrenta', 'hace', 'tiene', 'tienen', 'cada', 'todo', 'todos', 'esta', 'estos', 'estas'
+  ]);
+
+  // Keep tech 2-letter words like ia, ai, vr, ar, 3d, 4k
+  const validTwoLetter = new Set(['ia', 'ai', 'vr', 'ar', '3d', '4k', 'hd', '5g', 'it', 'pc']);
+
+  const words = clean
+    .replace(/[^\w\sáéíóúÁÉÍÓÚñÑ]/g, ' ')
+    .split(/\s+/)
+    .filter(w => (w.length > 2 || validTwoLetter.has(w)) && !stopWords.has(w));
+
+  if (words.length > 0) {
+    // Check if any word is 'ia' or 'ai' or 'laia'
+    const translatedWords = words.map(w => {
+      if (w === 'ia' || w === 'ai' || w === 'laia') return 'artificial intelligence AI';
+      if (w === 'problema') return 'problem challenge';
+      if (w === 'datos') return 'data';
+      if (w === 'servidores') return 'servers';
+      if (w === 'energia') return 'energy';
+      return w;
+    });
+    return translatedWords.slice(0, 4).join(' ');
+  }
+
+  return clean;
+}
+
+/**
+ * Extracts rich, clickable concept pills and visual tags from a scene,
+ * used both by the Explorer modal and the AI Visual Curator Agent.
+ */
+export function extractSceneConceptPills(scene) {
+  if (!scene) return [];
+  const pills = [];
+  const added = new Set();
+
+  const addPill = (label, searchTerm, icon = null) => {
+    const key = label.toLowerCase();
+    if (!added.has(key)) {
+      added.add(key);
+      pills.push({ label, searchTerm: searchTerm || label, icon });
+    }
+  };
+
+  const text = `${scene.title || ''} ${scene.scriptExcerpt || scene.scriptText || ''} ${scene.visualDescription || ''}`.toLowerCase();
+
+  // Core thematic domains
+  if (/ia|inteligencia artificial|algoritmo|machine learning|c[oó]mputo|modelo|red neuronal|gpu|chip/.test(text)) {
+    addPill('Inteligencia Artificial', 'artificial intelligence AI', '🤖');
+  }
+  if (/data center|servidor|servidores|rack|infraestructura/.test(text)) {
+    addPill('Data Center / Servidores', 'data center servers rack', '🖥️');
+  }
+  if (/alta tensi|el[eé]ctric|energ|voltaje|torre|red el[eé]ctrica|subestaci/.test(text)) {
+    addPill('Red Eléctrica / Alta Tensión', 'high voltage power lines electricity', '⚡');
+  }
+  if (/dinero|inversi|presupuesto|d[oó]lar|costo|millon|financ|empresa/.test(text)) {
+    addPill('Inversión y Negocios', 'corporate investment business finance', '📊');
+  }
+  if (/problema|crisis|dilema|desaf[ií]o|obst[aá]culo|cuello de botella|dif[ií]cil|riesgo/.test(text)) {
+    addPill('Desafío / Crisis', 'technology challenge problem solving', '🧠');
+  }
+  if (/ciudad|gente|sociedad|humano|mundo|urbano|personas|calle|amsterdam|canal/.test(text)) {
+    addPill('Ciudad y Sociedad', 'modern city crowd urban people', '🏙️');
+  }
+  if (/pantalla|c[oó]digo|gr[aá]ficos|programac|software|datos/.test(text)) {
+    addPill('Pantallas y Datos', 'data screens code analytics', '💻');
+  }
+  if (/dron|a[eé]rea|panor[aá]mica|horizonte/.test(text)) {
+    addPill('Toma Aérea', 'drone aerial view cinematic', '🚁');
+  }
+  if (/mapa|ruta|exportac|mundo|global|barco|comercio|transporte|mar[ií]timo/.test(text)) {
+    addPill('Mapa y Rutas Globales', 'world map global routes trade', '🗺️');
+  }
+
+  // Add individual keywords from scene
+  if (Array.isArray(scene.searchKeywords)) {
+    scene.searchKeywords.forEach(kw => {
+      let clean = String(kw).toLowerCase().replace(/laia/g, 'ia').trim();
+      if (clean === 'ia') {
+        addPill('IA', 'artificial intelligence AI', '✨');
+      } else if (clean.length > 2 && !['para', 'como', 'pero', 'este', 'esta', 'porque', 'enfrenta'].includes(clean)) {
+        const capitalized = clean.charAt(0).toUpperCase() + clean.slice(1);
+        addPill(capitalized, clean);
+      }
+    });
+  }
+
+  // Scene title as preset
+  if (scene.title && scene.title.length > 3) {
+    addPill(scene.title, scene.title, '🎬');
+  }
+
+  return pills.slice(0, 10);
+}
+
+/**
+ * Searches stock videos or photos via Vite server proxy with pagination
+ */
+export async function searchStockMedia({
+  query,
+  type = 'video',
+  provider = null,
+  apiKey = null,
+  orientation = 'landscape',
+  page = 1,
+  perPage = 16,
+  skipTranslation = false
+}) {
+  const cfg = getSavedStockConfig();
+  const activeProvider = provider || cfg.preferredProvider || 'pexels';
+  const activeKey = apiKey !== null ? apiKey : (activeProvider === 'pexels' ? cfg.pexelsApiKey : cfg.pixabayApiKey);
+  const activeOrientation = orientation || cfg.preferredOrientation || 'landscape';
+
+  const isWeb = activeProvider === 'web' || activeProvider === 'duckduckgo' || activeProvider === 'bing';
+  const translatedQuery = (skipTranslation || isWeb) ? query.trim() : translateQueryForStock(query);
+
+  const params = new URLSearchParams({
+    query: translatedQuery,
+    type: isWeb ? 'image' : type,
+    provider: activeProvider,
+    apiKey: activeKey || '',
+    orientation: activeOrientation,
+    page: page.toString(),
+    per_page: perPage.toString()
+  });
+
+  const response = await fetch(`${API_BASE}/api/media/search?${params.toString()}`);
+  if (!response.ok) {
+    throw new Error(`Error buscando stock media: HTTP ${response.status}`);
+  }
+
+  const data = await response.json();
+  return {
+    query: data.query,
+    originalQuery: query,
+    translatedQuery,
+    page: data.page || page,
+    perPage: data.perPage || perPage,
+    totalResults: data.totalResults || (data.results || []).length,
+    hasMore: Boolean(data.hasMore),
+    provider: data.provider,
+    hasApiKey: data.hasApiKey,
+    results: data.results || []
+  };
+}
+
+/**
+ * Downloads a chosen stock media item directly to the project's disk folder
+ * Returns metadata and static /media-library/ URL
+ */
+export async function downloadStockMediaToDisk({
+  mediaItem,
+  projectId = 'default',
+  scene = null,
+  customFilename = null
+}) {
+  if (!mediaItem || !mediaItem.downloadUrl) {
+    throw new Error('Elemento multimedia no contiene URL de descarga');
+  }
+
+  const cleanTitle = (scene?.title || 'toma')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]/g, '_')
+    .replace(/_+/g, '_')
+    .slice(0, 18);
+
+  const mediaIdHash = String(mediaItem.id || 'res').replace(/[^a-zA-Z0-9]/g, '').slice(-8);
+  const timeSalt = Date.now().toString(36).slice(-5);
+
+  const filename = customFilename || (scene
+    ? `broll_e${scene.sceneNumber || 1}_${cleanTitle}_${mediaIdHash}_${timeSalt}`
+    : `broll_${mediaIdHash}_${timeSalt}`);
+
+  const payload = {
+    url: mediaItem.downloadUrl,
+    fallbackUrl: mediaItem.fallbackUrl || mediaItem.thumbnail || null,
+    filename,
+    projectId,
+    type: mediaItem.type || 'video'
+  };
+
+  const response = await fetch(`${API_BASE}/api/media/download`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(errorData.error || `Error al descargar a disco: HTTP ${response.status}`);
+  }
+
+  const result = await response.json();
+
+  // Construct a standard Project Asset Object (No IndexedDB!)
+  const isVideo = mediaItem.type === 'video' || (result.contentType || '').includes('video');
+  const assetId = `asset_broll_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+  const cacheBuster = `?t=${Date.now()}`;
+  const freshLocalUrl = result.localUrl ? `${result.localUrl}${cacheBuster}` : result.localUrl;
+
+  const newAsset = {
+    id: assetId,
+    name: result.filename,
+    type: isVideo ? 'video' : 'image',
+    url: freshLocalUrl, // Served directly by Vite server with HTTP Range support + cache buster
+    diskPath: result.diskPath,
+    size: result.size,
+    duration: mediaItem.duration || (scene ? scene.duration : 10),
+    width: mediaItem.width || 1280,
+    height: mediaItem.height || 720,
+    thumbnail: mediaItem.thumbnail || freshLocalUrl,
+    color: isVideo ? '#06b6d4' : '#6366f1',
+    source: 'stock_api',
+    sceneId: scene ? scene.id : null,
+    isBroll: true
+  };
+
+  return {
+    asset: newAsset,
+    downloadResult: result
+  };
+}
+
+/**
+ * Checks storage directory status on host disk
+ */
+export async function getStorageDiskInfo() {
+  try {
+    const res = await fetch(`${API_BASE}/api/media/storage-info`);
+    if (res.ok) return await res.json();
+  } catch (err) {
+    console.warn('Could not query storage info:', err);
+  }
+  return { exists: false, totalFiles: 0, totalBytes: 0, formattedSize: '0.00 MB' };
+}
