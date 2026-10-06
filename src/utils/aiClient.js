@@ -26,6 +26,20 @@ export const DEFAULT_AI_CONFIG = {
 
 export const PROVIDER_PRESETS = [
   {
+    id: 'gemini',
+    name: 'Google Gemini (AI Studio)',
+    defaultUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
+    keyPlaceholder: 'AIzaSy...',
+    keyHelpUrl: 'https://aistudio.google.com/app/apikey',
+    description: 'Modelos de Google AI Studio (Gemini 2.5 Flash, 2.0 Flash, 1.5 Pro) con respuesta ultra veloz.',
+    defaultModels: [
+      'gemini-2.5-flash',
+      'gemini-2.0-flash',
+      'gemini-1.5-flash',
+      'gemini-1.5-pro'
+    ]
+  },
+  {
     id: 'ollama_cloud',
     name: 'Ollama Cloud / Remoto',
     defaultUrl: 'https://ollama.com',
@@ -87,8 +101,28 @@ export const PROVIDER_PRESETS = [
 export function getSavedAiConfig() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY_AI_CONFIG);
-    if (!raw) return DEFAULT_AI_CONFIG;
+    const envGeminiKey = import.meta.env.VITE_GEMINI_API_KEY;
+
+    if (!raw) {
+      if (envGeminiKey) {
+        const geminiPreset = PROVIDER_PRESETS.find(p => p.id === 'gemini');
+        return {
+          ...DEFAULT_AI_CONFIG,
+          provider: 'gemini',
+          baseUrl: geminiPreset.defaultUrl,
+          apiKey: envGeminiKey,
+          selectedModel: geminiPreset.defaultModels[0],
+          availableModels: geminiPreset.defaultModels
+        };
+      }
+      return DEFAULT_AI_CONFIG;
+    }
     const parsed = JSON.parse(raw);
+
+    // If configured provider is gemini but has no apiKey and env has one, supply it
+    if (parsed.provider === 'gemini' && !parsed.apiKey && envGeminiKey) {
+      parsed.apiKey = envGeminiKey;
+    }
 
     // Auto-heal truncated or legacy Ollama key from previous sessions
     if (parsed.apiKey && (parsed.apiKey.includes('f25af7d60a3470cb75ca28538bab58d') || parsed.apiKey.length === 56)) {
@@ -383,15 +417,20 @@ export async function sendAiChatCompletion({
 
       // Determine endpoints to try: Ollama native (/api/chat) or OpenAI standard (/v1/chat/completions)
       const isOllamaCloud = cleanBase.includes('ollama.com');
+      const isGoogleApi = normUrl.includes('googleapis.com') || normUrl.endsWith('/openai');
+      const isOpenAiDirect = normUrl.endsWith('/v1') || isGoogleApi;
+      const openAiEndpoint = isOpenAiDirect ? `${normUrl}/chat/completions` : `${normUrl}/v1/chat/completions`;
+
       const endpointsToTry = isOllamaCloud
         ? [`${cleanBase}/api/chat`]
         : isOllama
         ? [
             `${cleanBase}/api/chat`,
-            normUrl.endsWith('/v1') ? `${normUrl}/chat/completions` : `${normUrl}/v1/chat/completions`
+            openAiEndpoint
           ]
         : [
-            normUrl.endsWith('/v1') ? `${normUrl}/chat/completions` : `${normUrl}/v1/chat/completions`,
+            openAiEndpoint,
+            `${normUrl}/chat/completions`,
             `${cleanBase}/api/chat`
           ];
 
@@ -407,7 +446,7 @@ export async function sendAiChatCompletion({
               model,
               messages: messagesOllama,
               stream: stream !== false,
-              think: isThinkingEnabled, // Top-level official Ollama parameter: false completely suppresses internal <think> deliberation
+              think: isThinkingEnabled, // Top-level official Ollama parameter
               format: (jsonMode && (!isReasoningModel || !isThinkingEnabled)) ? 'json' : undefined,
               options: {
                 temperature: temperature ?? 0.3,
@@ -419,10 +458,10 @@ export async function sendAiChatCompletion({
               messages: messagesOpenAI,
               stream: stream !== false,
               temperature: temperature ?? 0.3,
-              think: isThinkingEnabled,
-              ...(isThinkingEnabled
+              ...(isOllama ? { think: isThinkingEnabled } : {}),
+              ...(!isGoogleApi && isReasoningModel && isThinkingEnabled
                 ? { reasoning_effort: effectiveThinkingMode === 'deep' ? 'high' : 'low', thinking: { type: 'enabled' } }
-                : { thinking: { type: 'disabled' } }),
+                : {}),
               ...(jsonMode && (!model.includes('reasoner') && !model.includes('-r1') || !isThinkingEnabled) ? { response_format: { type: 'json_object' } } : {})
             };
 
