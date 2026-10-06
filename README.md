@@ -57,7 +57,7 @@
 
 1. **Clonar el repositorio:**
    ```bash
-   git clone https://github.com/TU_USUARIO/video-montage-editor.git
+   git clone git@github.com:Eldani110/video-montage-editor.git
    cd video-montage-editor
    ```
 
