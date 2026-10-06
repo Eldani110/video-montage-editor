@@ -1,0 +1,13 @@
+services:
+  video-montage-editor:
+    build: .
+    image: video-montage-editor:latest
+    container_name: video-montage-editor
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+    # Only bound to localhost: the host reverse proxy (Nginx) publishes it with HTTPS
+    ports:
+      - "127.0.0.1:4173:4173"
+    volumes:
+      - ./projects_media:/app/projects_media

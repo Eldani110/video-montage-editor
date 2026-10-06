@@ -1,0 +1,16 @@
+node_modules
+dist
+dist-ssr
+projects_media
+scratch
+.git
+.github
+.env
+.env.*
+!.env.example
+*.log
+.vscode
+.idea
+.DS_Store
+Dockerfile
+docker-compose.yml

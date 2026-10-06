@@ -306,7 +306,7 @@ const CURATED_STOCK_LIBRARY = {
 };
 
 function mediaStoragePlugin() {
-  return {
+  const plugin = {
     name: 'media-storage-middleware',
     configureServer(server) {
       // 1. Static Media File Serving with HTTP Range Request Support
@@ -846,10 +846,13 @@ function mediaStoragePlugin() {
       });
     }
   };
+  // Reuse the same middlewares in `vite preview` (production container)
+  plugin.configurePreviewServer = plugin.configureServer;
+  return plugin;
 }
 
 function aiProxyPlugin() {
-  return {
+  const plugin = {
     name: 'ai-proxy-middleware',
     configureServer(server) {
       server.middlewares.use((req, res, next) => {
@@ -997,10 +1000,24 @@ function aiProxyPlugin() {
       });
     }
   };
+  // Reuse the same middlewares in `vite preview` (production container)
+  plugin.configurePreviewServer = plugin.configureServer;
+  return plugin;
 }
+
+const ALLOWED_HOSTS = [
+  'videomontageeditor.thisoftcore.com',
+  ...(process.env.ALLOWED_HOSTS ? process.env.ALLOWED_HOSTS.split(',') : []),
+];
 
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react(), mediaStoragePlugin(), aiProxyPlugin()],
+  preview: {
+    host: '0.0.0.0',
+    port: 4173,
+    strictPort: true,
+    allowedHosts: ALLOWED_HOSTS,
+  },
 })
 
