@@ -1240,7 +1240,7 @@ export function SceneDirectorModal({
                 type="button"
                 className="btn-primary"
                 onClick={() => handleApplyToTimeline(true)}
-                title="Inserta las escenas en el Storyboard, abre el panel y lanza el descargador automático de videos HD a disco (projects_media/)"
+                title="Inserta las escenas en el Storyboard, abre el panel y lanza el descargador automático de videos HD a la carpeta local del proyecto (projects_media/)"
                 style={{
                   background: 'linear-gradient(135deg, #06b6d4, #6366f1)',
                   boxShadow: '0 4px 14px rgba(6, 182, 212, 0.4)',

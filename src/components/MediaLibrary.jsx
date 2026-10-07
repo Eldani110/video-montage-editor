@@ -1,18 +1,27 @@
 import React, { useRef, useState, useEffect } from 'react';
-import { Upload, Image as ImageIcon, Music, Film, Plus, Trash2, CheckCircle2, HardDrive } from 'lucide-react';
+import { Upload, Image as ImageIcon, Music, Film, Plus, Trash2, CheckCircle2, HardDrive, FolderCog } from 'lucide-react';
 import { saveMediaBlob } from '../utils/storage';
-import { getStorageDiskInfo } from '../utils/stockMediaClient';
+import { getStorageDiskInfo, getProjectMediaFolder } from '../utils/stockMediaClient';
 import { extractWaveformData } from '../utils/audioWaveform';
 
-export const MediaLibrary = React.memo(function MediaLibrary({ assets = [], onAddAsset, onDeleteAsset, onAddToTimeline }) {
+export const MediaLibrary = React.memo(function MediaLibrary({
+  assets = [],
+  onAddAsset,
+  onDeleteAsset,
+  onAddToTimeline,
+  project,
+  onOpenProjectSettings
+}) {
   const [filter, setFilter] = useState('all');
   const [isDragging, setIsDragging] = useState(false);
   const [diskInfo, setDiskInfo] = useState(null);
   const fileInputRef = useRef(null);
 
+  const projectFolder = getProjectMediaFolder(project);
+
   useEffect(() => {
-    getStorageDiskInfo().then(info => setDiskInfo(info));
-  }, [assets.length]);
+    getStorageDiskInfo(projectFolder).then(info => setDiskInfo(info));
+  }, [assets.length, projectFolder]);
 
   const handleFiles = async (files) => {
     for (const file of Array.from(files)) {
@@ -175,11 +184,31 @@ export const MediaLibrary = React.memo(function MediaLibrary({ assets = [], onAd
         }}>
           <span style={{ color: '#06b6d4', display: 'flex', alignItems: 'center', gap: '5px' }}>
             <HardDrive size={12} />
-            <span>projects_media/</span>
+            <span style={{ fontFamily: 'monospace' }}>projects_media/{projectFolder}/</span>
           </span>
-          <span style={{ color: 'var(--text-dim)' }}>
-            {diskInfo.totalFiles} en disco ({diskInfo.formattedSize})
-          </span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+            <span style={{ color: 'var(--text-dim)' }}>
+              {diskInfo.folderFiles || 0} arch. ({diskInfo.folderFormattedSize || '0.00 MB'})
+            </span>
+            {onOpenProjectSettings && (
+              <button
+                type="button"
+                style={{
+                  background: 'transparent',
+                  border: 'none',
+                  color: '#06b6d4',
+                  cursor: 'pointer',
+                  fontSize: '10px',
+                  textDecoration: 'underline',
+                  padding: 0
+                }}
+                onClick={onOpenProjectSettings}
+                title="Cambiar carpeta en Ajustes del Proyecto"
+              >
+                Cambiar
+              </button>
+            )}
+          </div>
         </div>
       )}
 

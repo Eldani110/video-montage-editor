@@ -32,7 +32,9 @@ import {
   getSavedStockConfig,
   saveStockConfig,
   getStorageDiskInfo,
-  searchStockMedia
+  searchStockMedia,
+  getDiskMediaFolders,
+  updateBaseMediaDir
 } from '../utils/stockMediaClient';
 
 export function GlobalSettingsModal({ isOpen, onClose }) {
@@ -40,6 +42,9 @@ export function GlobalSettingsModal({ isOpen, onClose }) {
   const [stockConfig, setStockConfig] = useState(getSavedStockConfig());
   const [autosaveConfig, setAutosaveConfig] = useState(getAutosaveConfig);
   const [diskInfo, setDiskInfo] = useState(null);
+  const [diskFolders, setDiskFolders] = useState([]);
+  const [baseDirInput, setBaseDirInput] = useState('');
+  const [isUpdatingBaseDir, setIsUpdatingBaseDir] = useState(false);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
   const [isTesting, setIsTesting] = useState(false);
   const [isTestingStock, setIsTestingStock] = useState(false);
@@ -58,8 +63,12 @@ export function GlobalSettingsModal({ isOpen, onClose }) {
       setTestResult(null);
       setStockTestResult(null);
       setErrorMessage(null);
+      getStorageDiskInfo().then(info => {
+        setDiskInfo(info);
+        if (info?.mediaDir) setBaseDirInput(info.mediaDir);
+      });
+      getDiskMediaFolders().then(folders => setDiskFolders(folders));
       setSuccessMessage(null);
-      getStorageDiskInfo().then(info => setDiskInfo(info));
     }
   }, [isOpen]);
 
@@ -158,6 +167,25 @@ export function GlobalSettingsModal({ isOpen, onClose }) {
       });
     } finally {
       setIsTestingStock(false);
+    }
+  };
+
+  const handleSaveBaseDir = async (e) => {
+    e?.preventDefault();
+    if (!baseDirInput.trim()) return;
+    setIsUpdatingBaseDir(true);
+    setErrorMessage(null);
+    try {
+      const res = await updateBaseMediaDir(baseDirInput.trim());
+      setSuccessMessage(`Ruta base de medios actualizada a: ${res.baseMediaDir}`);
+      const info = await getStorageDiskInfo();
+      setDiskInfo(info);
+      const folders = await getDiskMediaFolders();
+      setDiskFolders(folders);
+    } catch (err) {
+      setErrorMessage(`Error al actualizar ruta: ${err.message}`);
+    } finally {
+      setIsUpdatingBaseDir(false);
     }
   };
 
@@ -518,7 +546,7 @@ export function GlobalSettingsModal({ isOpen, onClose }) {
 
           {activeTab === 'stock' && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-              {/* Local Disk Folder Predefined Location */}
+              {/* Local Disk Folder Configuration */}
               <div style={{
                 background: 'rgba(6, 182, 212, 0.06)',
                 border: '1px solid rgba(6, 182, 212, 0.25)',
@@ -526,30 +554,90 @@ export function GlobalSettingsModal({ isOpen, onClose }) {
                 padding: '14px 16px',
                 display: 'flex',
                 flexDirection: 'column',
-                gap: '8px'
+                gap: '12px'
               }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#06b6d4', fontWeight: 600, fontSize: '13px' }}>
                     <HardDrive size={15} />
-                    <span>Carpeta Predefinida de Descargas en Disco:</span>
+                    <span>Ruta Base de Almacenamiento Multimedia:</span>
                   </div>
                   <span className="badge badge-emerald" style={{ fontSize: '10px' }}>
-                    ✓ Cero IndexedDB (Archivos Reales en Disco)
+                    ✓ Subcarpetas por Proyecto
                   </span>
                 </div>
 
-                <code style={{ fontSize: '12px', background: 'rgba(0,0,0,0.35)', padding: '6px 10px', borderRadius: '4px', color: '#38bdf8' }}>
-                  {diskInfo?.mediaDir || '.../projects_media/'}
-                </code>
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  <input
+                    type="text"
+                    className="input-field"
+                    style={{
+                      fontFamily: 'monospace',
+                      fontSize: '12px',
+                      color: '#38bdf8',
+                      background: 'rgba(0,0,0,0.4)',
+                      flex: 1
+                    }}
+                    value={baseDirInput}
+                    onChange={(e) => setBaseDirInput(e.target.value)}
+                    placeholder="/ruta/hacia/projects_media"
+                  />
+                  <button
+                    type="button"
+                    className="btn-primary btn-sm"
+                    disabled={isUpdatingBaseDir || !baseDirInput.trim()}
+                    onClick={handleSaveBaseDir}
+                  >
+                    {isUpdatingBaseDir ? <Loader2 size={13} className="animate-spin" /> : 'Guardar Ruta'}
+                  </button>
+                </div>
 
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '11px', color: 'var(--text-secondary)' }}>
                   <span>
-                    Espacio ocupado actualmente: <strong>{diskInfo?.formattedSize || '0.00 MB'}</strong> ({diskInfo?.totalFiles || 0} archivos descargados)
+                    Espacio total ocupado: <strong>{diskInfo?.formattedSize || '0.00 MB'}</strong> ({diskInfo?.totalFiles || 0} archivos en {diskFolders.length} carpetas)
                   </span>
                   <span style={{ color: '#10b981' }}>
-                    ✓ Soporte HTTP Range (Streaming fluido en línea de tiempo)
+                    ✓ Streaming con HTTP Range habilitado
                   </span>
                 </div>
+
+                {/* List of project subfolders */}
+                {diskFolders.length > 0 && (
+                  <div style={{ borderTop: '1px solid rgba(255,255,255,0.06)', paddingTop: '10px' }}>
+                    <span style={{ fontSize: '11px', color: 'var(--text-dim)', display: 'block', marginBottom: '6px', fontWeight: 600 }}>
+                      Carpetas de proyectos detectadas en disco:
+                    </span>
+                    <div style={{
+                      display: 'grid',
+                      gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))',
+                      gap: '6px',
+                      maxHeight: '120px',
+                      overflowY: 'auto'
+                    }}>
+                      {diskFolders.map((df) => (
+                        <div
+                          key={df.name}
+                          style={{
+                            background: 'rgba(0,0,0,0.3)',
+                            padding: '6px 10px',
+                            borderRadius: '4px',
+                            border: '1px solid var(--border-subtle)',
+                            fontSize: '11px',
+                            display: 'flex',
+                            justifyContent: 'space-between',
+                            alignItems: 'center'
+                          }}
+                        >
+                          <span style={{ color: '#38bdf8', fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            📁 {df.name}
+                          </span>
+                          <span style={{ color: 'var(--text-dim)', fontSize: '10px', whiteSpace: 'nowrap', marginLeft: '6px' }}>
+                            {df.fileCount} arch. ({df.formattedSize})
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* Provider Selection */}

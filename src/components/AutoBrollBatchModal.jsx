@@ -20,7 +20,7 @@ import {
   RotateCcw
 } from 'lucide-react';
 import { autoPopulateAllScenesBroll, getProjectScenesStatus } from '../utils/sceneBrollManager';
-import { getSavedStockConfig, getStorageDiskInfo } from '../utils/stockMediaClient';
+import { getSavedStockConfig, getStorageDiskInfo, getProjectMediaFolder } from '../utils/stockMediaClient';
 
 export function AutoBrollBatchModal({
   isOpen,
@@ -34,6 +34,16 @@ export function AutoBrollBatchModal({
   const [isCompleted, setIsCompleted] = useState(false);
   const [errorMessage, setErrorMessage] = useState(null);
   const [diskInfo, setDiskInfo] = useState(null);
+  const [batchFolder, setBatchFolder] = useState(() => getProjectMediaFolder(project));
+  const [isEditingFolder, setIsEditingFolder] = useState(false);
+
+  useEffect(() => {
+    if (isOpen) {
+      const folder = getProjectMediaFolder(project);
+      setBatchFolder(folder);
+      getStorageDiskInfo(folder).then(info => setDiskInfo(info));
+    }
+  }, [isOpen, project]);
   const [useVisionAI, setUseVisionAI] = useState(true);
   const [currentCollage, setCurrentCollage] = useState(null);
   const [curatedScenesCount, setCuratedScenesCount] = useState(0);
@@ -105,12 +115,20 @@ export function AutoBrollBatchModal({
     setCuratedScenesCount(0);
     setDetectedGlobalTopic(null);
     abortControllerRef.current = new AbortController();
-    latestProjectRef.current = project;
+    const effectiveFolder = (batchFolder || getProjectMediaFolder(project)).trim();
+    latestProjectRef.current = {
+      ...project,
+      mediaFolder: effectiveFolder,
+      settings: {
+        ...project?.settings,
+        mediaFolder: effectiveFolder
+      }
+    };
 
     try {
       const isResume = batchMode === 'resume';
       const isRange = batchMode === 'range';
-      const currentStatus = getProjectScenesStatus(project);
+      const currentStatus = getProjectScenesStatus(latestProjectRef.current);
 
       const updatedProject = await autoPopulateAllScenesBroll({
         project: latestProjectRef.current,
@@ -627,11 +645,57 @@ export function AutoBrollBatchModal({
                     ? `${sceneStatus.emptyCount} escenas vacías por procesar`
                     : (batchMode === 'range' ? `${Math.max(0, customEndScene - customStartScene + 1)} escenas en rango` : `${scenes.length} escenas totales`)}
                 </h4>
-                <p style={{ margin: 0, fontSize: '11px', color: 'var(--text-secondary)' }}>
-                  {batchMode === 'resume'
-                    ? `Reanudando desde Escena #${sceneStatus.firstEmptyScene?.sceneNumber || 1} • Conservando ${sceneStatus.populatedCount} ya pobladas`
-                    : `Carpeta destino: projects_media/${project.id || 'default'}/ • Pista: V2 B-Roll`}
-                </p>
+                <div style={{ margin: 0, fontSize: '11px', color: 'var(--text-secondary)', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  {batchMode === 'resume' ? (
+                    `Reanudando desde Escena #${sceneStatus.firstEmptyScene?.sceneNumber || 1} • Conservando ${sceneStatus.populatedCount} ya pobladas`
+                  ) : (
+                    <>
+                      <span>Carpeta destino:</span>
+                      {isEditingFolder ? (
+                        <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+                          <span style={{ fontFamily: 'monospace', color: 'var(--text-dim)' }}>projects_media/</span>
+                          <input
+                            type="text"
+                            value={batchFolder}
+                            onChange={(e) => setBatchFolder(e.target.value)}
+                            style={{
+                              background: 'rgba(0,0,0,0.4)',
+                              border: '1px solid #06b6d4',
+                              borderRadius: '4px',
+                              color: '#38bdf8',
+                              padding: '2px 6px',
+                              fontSize: '11px',
+                              fontFamily: 'monospace'
+                            }}
+                            autoFocus
+                            onBlur={() => setIsEditingFolder(false)}
+                            onKeyDown={(e) => { if (e.key === 'Enter') setIsEditingFolder(false); }}
+                          />
+                        </div>
+                      ) : (
+                        <>
+                          <strong style={{ color: '#38bdf8', fontFamily: 'monospace' }}>projects_media/{batchFolder}/</strong>
+                          <button
+                            type="button"
+                            onClick={() => setIsEditingFolder(true)}
+                            style={{
+                              background: 'transparent',
+                              border: '1px solid rgba(6, 182, 212, 0.3)',
+                              color: '#06b6d4',
+                              padding: '1px 5px',
+                              borderRadius: '3px',
+                              fontSize: '10px',
+                              cursor: 'pointer'
+                            }}
+                          >
+                            Cambiar
+                          </button>
+                        </>
+                      )}
+                      <span>• Pista: V2 B-Roll</span>
+                    </>
+                  )}
+                </div>
               </div>
 
               <button

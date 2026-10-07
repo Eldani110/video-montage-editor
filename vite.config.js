@@ -9,7 +9,7 @@ import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const MEDIA_DIR = path.resolve(__dirname, 'projects_media');
+let MEDIA_DIR = path.resolve(__dirname, 'projects_media');
 
 // Ensure media folder exists on disk
 if (!fs.existsSync(MEDIA_DIR)) {
@@ -394,9 +394,93 @@ function mediaStoragePlugin() {
           return;
         }
 
-        // 2. Storage Info Endpoint
-        if (req.url && req.url === '/api/media/storage-info') {
+        // 2. Storage Configuration & Base Directory Endpoints
+        if (req.url && req.url.startsWith('/api/media/config')) {
+          if (req.method === 'GET') {
+            res.statusCode = 200;
+            res.setHeader('Content-Type', 'application/json');
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.end(JSON.stringify({
+              baseMediaDir: MEDIA_DIR,
+              exists: fs.existsSync(MEDIA_DIR)
+            }));
+            return;
+          }
+          if (req.method === 'POST') {
+            let bodyRaw = '';
+            req.on('data', chunk => { bodyRaw += chunk; });
+            req.on('end', () => {
+              try {
+                const { baseMediaDir } = JSON.parse(bodyRaw || '{}');
+                if (baseMediaDir && typeof baseMediaDir === 'string') {
+                  const resolved = path.resolve(baseMediaDir);
+                  if (!fs.existsSync(resolved)) {
+                    fs.mkdirSync(resolved, { recursive: true });
+                  }
+                  MEDIA_DIR = resolved;
+                  res.statusCode = 200;
+                  res.setHeader('Content-Type', 'application/json');
+                  res.setHeader('Access-Control-Allow-Origin', '*');
+                  res.end(JSON.stringify({ success: true, baseMediaDir: MEDIA_DIR }));
+                } else {
+                  res.statusCode = 400;
+                  res.end(JSON.stringify({ error: 'Ruta base inválida' }));
+                }
+              } catch (err) {
+                res.statusCode = 500;
+                res.end(JSON.stringify({ error: err.message }));
+              }
+            });
+            return;
+          }
+        }
+
+        // 3. Project Media Folders Listing Endpoint
+        if (req.url && req.url.startsWith('/api/media/folders')) {
           try {
+            const folders = [];
+            if (fs.existsSync(MEDIA_DIR)) {
+              const entries = fs.readdirSync(MEDIA_DIR, { withFileTypes: true });
+              for (const e of entries) {
+                if (e.isDirectory()) {
+                  const folderPath = path.join(MEDIA_DIR, e.name);
+                  let fileCount = 0;
+                  let totalBytes = 0;
+                  try {
+                    const subFiles = fs.readdirSync(folderPath, { withFileTypes: true });
+                    for (const sf of subFiles) {
+                      if (sf.isFile()) {
+                        fileCount++;
+                        totalBytes += fs.statSync(path.join(folderPath, sf.name)).size;
+                      }
+                    }
+                  } catch (_) {}
+                  folders.push({
+                    name: e.name,
+                    fileCount,
+                    totalBytes,
+                    formattedSize: (totalBytes / (1024 * 1024)).toFixed(2) + ' MB'
+                  });
+                }
+              }
+            }
+            res.statusCode = 200;
+            res.setHeader('Content-Type', 'application/json');
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.end(JSON.stringify({ folders }));
+          } catch (err) {
+            res.statusCode = 500;
+            res.end(JSON.stringify({ error: err.message, folders: [] }));
+          }
+          return;
+        }
+
+        // 4. Storage Info Endpoint (Supports global or per-project folder stats)
+        if (req.url && req.url.startsWith('/api/media/storage-info')) {
+          try {
+            const urlObj = new URL(req.url, `http://${req.headers.host || 'localhost:5173'}`);
+            const requestedFolder = urlObj.searchParams.get('folder');
+
             let totalFiles = 0;
             let totalBytes = 0;
             const walk = (dir) => {
@@ -413,11 +497,36 @@ function mediaStoragePlugin() {
             };
             walk(MEDIA_DIR);
 
+            let folderFiles = 0;
+            let folderBytes = 0;
+            if (requestedFolder) {
+              const safeFolder = requestedFolder.replace(/[^a-zA-Z0-9_\-\s]/g, '_').replace(/\.\./g, '');
+              const subDir = path.join(MEDIA_DIR, safeFolder);
+              if (fs.existsSync(subDir)) {
+                const walkSub = (dir) => {
+                  const entries = fs.readdirSync(dir, { withFileTypes: true });
+                  for (const e of entries) {
+                    const full = path.join(dir, e.name);
+                    if (e.isDirectory()) walkSub(full);
+                    else if (e.isFile()) {
+                      folderFiles++;
+                      folderBytes += fs.statSync(full).size;
+                    }
+                  }
+                };
+                walkSub(subDir);
+              }
+            }
+
             res.statusCode = 200;
             res.setHeader('Content-Type', 'application/json');
             res.setHeader('Access-Control-Allow-Origin', '*');
             res.end(JSON.stringify({
               mediaDir: MEDIA_DIR,
+              folder: requestedFolder || null,
+              folderFiles,
+              folderBytes,
+              folderFormattedSize: (folderBytes / (1024 * 1024)).toFixed(2) + ' MB',
               exists: true,
               totalFiles,
               totalBytes,
@@ -430,14 +539,14 @@ function mediaStoragePlugin() {
           return;
         }
 
-        // 3. Media Download Endpoint: Streams remote URL directly to disk folder
+        // 5. Media Download Endpoint: Streams remote URL directly to project folder
         if (req.url && req.url.startsWith('/api/media/download') && req.method === 'POST') {
           let bodyRaw = '';
           req.on('data', chunk => { bodyRaw += chunk; });
           req.on('end', async () => {
             try {
               const body = JSON.parse(bodyRaw || '{}');
-              const { url, filename, projectId = 'global', type = 'video', fallbackUrl } = body;
+              const { url, filename, projectId = 'global', projectFolder, type = 'video', fallbackUrl } = body;
 
               if (!url) {
                 res.statusCode = 400;
@@ -446,9 +555,14 @@ function mediaStoragePlugin() {
                 return;
               }
 
-              // Create project subfolder on disk
-              const safeProjectId = (projectId || 'default').replace(/[^a-zA-Z0-9_-]/g, '_');
-              const projectDir = path.join(MEDIA_DIR, safeProjectId);
+              // Determine target subfolder (projectFolder takes precedence over projectId)
+              const rawFolder = (projectFolder || projectId || 'default').trim();
+              const safeFolder = rawFolder
+                .replace(/[^a-zA-Z0-9_\-\s]/g, '_')
+                .replace(/\.\./g, '')
+                .replace(/\s+/g, '_') || 'default';
+
+              const projectDir = path.join(MEDIA_DIR, safeFolder);
               if (!fs.existsSync(projectDir)) {
                 fs.mkdirSync(projectDir, { recursive: true });
               }
@@ -513,7 +627,7 @@ function mediaStoragePlugin() {
               await pipeline(Readable.fromWeb(remoteRes.body), fileStream);
 
               const stat = fs.statSync(targetFilePath);
-              const relativeUrl = `/media-library/${safeProjectId}/${safeName}`;
+              const relativeUrl = `/media-library/${encodeURIComponent(safeFolder)}/${safeName}`;
 
               res.statusCode = 200;
               res.setHeader('Content-Type', 'application/json');
@@ -521,6 +635,7 @@ function mediaStoragePlugin() {
               res.end(JSON.stringify({
                 success: true,
                 filename: safeName,
+                folder: safeFolder,
                 localUrl: relativeUrl,
                 diskPath: targetFilePath,
                 size: stat.size,

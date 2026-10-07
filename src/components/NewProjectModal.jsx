@@ -7,6 +7,7 @@ export function NewProjectModal({ isOpen, onClose, onCreateProject }) {
   const [aspectRatio, setAspectRatio] = useState('16:9');
   const [duration, setDuration] = useState(20);
   const [includeSamples, setIncludeSamples] = useState(true);
+  const [mediaFolder, setMediaFolder] = useState('');
 
   if (!isOpen) return null;
 
@@ -15,6 +16,12 @@ export function NewProjectModal({ isOpen, onClose, onCreateProject }) {
     const project = createNewProjectTemplate(name.trim() || 'Nuevo Proyecto');
     project.settings.duration = Number(duration);
     project.settings.aspectRatio = aspectRatio;
+
+    const cleanFolder = mediaFolder.trim();
+    if (cleanFolder) {
+      project.mediaFolder = cleanFolder;
+      project.settings.mediaFolder = cleanFolder;
+    }
 
     if (aspectRatio === '9:16') {
       project.settings.width = 1080;
@@ -66,6 +73,38 @@ export function NewProjectModal({ isOpen, onClose, onCreateProject }) {
               autoFocus
               required
             />
+          </div>
+
+          <div className="form-group">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <label style={{ margin: 0 }}>Carpeta Multimedia Local</label>
+              <span style={{ fontSize: '10px', color: 'var(--text-dim)' }}>Opcional (se genera automáticamente si se deja vacía)</span>
+            </div>
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              background: 'rgba(0,0,0,0.3)',
+              padding: '0 10px',
+              borderRadius: '6px',
+              border: '1px solid var(--border-subtle)',
+              marginTop: '4px'
+            }}>
+              <span style={{ fontSize: '12px', color: 'var(--text-dim)', fontFamily: 'monospace' }}>projects_media/</span>
+              <input
+                type="text"
+                className="input-field"
+                style={{
+                  border: 'none',
+                  background: 'transparent',
+                  padding: '8px 4px',
+                  fontFamily: 'monospace',
+                  color: '#38bdf8'
+                }}
+                value={mediaFolder}
+                onChange={(e) => setMediaFolder(e.target.value)}
+                placeholder={name.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '_') || 'nombre_de_carpeta'}
+              />
+            </div>
           </div>
 
           <div className="form-group">

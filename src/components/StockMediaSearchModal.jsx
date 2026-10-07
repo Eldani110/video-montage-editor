@@ -25,7 +25,8 @@ import {
   saveStockConfig,
   getStorageDiskInfo,
   translateQueryForStock,
-  extractSceneConceptPills
+  extractSceneConceptPills,
+  getProjectMediaFolder
 } from '../utils/stockMediaClient';
 import { assignStockMediaToScene } from '../utils/sceneBrollManager';
 
@@ -53,6 +54,22 @@ export function StockMediaSearchModal({
   const [showKeyConfig, setShowKeyConfig] = useState(false);
   const [hoveredVideoId, setHoveredVideoId] = useState(null);
   const [diskInfo, setDiskInfo] = useState(null);
+  const [selectedFolder, setSelectedFolder] = useState(() => getProjectMediaFolder(project));
+  const [isEditingFolder, setIsEditingFolder] = useState(false);
+
+  useEffect(() => {
+    if (isOpen) {
+      const folder = getProjectMediaFolder(project);
+      setSelectedFolder(folder);
+      getStorageDiskInfo(folder).then(info => setDiskInfo(info));
+    }
+  }, [isOpen, project]);
+
+  useEffect(() => {
+    if (selectedFolder) {
+      getStorageDiskInfo(selectedFolder).then(info => setDiskInfo(info));
+    }
+  }, [selectedFolder]);
 
   // Compute concept pills
   const conceptPills = useMemo(() => {
@@ -170,12 +187,21 @@ export function StockMediaSearchModal({
     setDownloadingId(mediaItem.id);
     setErrorMessage(null);
     try {
+      const effectiveFolder = (selectedFolder || getProjectMediaFolder(project)).trim();
       const { updatedProject, newAsset } = await assignStockMediaToScene({
         project,
         scene,
         mediaItem,
-        trackPreference: stockConfig.targetTrack || 'v2'
+        trackPreference: stockConfig.targetTrack || 'v2',
+        projectFolder: effectiveFolder
       });
+
+      // Update project mediaFolder if changed
+      if (updatedProject) {
+        if (!updatedProject.settings) updatedProject.settings = {};
+        updatedProject.settings.mediaFolder = effectiveFolder;
+        updatedProject.mediaFolder = effectiveFolder;
+      }
 
       setSuccessInfo({
         name: newAsset.name,
@@ -763,11 +789,65 @@ export function StockMediaSearchModal({
           fontSize: '11px',
           color: 'var(--text-dim)'
         }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
             <HardDrive size={13} style={{ color: '#06b6d4' }} />
-            <span>
-              Carpeta local: <strong style={{ color: 'var(--text-secondary)' }}>projects_media/{project.id || 'default'}/</strong> ({diskInfo ? `${diskInfo.totalFiles} archivos, ${diskInfo.formattedSize}` : '0 MB'})
-            </span>
+            <span>Carpeta de destino:</span>
+            {isEditingFolder ? (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                <span style={{ color: 'var(--text-dim)', fontFamily: 'monospace' }}>projects_media/</span>
+                <input
+                  type="text"
+                  value={selectedFolder}
+                  onChange={(e) => setSelectedFolder(e.target.value)}
+                  style={{
+                    background: 'rgba(0,0,0,0.5)',
+                    border: '1px solid #06b6d4',
+                    borderRadius: '4px',
+                    color: '#38bdf8',
+                    padding: '2px 8px',
+                    fontSize: '11px',
+                    fontFamily: 'monospace',
+                    fontWeight: 600
+                  }}
+                  autoFocus
+                  onBlur={() => setIsEditingFolder(false)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') setIsEditingFolder(false); }}
+                />
+                <button
+                  type="button"
+                  className="btn-primary btn-sm"
+                  style={{ padding: '2px 8px', fontSize: '10px' }}
+                  onClick={() => setIsEditingFolder(false)}
+                >
+                  Confirmar
+                </button>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <strong style={{ color: '#38bdf8', fontFamily: 'monospace' }}>
+                  projects_media/{selectedFolder}/
+                </strong>
+                <button
+                  type="button"
+                  style={{
+                    background: 'rgba(6, 182, 212, 0.1)',
+                    border: '1px solid rgba(6, 182, 212, 0.3)',
+                    color: '#06b6d4',
+                    borderRadius: '3px',
+                    padding: '1px 6px',
+                    fontSize: '10px',
+                    cursor: 'pointer'
+                  }}
+                  onClick={() => setIsEditingFolder(true)}
+                  title="Cambiar carpeta de destino para este proyecto"
+                >
+                  Cambiar
+                </button>
+                <span style={{ color: 'var(--text-dim)' }}>
+                  ({diskInfo ? `${diskInfo.folderFiles || 0} archivos, ${diskInfo.folderFormattedSize || '0.00 MB'}` : '0 MB'})
+                </span>
+              </div>
+            )}
           </div>
 
           <button className="btn-secondary btn-sm" onClick={onClose}>

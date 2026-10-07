@@ -1333,6 +1333,8 @@ export function EditorPage({
                 onAddAsset={handleAddAsset}
                 onDeleteAsset={handleDeleteAsset}
                 onAddToTimeline={handleAddToTimeline}
+                project={project}
+                onOpenProjectSettings={() => setShowSettingsModal(true)}
               />
             )}
             {activeSidebarTab === 'inspector' && (

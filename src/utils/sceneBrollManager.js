@@ -4,7 +4,7 @@
  * executes Multimodal Vision AI evaluation to filter clichés and pick the best shot,
  * saves top alternatives, downloads files to disk folder, and places clips onto timeline.
  */
-import { searchStockMedia, downloadStockMediaToDisk, getSavedStockConfig, extractSceneConceptPills } from './stockMediaClient.js';
+import { searchStockMedia, downloadStockMediaToDisk, getSavedStockConfig, extractSceneConceptPills, getProjectMediaFolder } from './stockMediaClient.js';
 import {
   generateSceneSearchStrategiesWithAI,
   preFilterAndRankCandidatesWithAI,
@@ -104,14 +104,16 @@ export async function assignStockMediaToScene({
   alternatives = [],
   critique = null,
   collageDataUrl = null,
-  trackPreference = 'v2'
+  trackPreference = 'v2',
+  projectFolder = null
 }) {
-  const projectId = project.id || 'default_montage';
+  const targetFolder = (projectFolder || getProjectMediaFolder(project)).trim();
 
   // 1. Download file directly to local disk folder (zero IndexedDB!)
   const { asset } = await downloadStockMediaToDisk({
     mediaItem,
-    projectId,
+    projectId: targetFolder,
+    projectFolder: targetFolder,
     scene
   });
 
@@ -752,9 +754,10 @@ export async function autoPopulateAllScenesBroll({
         message: `[${sceneNum}/${totalProjectScenes} Total] Descargando a disco: "${scene.title}"...`
       });
 
+      const projectFolder = getProjectMediaFolder(currentProject);
       onLog({
         phase: `Descarga Disco`,
-        text: `Guardando archivo en carpeta local projects_media/${currentProject.id || 'default'}/...`,
+        text: `Guardando archivo en carpeta local projects_media/${projectFolder}/...`,
         icon: '💾'
       });
 
@@ -766,7 +769,8 @@ export async function autoPopulateAllScenesBroll({
         alternatives,
         critique: critiqueData,
         collageDataUrl,
-        trackPreference: stockConfig.targetTrack || 'v2'
+        trackPreference: stockConfig.targetTrack || 'v2',
+        projectFolder
       });
 
       currentProject = result.updatedProject;

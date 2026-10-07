@@ -53,7 +53,7 @@ export function TranscribeModal({ isOpen, onClose, project, onUpdateProject, ini
 
   // Load saved Gemini API Key
   useEffect(() => {
-    const saved = localStorage.getItem(STORAGE_KEY_GEMINI) || import.meta.env.VITE_GEMINI_API_KEY || '';
+    const saved = localStorage.getItem(STORAGE_KEY_GEMINI);
     if (saved) {
       setApiKey(saved);
     }

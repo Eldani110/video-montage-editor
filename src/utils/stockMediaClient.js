@@ -277,12 +277,48 @@ export async function searchStockMedia({
 }
 
 /**
+ * Resolves the sanitized media folder for a given project.
+ * Uses custom mediaFolder if set, or falls back to clean project title + id or default.
+ */
+export function getProjectMediaFolder(project) {
+  if (!project) return 'default';
+
+  const custom = project.settings?.mediaFolder || project.mediaFolder;
+  if (custom && typeof custom === 'string' && custom.trim()) {
+    return custom
+      .trim()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-zA-Z0-9_\-\s]/g, '')
+      .replace(/\s+/g, '_')
+      .slice(0, 40) || 'default';
+  }
+
+  const name = project.name || 'proyecto';
+  const cleanName = name
+    .trim()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-zA-Z0-9_\-\s]/g, '')
+    .replace(/\s+/g, '_')
+    .slice(0, 24);
+
+  const shortId = (project.id || '')
+    .replace(/^proj_/, '')
+    .replace(/[^a-zA-Z0-9]/g, '')
+    .slice(-6);
+
+  return shortId ? `${cleanName || 'proj'}_${shortId}` : cleanName || project.id || 'default';
+}
+
+/**
  * Downloads a chosen stock media item directly to the project's disk folder
  * Returns metadata and static /media-library/ URL
  */
 export async function downloadStockMediaToDisk({
   mediaItem,
   projectId = 'default',
+  projectFolder = null,
   scene = null,
   customFilename = null
 }) {
@@ -305,11 +341,14 @@ export async function downloadStockMediaToDisk({
     ? `broll_e${scene.sceneNumber || 1}_${cleanTitle}_${mediaIdHash}_${timeSalt}`
     : `broll_${mediaIdHash}_${timeSalt}`);
 
+  const targetFolder = (projectFolder || projectId || 'default').trim();
+
   const payload = {
     url: mediaItem.downloadUrl,
     fallbackUrl: mediaItem.fallbackUrl || mediaItem.thumbnail || null,
     filename,
-    projectId,
+    projectId: targetFolder,
+    projectFolder: targetFolder,
     type: mediaItem.type || 'video'
   };
 
@@ -356,14 +395,72 @@ export async function downloadStockMediaToDisk({
 }
 
 /**
- * Checks storage directory status on host disk
+ * Checks storage directory status on host disk, optionally filtering by project folder
  */
-export async function getStorageDiskInfo() {
+export async function getStorageDiskInfo(projectFolder = null) {
   try {
-    const res = await fetch(`${API_BASE}/api/media/storage-info`);
+    const url = projectFolder
+      ? `${API_BASE}/api/media/storage-info?folder=${encodeURIComponent(projectFolder)}`
+      : `${API_BASE}/api/media/storage-info`;
+    const res = await fetch(url);
     if (res.ok) return await res.json();
   } catch (err) {
     console.warn('Could not query storage info:', err);
   }
-  return { exists: false, totalFiles: 0, totalBytes: 0, formattedSize: '0.00 MB' };
+  return {
+    mediaDir: 'projects_media',
+    folder: projectFolder,
+    folderFiles: 0,
+    folderBytes: 0,
+    folderFormattedSize: '0.00 MB',
+    exists: false,
+    totalFiles: 0,
+    totalBytes: 0,
+    formattedSize: '0.00 MB'
+  };
+}
+
+/**
+ * Fetches the list of subfolders in the media directory
+ */
+export async function getDiskMediaFolders() {
+  try {
+    const res = await fetch(`${API_BASE}/api/media/folders`);
+    if (res.ok) {
+      const data = await res.json();
+      return data.folders || [];
+    }
+  } catch (err) {
+    console.warn('Could not list media folders:', err);
+  }
+  return [];
+}
+
+/**
+ * Gets base media storage configuration
+ */
+export async function getStorageConfig() {
+  try {
+    const res = await fetch(`${API_BASE}/api/media/config`);
+    if (res.ok) return await res.json();
+  } catch (err) {
+    console.warn('Could not fetch storage config:', err);
+  }
+  return { baseMediaDir: 'projects_media', exists: true };
+}
+
+/**
+ * Updates base media storage directory on host
+ */
+export async function updateBaseMediaDir(newBaseDir) {
+  const res = await fetch(`${API_BASE}/api/media/config`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ baseMediaDir: newBaseDir })
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `HTTP ${res.status}`);
+  }
+  return await res.json();
 }

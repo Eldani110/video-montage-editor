@@ -15,9 +15,8 @@ const FALLBACK_MODEL = 'gemini-1.5-flash';
  * @returns {Promise<Array<{ id: string, start: number, end: number, text: string }>>}
  */
 export async function transcribeWithGemini(mediaSource, apiKey, options = {}) {
-  const effectiveKey = (apiKey && apiKey.trim()) || (typeof window !== 'undefined' ? localStorage.getItem('montage_pro_gemini_api_key') : '') || import.meta.env.VITE_GEMINI_API_KEY || '';
-  if (!effectiveKey || effectiveKey.trim() === '') {
-    throw new Error('Se requiere una clave API de Google Gemini para transcribir con la nube. Puedes obtenerla en https://aistudio.google.com/app/apikey');
+  if (!apiKey || apiKey.trim() === '') {
+    throw new Error('Se requiere una clave API de Google Gemini para transcribir con la nube.');
   }
 
   const onProgress = options.onProgress || (() => {});
@@ -61,7 +60,7 @@ export async function transcribeWithGemini(mediaSource, apiKey, options = {}) {
     const base64Audio = await blobToBase64(chunkWavBlob);
 
     // Query Gemini
-    const chunkSegments = await sendAudioChunkToGemini(base64Audio, chunkDuration, effectiveKey, options.language);
+    const chunkSegments = await sendAudioChunkToGemini(base64Audio, chunkDuration, apiKey, options.language);
 
     // Adjust timestamps relative to total media timeline
     for (const seg of chunkSegments) {
