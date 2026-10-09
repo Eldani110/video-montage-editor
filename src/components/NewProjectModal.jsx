@@ -14,7 +14,7 @@ export function NewProjectModal({ isOpen, onClose, onCreateProject }) {
   const handleSubmit = (e) => {
     e.preventDefault();
     const project = createNewProjectTemplate(name.trim() || 'Nuevo Proyecto');
-    project.settings.duration = Number(duration);
+    project.settings.duration = Math.max(5, Math.round(Number(duration) || 0));
     project.settings.aspectRatio = aspectRatio;
 
     const cleanFolder = mediaFolder.trim();
@@ -148,7 +148,7 @@ export function NewProjectModal({ isOpen, onClose, onCreateProject }) {
               <input
                 type="number"
                 min="5"
-                max="300"
+                step="1"
                 className="input-field"
                 value={duration}
                 onChange={(e) => setDuration(e.target.value)}

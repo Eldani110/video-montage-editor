@@ -95,7 +95,7 @@ export function ProjectSettingsModal({ isOpen, onClose, project, onUpdateSetting
         width,
         height,
         aspectRatio,
-        duration: Math.max(5, Number(duration)),
+        duration: Math.max(5, Math.round(Number(duration) || 0)),
         mediaFolder: cleanFolder
       }
     });
@@ -169,10 +169,11 @@ export function ProjectSettingsModal({ isOpen, onClose, project, onUpdateSetting
             <input
               type="number"
               min="5"
-              max="600"
+              step="1"
               className="input-field"
               value={duration}
               onChange={(e) => setDuration(e.target.value)}
+              placeholder="Ej: 3600 (1 hora) o el valor que necesites"
             />
           </div>
 
