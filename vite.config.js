@@ -13,31 +13,50 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Persistent storage config file (survives server restarts/redeploys)
 const MEDIA_CONFIG_FILE = path.resolve(__dirname, '.media-config.json');
 
-function loadPersistedMediaDir() {
+function readMediaConfig() {
   try {
     if (fs.existsSync(MEDIA_CONFIG_FILE)) {
-      const raw = fs.readFileSync(MEDIA_CONFIG_FILE, 'utf-8');
-      const parsed = JSON.parse(raw || '{}');
-      if (parsed.baseMediaDir && typeof parsed.baseMediaDir === 'string') {
-        const resolved = path.resolve(parsed.baseMediaDir);
-        if (fs.existsSync(resolved)) return resolved;
-      }
+      return JSON.parse(fs.readFileSync(MEDIA_CONFIG_FILE, 'utf-8') || '{}');
     }
   } catch (err) {
     console.warn('[media-config] No se pudo leer la config persistida:', err.message);
+  }
+  return {};
+}
+
+function writeMediaConfig(patch) {
+  try {
+    const current = readMediaConfig();
+    const next = { ...current, ...patch };
+    fs.writeFileSync(MEDIA_CONFIG_FILE, JSON.stringify(next, null, 2), 'utf-8');
+    return true;
+  } catch (err) {
+    console.warn('[media-config] No se pudo persistir la config:', err.message);
+    return false;
+  }
+}
+
+function loadPersistedMediaDir() {
+  const cfg = readMediaConfig();
+  if (cfg.baseMediaDir && typeof cfg.baseMediaDir === 'string') {
+    const resolved = path.resolve(cfg.baseMediaDir);
+    if (fs.existsSync(resolved)) return resolved;
   }
   return null;
 }
 
 function persistMediaDir(dir) {
-  try {
-    fs.writeFileSync(MEDIA_CONFIG_FILE, JSON.stringify({ baseMediaDir: dir }, null, 2), 'utf-8');
-  } catch (err) {
-    console.warn('[media-config] No se pudo persistir la config:', err.message);
-  }
+  writeMediaConfig({ baseMediaDir: dir });
 }
 
 let MEDIA_DIR = loadPersistedMediaDir() || path.resolve(__dirname, 'projects_media');
+
+// Remote media server (Option 2: your PC serves the media, the server proxies to it).
+// Any device -> this server -> remote PC (tunnel/IP) -> the PC's disk.
+const initialConfig = readMediaConfig();
+let REMOTE_MEDIA_URL = typeof initialConfig.remoteMediaUrl === 'string'
+  ? initialConfig.remoteMediaUrl.replace(/\/+$/, '')
+  : '';
 
 // Ensure media folder exists on disk
 if (!fs.existsSync(MEDIA_DIR)) {
@@ -382,6 +401,48 @@ const CURATED_STOCK_LIBRARY = {
   ]
 };
 
+// Proxies a /media-library request to the configured remote media server (the user's PC).
+// Streams the response back (supports GET/HEAD and HTTP Range for video seeking).
+async function proxyRemoteMedia(req, res, remoteBase) {
+  const remoteUrl = remoteBase + req.url;
+  const headers = {};
+  if (req.headers.range) headers.Range = req.headers.range;
+  if (req.headers['if-none-match']) headers['If-None-Match'] = req.headers['if-none-match'];
+  if (req.headers['if-modified-since']) headers['If-Modified-Since'] = req.headers['if-modified-since'];
+
+  let upstream;
+  try {
+    upstream = await fetch(remoteUrl, { method: req.method, headers });
+  } catch (err) {
+    res.statusCode = 502;
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ error: 'Remote media server unreachable', detail: err.message }));
+    return;
+  }
+
+  res.statusCode = upstream.status;
+  // Copy useful headers
+  const passthrough = ['content-type', 'content-length', 'content-range', 'accept-ranges', 'last-modified', 'etag', 'cache-control'];
+  for (const h of passthrough) {
+    const v = upstream.headers.get(h);
+    if (v) res.setHeader(h, v);
+  }
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('X-Media-Source', 'remote');
+
+  if (req.method === 'HEAD' || !upstream.body) {
+    res.end();
+    return;
+  }
+
+  try {
+    const { Readable } = await import('node:stream');
+    Readable.fromWeb(upstream.body).pipe(res);
+  } catch (_) {
+    res.end();
+  }
+}
+
 function mediaStoragePlugin() {
   const plugin = {
     name: 'media-storage-middleware',
@@ -396,6 +457,10 @@ function mediaStoragePlugin() {
           const filePath = resolveMediaFile(safePath);
 
           if (!filePath) {
+            // Not on this server's disk: proxy to the remote media server (user's PC) if configured.
+            if (REMOTE_MEDIA_URL) {
+              return proxyRemoteMedia(req, res, REMOTE_MEDIA_URL);
+            }
             res.statusCode = 404;
             res.setHeader('Content-Type', 'application/json');
             res.end(JSON.stringify({ error: 'Media file not found on disk' }));
@@ -480,7 +545,8 @@ function mediaStoragePlugin() {
             res.setHeader('Access-Control-Allow-Origin', '*');
             res.end(JSON.stringify({
               baseMediaDir: MEDIA_DIR,
-              exists: fs.existsSync(MEDIA_DIR)
+              exists: fs.existsSync(MEDIA_DIR),
+              remoteMediaUrl: REMOTE_MEDIA_URL || null
             }));
             return;
           }
@@ -489,21 +555,37 @@ function mediaStoragePlugin() {
             req.on('data', chunk => { bodyRaw += chunk; });
             req.on('end', () => {
               try {
-                const { baseMediaDir } = JSON.parse(bodyRaw || '{}');
-                if (baseMediaDir && typeof baseMediaDir === 'string') {
-                  const resolved = path.resolve(baseMediaDir);
+                const body = JSON.parse(bodyRaw || '{}');
+                let updated = false;
+
+                if (body.baseMediaDir && typeof body.baseMediaDir === 'string') {
+                  const resolved = path.resolve(body.baseMediaDir);
                   if (!fs.existsSync(resolved)) {
                     fs.mkdirSync(resolved, { recursive: true });
                   }
                   MEDIA_DIR = resolved;
                   persistMediaDir(resolved); // Survive restarts/redeploys
+                  updated = true;
+                }
+
+                if (typeof body.remoteMediaUrl === 'string') {
+                  REMOTE_MEDIA_URL = body.remoteMediaUrl.trim().replace(/\/+$/, '');
+                  writeMediaConfig({ remoteMediaUrl: REMOTE_MEDIA_URL });
+                  updated = true;
+                }
+
+                if (updated) {
                   res.statusCode = 200;
                   res.setHeader('Content-Type', 'application/json');
                   res.setHeader('Access-Control-Allow-Origin', '*');
-                  res.end(JSON.stringify({ success: true, baseMediaDir: MEDIA_DIR }));
+                  res.end(JSON.stringify({
+                    success: true,
+                    baseMediaDir: MEDIA_DIR,
+                    remoteMediaUrl: REMOTE_MEDIA_URL || null
+                  }));
                 } else {
                   res.statusCode = 400;
-                  res.end(JSON.stringify({ error: 'Ruta base inválida' }));
+                  res.end(JSON.stringify({ error: 'Nada que actualizar' }));
                 }
               } catch (err) {
                 res.statusCode = 500;
@@ -512,6 +594,35 @@ function mediaStoragePlugin() {
             });
             return;
           }
+        }
+
+        // Remote media server connectivity test
+        if (req.url && req.url.startsWith('/api/media/remote-status')) {
+          (async () => {
+            const configured = Boolean(REMOTE_MEDIA_URL);
+            let reachable = false;
+            let detail = null;
+            if (configured) {
+              try {
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), 5000);
+                const probe = await fetch(`${REMOTE_MEDIA_URL}/api/media/config`, { signal: controller.signal });
+                clearTimeout(timer);
+                reachable = probe.ok;
+                if (reachable) {
+                  const data = await probe.json().catch(() => ({}));
+                  detail = { baseMediaDir: data.baseMediaDir || null };
+                }
+              } catch (err) {
+                detail = err.message;
+              }
+            }
+            res.statusCode = 200;
+            res.setHeader('Content-Type', 'application/json');
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.end(JSON.stringify({ configured, reachable, url: REMOTE_MEDIA_URL || null, detail }));
+          })();
+          return;
         }
 
         // 3. Project Media Folders Listing Endpoint

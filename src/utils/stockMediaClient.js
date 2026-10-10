@@ -622,6 +622,36 @@ export async function getStorageConfig() {
 }
 
 /**
+ * Sets the remote media server URL (your PC). The server proxies /media-library
+ * requests to it when a file is not present locally.
+ */
+export async function setRemoteMediaUrl(url) {
+  const res = await fetch(`${API_BASE}/api/media/config`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ remoteMediaUrl: url || '' })
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `HTTP ${res.status}`);
+  }
+  return await res.json();
+}
+
+/**
+ * Tests connectivity to the configured remote media server.
+ */
+export async function getRemoteMediaStatus() {
+  try {
+    const res = await fetch(`${API_BASE}/api/media/remote-status`);
+    if (res.ok) return await res.json();
+  } catch (err) {
+    console.warn('Could not query remote media status:', err);
+  }
+  return { configured: false, reachable: false, url: null };
+}
+
+/**
  * Updates base media storage directory on host
  */
 export async function updateBaseMediaDir(newBaseDir) {
