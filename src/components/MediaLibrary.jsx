@@ -1,8 +1,17 @@
 import React, { useRef, useState, useEffect } from 'react';
-import { Upload, Image as ImageIcon, Music, Film, Plus, Trash2, CheckCircle2, HardDrive, FolderCog, RefreshCw, Loader2 } from 'lucide-react';
+import { Upload, Image as ImageIcon, Music, Film, Plus, Trash2, CheckCircle2, HardDrive, FolderCog, RefreshCw, Loader2, FolderOpen, FolderPlus, AlertTriangle } from 'lucide-react';
 import { saveMediaBlob } from '../utils/storage';
 import { getStorageDiskInfo, getProjectMediaFolder, listDiskMediaFiles } from '../utils/stockMediaClient';
 import { extractWaveformData } from '../utils/audioWaveform';
+import {
+  isLocalMediaSupported,
+  pickLocalMediaFolder,
+  getConnectedMediaFolder,
+  disconnectMediaFolder,
+  listLocalMediaFiles,
+  readLocalMediaFile,
+  writeLocalMediaFile
+} from '../utils/localMedia';
 
 export const MediaLibrary = React.memo(function MediaLibrary({
   assets = [],
@@ -22,6 +31,61 @@ export const MediaLibrary = React.memo(function MediaLibrary({
 
   const [isScanning, setIsScanning] = useState(false);
   const [scanMessage, setScanMessage] = useState(null);
+
+  // Local media folder connection (Clipchamp-style File System Access API)
+  const [localFolder, setLocalFolder] = useState(null); // { handle, name, needsPermission }
+  const [isConnectingFolder, setIsConnectingFolder] = useState(false);
+  const localSupported = isLocalMediaSupported();
+
+  // Load any previously connected local media folder on mount
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const connected = await getConnectedMediaFolder(false);
+      if (!cancelled) setLocalFolder(connected);
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const handleConnectFolder = async () => {
+    setIsConnectingFolder(true);
+    setScanMessage(null);
+    try {
+      const handle = await pickLocalMediaFolder();
+      setLocalFolder({ handle, name: handle.name, needsPermission: false });
+      setScanMessage({ type: 'success', text: `Carpeta local conectada: "${handle.name}". Los medios se guardarán aquí.` });
+      // Auto-scan the newly connected folder
+      setTimeout(() => scanFolderRef.current?.(), 100);
+    } catch (err) {
+      if (err && err.name === 'AbortError') {
+        // user cancelled the picker — do nothing
+      } else {
+        setScanMessage({ type: 'error', text: 'No se pudo conectar la carpeta: ' + (err.message || err) });
+      }
+    } finally {
+      setIsConnectingFolder(false);
+    }
+  };
+
+  const handleDisconnectFolder = async () => {
+    await disconnectMediaFolder();
+    setLocalFolder(null);
+    setScanMessage({ type: 'info', text: 'Carpeta local desconectada. Se usará el almacenamiento del servidor.' });
+  };
+
+  const handleReconnectFolder = async () => {
+    setIsConnectingFolder(true);
+    try {
+      const connected = await getConnectedMediaFolder(true);
+      setLocalFolder(connected);
+      if (connected && !connected.needsPermission) {
+        setScanMessage({ type: 'success', text: `Permiso concedido para "${connected.name}".` });
+        setTimeout(() => scanFolderRef.current?.(), 100);
+      }
+    } finally {
+      setIsConnectingFolder(false);
+    }
+  };
 
   useEffect(() => {
     getStorageDiskInfo(projectFolder).then(info => setDiskInfo(info));
@@ -80,120 +144,187 @@ export const MediaLibrary = React.memo(function MediaLibrary({
     return asset;
   };
 
+  // Enriches an asset with real metadata (dimensions, duration, thumbnail) by probing its URL.
+  const enrichAssetMetadata = async (asset) => {
+    if (asset.type === 'image') {
+      await new Promise((resolve) => {
+        const img = new Image();
+        img.onload = () => {
+          asset.width = img.naturalWidth;
+          asset.height = img.naturalHeight;
+          asset.thumbnail = asset.url;
+          resolve();
+        };
+        img.onerror = resolve;
+        img.src = asset.url;
+      });
+    } else if (asset.type === 'video') {
+      await new Promise((resolve) => {
+        const vid = document.createElement('video');
+        vid.preload = 'metadata';
+        vid.muted = true;
+        vid.src = asset.url;
+        vid.onloadedmetadata = () => {
+          asset.duration = (isFinite(vid.duration) && vid.duration > 0)
+            ? Number(vid.duration.toFixed(2))
+            : 5;
+          asset.width = vid.videoWidth;
+          asset.height = vid.videoHeight;
+          vid.currentTime = Math.min(0.5, (vid.duration || 1) / 2);
+        };
+        vid.onseeked = () => {
+          try {
+            const canvas = document.createElement('canvas');
+            canvas.width = 160;
+            canvas.height = 90;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(vid, 0, 0, 160, 90);
+            asset.thumbnail = canvas.toDataURL('image/jpeg', 0.8);
+          } catch {
+            // ignore canvas errors
+          }
+          resolve();
+        };
+        vid.onerror = resolve;
+        setTimeout(resolve, 6000);
+      });
+    } else if (asset.type === 'audio') {
+      await new Promise((resolve) => {
+        const audio = new Audio();
+        audio.preload = 'metadata';
+        audio.src = asset.url;
+        audio.onloadedmetadata = () => {
+          asset.duration = (isFinite(audio.duration) && audio.duration > 0)
+            ? Number(audio.duration.toFixed(2))
+            : 10;
+          resolve();
+        };
+        audio.onerror = resolve;
+        setTimeout(resolve, 6000);
+      });
+    }
+    return asset;
+  };
+
   const handleScanFolder = async () => {
     if (isScanning) return;
     setIsScanning(true);
     setScanMessage(null);
     try {
-      const diskFiles = await listDiskMediaFiles(projectFolder);
-      if (!diskFiles.length) {
-        setScanMessage({ type: 'empty', text: `La carpeta "${projectFolder}" no contiene archivos multimedia.` });
-        setIsScanning(false);
-        return;
-      }
+      // Prefer the user's LOCAL media folder when connected (Clipchamp-style).
+      const connected = localFolder && localFolder.handle && !localFolder.needsPermission
+        ? localFolder
+        : await getConnectedMediaFolder(false);
 
-      const existing = buildExistingSignatures();
-      const newFiles = diskFiles.filter(f => {
-        const byName = existing.has(String(f.filename).toLowerCase());
-        const byUrl = existing.has(String(f.url).toLowerCase());
-        return !byName && !byUrl;
-      });
-
-      if (!newFiles.length) {
-        setScanMessage({ type: 'uptodate', text: `Todo sincronizado: ${diskFiles.length} archivo(s) ya en la biblioteca.` });
-        setIsScanning(false);
-        return;
-      }
-
-      // Enrich each file with real metadata, then register in a single batch
-      const enrichedAssets = [];
-      for (const f of newFiles) {
-        const asset = buildAssetFromDiskFile(f, projectFolder);
-
-        if (f.type === 'image') {
-          await new Promise((resolve) => {
-            const img = new Image();
-            img.onload = () => {
-              asset.width = img.naturalWidth;
-              asset.height = img.naturalHeight;
-              asset.thumbnail = asset.url;
-              resolve();
-            };
-            img.onerror = resolve;
-            img.src = asset.url;
-          });
-        } else if (f.type === 'video') {
-          await new Promise((resolve) => {
-            const vid = document.createElement('video');
-            vid.preload = 'metadata';
-            vid.muted = true;
-            vid.src = asset.url;
-            vid.onloadedmetadata = () => {
-              asset.duration = (isFinite(vid.duration) && vid.duration > 0)
-                ? Number(vid.duration.toFixed(2))
-                : 5;
-              asset.width = vid.videoWidth;
-              asset.height = vid.videoHeight;
-              vid.currentTime = Math.min(0.5, (vid.duration || 1) / 2);
-            };
-            vid.onseeked = () => {
-              try {
-                const canvas = document.createElement('canvas');
-                canvas.width = 160;
-                canvas.height = 90;
-                const ctx = canvas.getContext('2d');
-                ctx.drawImage(vid, 0, 0, 160, 90);
-                asset.thumbnail = canvas.toDataURL('image/jpeg', 0.8);
-              } catch {
-                // ignore canvas errors
-              }
-              resolve();
-            };
-            vid.onerror = resolve;
-            // Safety timeout so a broken file never blocks the loop
-            setTimeout(resolve, 6000);
-          });
-        } else if (f.type === 'audio') {
-          await new Promise((resolve) => {
-            const audio = new Audio();
-            audio.preload = 'metadata';
-            audio.src = asset.url;
-            audio.onloadedmetadata = () => {
-              asset.duration = (isFinite(audio.duration) && audio.duration > 0)
-                ? Number(audio.duration.toFixed(2))
-                : 10;
-              resolve();
-            };
-            audio.onerror = resolve;
-            setTimeout(resolve, 6000);
-          });
-        }
-
-        enrichedAssets.push(asset);
-      }
-
-      // Prefer batch handler to avoid state-overwrite when importing many files
-      if (typeof onAddAssets === 'function') {
-        onAddAssets(enrichedAssets);
+      if (connected && connected.handle && !connected.needsPermission) {
+        setLocalFolder(connected);
+        await scanLocalFolder(connected.handle);
       } else {
-        enrichedAssets.forEach(a => onAddAsset(a));
+        await scanServerFolder();
       }
-
-      setScanMessage({
-        type: 'success',
-        text: `Sincronizados ${enrichedAssets.length} archivo(s) nuevos desde "${projectFolder}".`
-      });
     } catch (err) {
       console.warn('Scan folder error:', err);
       setScanMessage({ type: 'error', text: 'Error al escanear la carpeta: ' + (err.message || err) });
     } finally {
       setIsScanning(false);
-      // Refresh disk stats after import
       getStorageDiskInfo(projectFolder).then(info => setDiskInfo(info));
     }
   };
 
-  // Keep a ref to the latest scan handler so the folder-change effect can call it safely
+  // Scan the connected local disk folder (File System Access API)
+  const scanLocalFolder = async (rootHandle) => {
+    const files = await listLocalMediaFiles({ rootHandle, projectFolder });
+
+    if (!files.length) {
+      setScanMessage({ type: 'empty', text: `La carpeta local "${localFolder?.name || ''}/${projectFolder}" no contiene archivos multimedia.` });
+      return;
+    }
+
+    const existing = buildExistingSignatures();
+    const newFiles = files.filter(f => !existing.has(String(f.filename).toLowerCase()));
+
+    if (!newFiles.length) {
+      setScanMessage({ type: 'uptodate', text: `Todo sincronizado: ${files.length} archivo(s) ya en la biblioteca.` });
+      return;
+    }
+
+    const enrichedAssets = [];
+    for (const f of newFiles) {
+      let objectUrl = null;
+      try {
+        const read = await readLocalMediaFile({ rootHandle, projectFolder, filename: f.filename });
+        objectUrl = read.objectUrl;
+      } catch (_) {
+        objectUrl = null;
+      }
+      if (!objectUrl) continue;
+
+      const asset = {
+        id: 'asset-local-' + Date.now() + '-' + Math.random().toString(36).substring(2, 8),
+        name: f.filename,
+        type: f.type,
+        url: objectUrl,
+        diskPath: `${projectFolder}/${f.filename}`,
+        localDisk: true,
+        size: f.size || 0,
+        duration: f.type === 'image' ? 5 : (f.type === 'audio' ? 10 : 5),
+        color: f.type === 'image' ? '#6366f1' : (f.type === 'audio' ? '#06b6d4' : '#10b981'),
+        source: 'local_scan',
+        isBroll: true
+      };
+      await enrichAssetMetadata(asset);
+      enrichedAssets.push(asset);
+    }
+
+    applyScannedAssets(enrichedAssets, `la carpeta local "${localFolder?.name || ''}/${projectFolder}"`);
+  };
+
+  // Scan the server-side projects_media folder (fallback / legacy)
+  const scanServerFolder = async () => {
+    const diskFiles = await listDiskMediaFiles(projectFolder);
+    if (!diskFiles.length) {
+      setScanMessage({ type: 'empty', text: `La carpeta "${projectFolder}" no contiene archivos multimedia.` });
+      return;
+    }
+
+    const existing = buildExistingSignatures();
+    const newFiles = diskFiles.filter(f => {
+      const byName = existing.has(String(f.filename).toLowerCase());
+      const byUrl = existing.has(String(f.url).toLowerCase());
+      return !byName && !byUrl;
+    });
+
+    if (!newFiles.length) {
+      setScanMessage({ type: 'uptodate', text: `Todo sincronizado: ${diskFiles.length} archivo(s) ya en la biblioteca.` });
+      return;
+    }
+
+    const enrichedAssets = [];
+    for (const f of newFiles) {
+      const asset = buildAssetFromDiskFile(f, projectFolder);
+      await enrichAssetMetadata(asset);
+      enrichedAssets.push(asset);
+    }
+
+    applyScannedAssets(enrichedAssets, `"${projectFolder}"`);
+  };
+
+  const applyScannedAssets = (enrichedAssets, sourceLabel) => {
+    if (!enrichedAssets.length) {
+      setScanMessage({ type: 'uptodate', text: 'No hay archivos nuevos para añadir.' });
+      return;
+    }
+    if (typeof onAddAssets === 'function') {
+      onAddAssets(enrichedAssets);
+    } else {
+      enrichedAssets.forEach(a => onAddAsset(a));
+    }
+    setScanMessage({
+      type: 'success',
+      text: `Sincronizados ${enrichedAssets.length} archivo(s) nuevos desde ${sourceLabel}.`
+    });
+  };
+
   scanFolderRef.current = handleScanFolder;
 
   const handleFiles = async (files) => {
@@ -205,9 +336,28 @@ export const MediaLibrary = React.memo(function MediaLibrary({
       if (!isImage && !isAudio && !isVideo) continue;
 
       const assetId = 'asset-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6);
-      const objectUrl = URL.createObjectURL(file);
+      let objectUrl = URL.createObjectURL(file);
+      let localDisk = false;
+      let diskPath = null;
 
-      // Persist raw file locally in IndexedDB (Clipchamp style local persistence)
+      // If a local media folder is connected, write the raw file straight to disk.
+      if (localFolder && localFolder.handle && !localFolder.needsPermission) {
+        try {
+          const written = await writeLocalMediaFile({
+            rootHandle: localFolder.handle,
+            projectFolder,
+            filename: file.name,
+            blob: file
+          });
+          objectUrl = written.objectUrl;
+          localDisk = true;
+          diskPath = `${written.folder}/${written.filename}`;
+        } catch (err) {
+          console.warn('Could not write uploaded file to local disk, using memory:', err);
+        }
+      }
+
+      // Always keep an IndexedDB copy as a safety net / fallback
       saveMediaBlob(assetId, file, { name: file.name, type: file.type });
 
       const newAsset = {
@@ -216,6 +366,8 @@ export const MediaLibrary = React.memo(function MediaLibrary({
         type: isImage ? 'image' : (isAudio ? 'audio' : 'video'),
         url: objectUrl,
         file: file,
+        localDisk,
+        diskPath: diskPath || undefined,
         duration: isAudio ? 10 : 5,
         size: file.size,
         color: isImage ? '#6366f1' : (isAudio ? '#06b6d4' : '#10b981')
@@ -385,41 +537,76 @@ export const MediaLibrary = React.memo(function MediaLibrary({
         </div>
       )}
 
-      {/* Disk Storage Info Bar */}
-      {diskInfo && (
+      {/* Local Media Folder Bar (Clipchamp-style disk access) */}
+      {localSupported && (
         <div style={{
           display: 'flex',
           justifyContent: 'space-between',
           alignItems: 'center',
-          padding: '6px 12px',
-          background: 'rgba(6, 182, 212, 0.05)',
-          borderBottom: '1px solid rgba(6, 182, 212, 0.15)',
+          gap: '8px',
+          padding: '7px 12px',
+          background: localFolder && !localFolder.needsPermission
+            ? 'rgba(16, 185, 129, 0.07)'
+            : 'rgba(245, 158, 11, 0.07)',
+          borderBottom: '1px solid rgba(148, 163, 184, 0.15)',
           fontSize: '11px'
         }}>
-          <span style={{ color: '#06b6d4', display: 'flex', alignItems: 'center', gap: '5px' }}>
-            <HardDrive size={12} />
-            <span style={{ fontFamily: 'monospace' }}>projects_media/{projectFolder}/</span>
+          <span style={{ display: 'flex', alignItems: 'center', gap: '6px', minWidth: 0 }}>
+            {localFolder && !localFolder.needsPermission ? (
+              <>
+                <FolderOpen size={13} style={{ color: '#34d399', flexShrink: 0 }} />
+                <span style={{ color: '#34d399', fontWeight: 600, whiteSpace: 'nowrap' }}>Carpeta local:</span>
+                <span style={{ fontFamily: 'monospace', color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={localFolder.name}>
+                  {localFolder.name}/{projectFolder}/
+                </span>
+              </>
+            ) : localFolder && localFolder.needsPermission ? (
+              <>
+                <AlertTriangle size={13} style={{ color: '#fbbf24', flexShrink: 0 }} />
+                <span style={{ color: '#fbbf24' }}>Permiso pendiente para "{localFolder.name}"</span>
+              </>
+            ) : (
+              <>
+                <HardDrive size={13} style={{ color: '#fbbf24', flexShrink: 0 }} />
+                <span style={{ color: 'var(--text-secondary)' }}>
+                  Conecta una carpeta de tu disco para guardar aquí tus medios
+                </span>
+              </>
+            )}
           </span>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-            <span style={{ color: 'var(--text-dim)' }}>
-              {diskInfo.folderFiles || 0} arch. ({diskInfo.folderFormattedSize || '0.00 MB'})
-            </span>
-            {onOpenProjectSettings && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexShrink: 0 }}>
+            {localFolder && localFolder.needsPermission ? (
               <button
                 type="button"
-                style={{
-                  background: 'transparent',
-                  border: 'none',
-                  color: '#06b6d4',
-                  cursor: 'pointer',
-                  fontSize: '10px',
-                  textDecoration: 'underline',
-                  padding: 0
-                }}
-                onClick={onOpenProjectSettings}
-                title="Cambiar carpeta en Ajustes del Proyecto"
+                className="btn-primary btn-sm"
+                onClick={handleReconnectFolder}
+                disabled={isConnectingFolder}
+                style={{ whiteSpace: 'nowrap', fontSize: '11px' }}
               >
-                Cambiar
+                <FolderOpen size={12} /> Reconectar
+              </button>
+            ) : (
+              <button
+                type="button"
+                className={localFolder ? 'btn-ghost btn-sm' : 'btn-primary btn-sm'}
+                onClick={handleConnectFolder}
+                disabled={isConnectingFolder}
+                style={{ whiteSpace: 'nowrap', fontSize: '11px' }}
+                title="Elegir una carpeta de tu disco donde vivirán los medios de tus proyectos"
+              >
+                {isConnectingFolder ? <Loader2 size={12} className="spinner" /> : <FolderPlus size={12} />}
+                {localFolder ? 'Cambiar' : 'Conectar carpeta'}
+              </button>
+            )}
+            {localFolder && !localFolder.needsPermission && (
+              <button
+                type="button"
+                className="btn-ghost icon-only btn-sm"
+                onClick={handleDisconnectFolder}
+                title="Desconectar carpeta local"
+                style={{ fontSize: '11px' }}
+              >
+                ×
               </button>
             )}
           </div>

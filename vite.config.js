@@ -44,6 +44,55 @@ if (!fs.existsSync(MEDIA_DIR)) {
   fs.mkdirSync(MEDIA_DIR, { recursive: true });
 }
 
+// Normalizes a filename for loose comparison: lowercase, collapse runs of
+// non-alphanumeric chars (_, -, space, dots) into a single underscore.
+function normalizeMediaKey(name) {
+  return String(name || '')
+    .toLowerCase()
+    .replace(/\.[^/.]+$/, '')        // strip extension
+    .replace(/[^a-z0-9]+/g, '_')     // collapse any separated runs to _
+    .replace(/^_+|_+$/g, '');       // trim leading/trailing _
+}
+
+// Resolves a requested /media-library subpath to a real file on disk.
+// Tries the exact path first; if missing, performs a normalized-name search
+// across MEDIA_DIR so assets whose stored names drifted (e.g. single vs double
+// underscore) still resolve instead of 404-ing.
+function resolveMediaFile(safePath) {
+  const exact = path.join(MEDIA_DIR, safePath);
+  if (exact.startsWith(MEDIA_DIR) && fs.existsSync(exact) && fs.statSync(exact).isFile()) {
+    return exact;
+  }
+
+  const requestedBase = path.basename(safePath);
+  const requestedKey = normalizeMediaKey(requestedBase);
+  const ext = path.extname(requestedBase).toLowerCase();
+  if (!requestedKey) return null;
+
+  let match = null;
+  const walk = (dir) => {
+    if (match) return;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (_) { return; }
+    for (const e of entries) {
+      if (match) return;
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        walk(full);
+      } else if (e.isFile()) {
+        const eExt = path.extname(e.name).toLowerCase();
+        if (ext && eExt !== ext) continue;
+        if (normalizeMediaKey(e.name) === requestedKey) {
+          match = full;
+          return;
+        }
+      }
+    }
+  };
+  walk(MEDIA_DIR);
+  return match;
+}
+
 // In-memory cache for DuckDuckGo search tokens (vqd)
 const ddgVqdCache = new Map();
 
@@ -343,9 +392,10 @@ function mediaStoragePlugin() {
           const rawSubpath = req.url.replace(/^\/media-library\//, '').split('?')[0];
           const decodedPath = decodeURIComponent(rawSubpath);
           const safePath = path.normalize(decodedPath).replace(/^(\.\.(\/|\\|$))+/, '');
-          const filePath = path.join(MEDIA_DIR, safePath);
+          // Exact match first, then tolerant normalized-name fallback (self-heals drifted filenames)
+          const filePath = resolveMediaFile(safePath);
 
-          if (!filePath.startsWith(MEDIA_DIR) || !fs.existsSync(filePath)) {
+          if (!filePath) {
             res.statusCode = 404;
             res.setHeader('Content-Type', 'application/json');
             res.end(JSON.stringify({ error: 'Media file not found on disk' }));
@@ -597,6 +647,8 @@ function mediaStoragePlugin() {
             }
 
             const targetLower = filename.toLowerCase();
+            const targetKey = normalizeMediaKey(filename);
+            const targetExt = path.extname(filename).toLowerCase();
             let found = null;
 
             const search = (dir, relParts) => {
@@ -612,14 +664,20 @@ function mediaStoragePlugin() {
                 const full = path.join(dir, e.name);
                 if (e.isDirectory()) {
                   search(full, [...relParts, e.name]);
-                } else if (e.isFile() && e.name.toLowerCase() === targetLower) {
-                  const encodedRel = [...relParts, e.name].map(p => encodeURIComponent(p)).join('/');
-                  found = {
-                    filename: e.name,
-                    folder: relParts.join('/') || null,
-                    diskPath: full,
-                    url: `/media-library/${encodedRel}`
-                  };
+                } else if (e.isFile()) {
+                  const eExt = path.extname(e.name).toLowerCase();
+                  const extOk = !targetExt || eExt === targetExt;
+                  const exact = e.name.toLowerCase() === targetLower;
+                  const loose = extOk && normalizeMediaKey(e.name) === targetKey;
+                  if (exact || loose) {
+                    const encodedRel = [...relParts, e.name].map(p => encodeURIComponent(p)).join('/');
+                    found = {
+                      filename: e.name,
+                      folder: relParts.join('/') || null,
+                      diskPath: full,
+                      url: `/media-library/${encodedRel}`
+                    };
+                  }
                 }
               }
             };

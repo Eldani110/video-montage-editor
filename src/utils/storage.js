@@ -139,6 +139,106 @@ export async function getStoredDirectoryHandle() {
 }
 
 /**
+ * Saves the local MEDIA folder handle (Clipchamp-style) to IndexedDB.
+ */
+export async function saveStoredMediaDirHandle(dirHandle) {
+  if (!dirHandle) return false;
+  try {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_SETTINGS, 'readwrite');
+      const store = tx.objectStore(STORE_SETTINGS);
+      const req = store.put({
+        key: 'active_media_directory',
+        handle: dirHandle,
+        name: dirHandle.name,
+        updatedAt: new Date().toISOString()
+      });
+      req.onsuccess = () => {
+        try {
+          if (typeof localStorage !== 'undefined') {
+            localStorage.setItem('montage_media_dir_name', dirHandle.name);
+          }
+        } catch (_) {}
+        resolve(true);
+      };
+      req.onerror = () => reject(req.error);
+    });
+  } catch (err) {
+    console.warn('Could not save media directory handle to IndexedDB:', err);
+    return false;
+  }
+}
+
+/**
+ * Retrieves the saved local MEDIA folder handle from IndexedDB.
+ */
+export async function getStoredMediaDirHandle() {
+  try {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_SETTINGS, 'readonly');
+      const store = tx.objectStore(STORE_SETTINGS);
+      const req = store.get('active_media_directory');
+      req.onsuccess = () => {
+        const result = req.result;
+        if (result && result.handle) {
+          resolve({
+            handle: result.handle,
+            name: result.name || result.handle.name,
+            updatedAt: result.updatedAt
+          });
+        } else {
+          resolve(null);
+        }
+      };
+      req.onerror = () => reject(req.error);
+    });
+  } catch (err) {
+    console.warn('Could not get media directory handle from IndexedDB:', err);
+    return null;
+  }
+}
+
+/**
+ * Clears the saved MEDIA folder handle from IndexedDB.
+ */
+export async function clearStoredMediaDirHandle() {
+  try {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_SETTINGS, 'readwrite');
+      const store = tx.objectStore(STORE_SETTINGS);
+      const req = store.delete('active_media_directory');
+      req.onsuccess = () => {
+        try {
+          if (typeof localStorage !== 'undefined') {
+            localStorage.removeItem('montage_media_dir_name');
+          }
+        } catch (_) {}
+        resolve(true);
+      };
+      req.onerror = () => reject(req.error);
+    });
+  } catch (err) {
+    console.warn('Could not clear media directory handle from IndexedDB:', err);
+    return false;
+  }
+}
+
+/**
+ * Gets the saved MEDIA folder name from localStorage as instant fallback.
+ */
+export function getStoredMediaDirNameFallback() {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      return localStorage.getItem('montage_media_dir_name');
+    }
+  } catch (_) {}
+  return null;
+}
+
+/**
  * Clears the saved directory handle from IndexedDB
  */
 export async function clearStoredDirectoryHandle() {

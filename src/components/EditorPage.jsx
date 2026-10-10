@@ -23,7 +23,8 @@ import {
   CloudOff,
   Loader2,
   ShieldCheck,
-  RefreshCw
+  RefreshCw,
+  AlertTriangle
 } from 'lucide-react';
 import { MediaLibrary } from './MediaLibrary';
 import { ClipInspector } from './ClipInspector';
@@ -42,6 +43,7 @@ import { StockMediaSearchModal } from './StockMediaSearchModal';
 import { saveProjectToDisk, hasDiskFileHandle } from '../utils/fileSystem';
 import { saveProjectToCache, getMediaBlob, saveMediaBlob } from '../utils/storage';
 import { repairAssetUrls } from '../utils/stockMediaClient';
+import { getConnectedMediaFolder, readLocalMediaFile } from '../utils/localMedia';
 import { getAutosaveConfig, saveAutosaveConfig } from '../utils/autosaveConfig';
 import { AutosaveSettingsModal } from './AutosaveSettingsModal';
 import { extractAudioTrackToWavBlob } from '../utils/audioExtractor';
@@ -105,6 +107,8 @@ export function EditorPage({
   const [historyPast, setHistoryPast] = useState([]);
   const [historyFuture, setHistoryFuture] = useState([]);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [localFolderMissing, setLocalFolderMissing] = useState(false);
+  const [isReconnectingFolder, setIsReconnectingFolder] = useState(false);
   const [showExportModal, setShowExportModal] = useState(false);
   const [showTranscribeModal, setShowTranscribeModal] = useState(false);
   const [showSceneDirectorModal, setShowSceneDirectorModal] = useState(false);
@@ -346,10 +350,39 @@ export function EditorPage({
           }
 
           if (needsRestore) {
-            const blob = await getMediaBlob(currentAsset.id);
-            if (blob) {
-              hasRestored = true;
-              currentAsset = { ...currentAsset, url: URL.createObjectURL(blob) };
+            // 1. Try to revive from the connected LOCAL media folder (Clipchamp-style disk storage)
+            if (currentAsset.localDisk && currentAsset.name) {
+              try {
+                const connected = await getConnectedMediaFolder(false);
+                if (connected && connected.handle && !connected.needsPermission) {
+                  const folder = getProjectMediaFolder(projectRef.current || project);
+                  const read = await readLocalMediaFile({
+                    rootHandle: connected.handle,
+                    projectFolder: folder,
+                    filename: currentAsset.name
+                  });
+                  if (read && read.objectUrl) {
+                    hasRestored = true;
+                    currentAsset = { ...currentAsset, url: read.objectUrl, missing: false };
+                  }
+                } else {
+                  // Local folder not connected -> mark so the UI can prompt to reconnect
+                  currentAsset = { ...currentAsset, needsLocalFolder: true };
+                  if (!isCancelled) setLocalFolderMissing(true);
+                }
+              } catch (err) {
+                console.warn('Could not read asset from local folder:', err);
+                currentAsset = { ...currentAsset, missing: true };
+              }
+            }
+
+            // 2. Fall back to IndexedDB copy
+            if (!currentAsset.url || (currentAsset.url && currentAsset.url.startsWith('blob:') && !hasRestored)) {
+              const blob = await getMediaBlob(currentAsset.id);
+              if (blob) {
+                hasRestored = true;
+                currentAsset = { ...currentAsset, url: URL.createObjectURL(blob), missing: false };
+              }
             }
           }
 
@@ -559,6 +592,36 @@ export function EditorPage({
   // Ref mirror so effects/timeouts can call the latest updateProjectData without stale closures
   const updateProjectDataRef = useRef(updateProjectData);
   updateProjectDataRef.current = updateProjectData;
+
+  const handleReconnectLocalFolder = async () => {
+    setIsReconnectingFolder(true);
+    try {
+      const connected = await getConnectedMediaFolder(true);
+      if (connected && connected.handle && !connected.needsPermission) {
+        setLocalFolderMissing(false);
+        // Re-read all localDisk assets from the folder
+        const folder = getProjectMediaFolder(projectRef.current || project);
+        const current = projectRef.current || project;
+        const updated = await Promise.all((current.assets || []).map(async (asset) => {
+          if (!asset.localDisk || !asset.name) return asset;
+          try {
+            const read = await readLocalMediaFile({
+              rootHandle: connected.handle,
+              projectFolder: folder,
+              filename: asset.name
+            });
+            if (read && read.objectUrl) {
+              return { ...asset, url: read.objectUrl, needsLocalFolder: false, missing: false };
+            }
+          } catch (_) {}
+          return asset;
+        }));
+        updateProjectDataRef.current?.({ ...current, assets: updated }, false, false);
+      }
+    } finally {
+      setIsReconnectingFolder(false);
+    }
+  };
 
   // Auto-heal broken disk asset URLs (e.g. after the project media folder changed
   // or the file was moved). Runs once per project load, silently in the background.
@@ -1367,6 +1430,39 @@ export function EditorPage({
           <UserNav onGoToAuth={onGoToAuth} />
         </div>
       </header>
+
+      {/* Local media folder reconnect banner */}
+      {localFolderMissing && (
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: '12px',
+          padding: '10px 18px',
+          background: 'linear-gradient(90deg, rgba(245, 158, 11, 0.14), rgba(245, 158, 11, 0.05))',
+          borderBottom: '1px solid rgba(245, 158, 11, 0.35)',
+          fontSize: '13px'
+        }}>
+          <span style={{ display: 'flex', alignItems: 'center', gap: '9px', color: '#fbbf24' }}>
+            <AlertTriangle size={16} />
+            <span>
+              <strong>No encuentro la carpeta de recursos de este proyecto.</strong>{' '}
+              <span style={{ color: 'var(--text-secondary)' }}>
+                Los medios viven en tu disco local. Localiza la carpeta para reconectar los archivos.
+              </span>
+            </span>
+          </span>
+          <button
+            className="btn-primary btn-sm"
+            onClick={handleReconnectLocalFolder}
+            disabled={isReconnectingFolder}
+            style={{ whiteSpace: 'nowrap', flexShrink: 0 }}
+          >
+            {isReconnectingFolder ? <Loader2 size={14} className="spinner" /> : <FolderOpen size={14} />}
+            {isReconnectingFolder ? 'Localizando...' : 'Localizar carpeta'}
+          </button>
+        </div>
+      )}
 
       {/* Main Workspace (Split: Left Sidebar + Center Monitor / Bottom Timeline) */}
       <div className="editor-workspace">
