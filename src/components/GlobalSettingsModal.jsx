@@ -18,8 +18,7 @@ import {
   Film,
   Download,
   Search,
-  ShieldCheck,
-  Save
+  ShieldCheck
 } from 'lucide-react';
 import { getAutosaveConfig, saveAutosaveConfig } from '../utils/autosaveConfig';
 import {
@@ -35,10 +34,7 @@ import {
   getStorageDiskInfo,
   searchStockMedia,
   getDiskMediaFolders,
-  updateBaseMediaDir,
-  setRemoteMediaUrl,
-  getRemoteMediaStatus,
-  getStorageConfig
+  updateBaseMediaDir
 } from '../utils/stockMediaClient';
 
 export function GlobalSettingsModal({ isOpen, onClose }) {
@@ -58,10 +54,6 @@ export function GlobalSettingsModal({ isOpen, onClose }) {
   const [successMessage, setSuccessMessage] = useState(null);
   const [activeTab, setActiveTab] = useState('ai'); // 'ai' | 'stock' | 'storage'
   const [isManualModel, setIsManualModel] = useState(false);
-  const [remoteUrlInput, setRemoteUrlInput] = useState('');
-  const [remoteStatus, setRemoteStatus] = useState(null);
-  const [isSavingRemote, setIsSavingRemote] = useState(false);
-  const [isTestingRemote, setIsTestingRemote] = useState(false);
 
   useEffect(() => {
     if (isOpen) {
@@ -76,41 +68,9 @@ export function GlobalSettingsModal({ isOpen, onClose }) {
         if (info?.mediaDir) setBaseDirInput(info.mediaDir);
       });
       getDiskMediaFolders().then(folders => setDiskFolders(folders));
-      getStorageConfig().then(cfg => {
-        if (cfg?.remoteMediaUrl) setRemoteUrlInput(cfg.remoteMediaUrl);
-      });
-      getRemoteMediaStatus().then(st => setRemoteStatus(st));
       setSuccessMessage(null);
     }
   }, [isOpen]);
-
-  const handleSaveRemoteUrl = async () => {
-    setIsSavingRemote(true);
-    setErrorMessage(null);
-    setSuccessMessage(null);
-    try {
-      await setRemoteMediaUrl(remoteUrlInput.trim());
-      const st = await getRemoteMediaStatus();
-      setRemoteStatus(st);
-      setSuccessMessage(remoteUrlInput.trim()
-        ? 'Servidor de medios remoto guardado.'
-        : 'Servidor de medios remoto desactivado.');
-    } catch (err) {
-      setErrorMessage('No se pudo guardar: ' + (err.message || err));
-    } finally {
-      setIsSavingRemote(false);
-    }
-  };
-
-  const handleTestRemote = async () => {
-    setIsTestingRemote(true);
-    try {
-      const st = await getRemoteMediaStatus();
-      setRemoteStatus(st);
-    } finally {
-      setIsTestingRemote(false);
-    }
-  };
 
   if (!isOpen) return null;
 
@@ -930,58 +890,6 @@ export function GlobalSettingsModal({ isOpen, onClose }) {
                         </button>
                       ))}
                     </div>
-                  </div>
-                )}
-              </div>
-
-              <div className="form-group" style={{ background: 'var(--bg-input)', padding: '14px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-subtle)' }}>
-                <h4 style={{ margin: '0 0 6px 0', fontSize: '13px', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                  <HardDrive size={16} className="text-cyan" />
-                  Servidor de medios remoto (tu PC)
-                </h4>
-                <p style={{ fontSize: '12px', color: 'var(--text-secondary)', margin: '0 0 10px 0', lineHeight: 1.5 }}>
-                  Si esta app corre en un servidor (VPS) pero tus medios viven en tu PC, indica aquí la URL pública/túnel de tu servidor de medios local.
-                  El servidor reenviará automáticamente los archivos que no tenga. Funciona desde cualquier dispositivo.
-                </p>
-                <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                  <input
-                    type="text"
-                    className="input-field"
-                    style={{ flex: 1, fontFamily: 'monospace', fontSize: '12px' }}
-                    placeholder="https://mi-pc.trycloudflare.com"
-                    value={remoteUrlInput}
-                    onChange={(e) => setRemoteUrlInput(e.target.value)}
-                  />
-                  <button
-                    type="button"
-                    className="btn-primary btn-sm"
-                    onClick={handleSaveRemoteUrl}
-                    disabled={isSavingRemote}
-                    style={{ whiteSpace: 'nowrap' }}
-                  >
-                    {isSavingRemote ? <Loader2 size={13} className="spinner" /> : <Save size={13} />}
-                    Guardar
-                  </button>
-                  <button
-                    type="button"
-                    className="btn-secondary btn-sm"
-                    onClick={handleTestRemote}
-                    disabled={isTestingRemote}
-                    style={{ whiteSpace: 'nowrap' }}
-                  >
-                    {isTestingRemote ? <Loader2 size={13} className="spinner" /> : <RefreshCw size={13} />}
-                    Probar
-                  </button>
-                </div>
-                {remoteStatus && (
-                  <div style={{ marginTop: '8px', fontSize: '11px', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                    {remoteStatus.configured && remoteStatus.reachable ? (
-                      <span style={{ color: '#34d399' }}>● Conectado a {remoteStatus.url}</span>
-                    ) : remoteStatus.configured ? (
-                      <span style={{ color: '#fbbf24' }}>● Configurado pero no responde ({remoteStatus.url})</span>
-                    ) : (
-                      <span style={{ color: 'var(--text-dim)' }}>● No configurado — se usa el disco del servidor</span>
-                    )}
                   </div>
                 )}
               </div>

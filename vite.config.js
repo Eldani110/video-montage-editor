@@ -9,107 +9,11 @@ import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-// Persistent storage config file (survives server restarts/redeploys)
-const MEDIA_CONFIG_FILE = path.resolve(__dirname, '.media-config.json');
-
-function readMediaConfig() {
-  try {
-    if (fs.existsSync(MEDIA_CONFIG_FILE)) {
-      return JSON.parse(fs.readFileSync(MEDIA_CONFIG_FILE, 'utf-8') || '{}');
-    }
-  } catch (err) {
-    console.warn('[media-config] No se pudo leer la config persistida:', err.message);
-  }
-  return {};
-}
-
-function writeMediaConfig(patch) {
-  try {
-    const current = readMediaConfig();
-    const next = { ...current, ...patch };
-    fs.writeFileSync(MEDIA_CONFIG_FILE, JSON.stringify(next, null, 2), 'utf-8');
-    return true;
-  } catch (err) {
-    console.warn('[media-config] No se pudo persistir la config:', err.message);
-    return false;
-  }
-}
-
-function loadPersistedMediaDir() {
-  const cfg = readMediaConfig();
-  if (cfg.baseMediaDir && typeof cfg.baseMediaDir === 'string') {
-    const resolved = path.resolve(cfg.baseMediaDir);
-    if (fs.existsSync(resolved)) return resolved;
-  }
-  return null;
-}
-
-function persistMediaDir(dir) {
-  writeMediaConfig({ baseMediaDir: dir });
-}
-
-let MEDIA_DIR = loadPersistedMediaDir() || path.resolve(__dirname, 'projects_media');
-
-// Remote media server (Option 2: your PC serves the media, the server proxies to it).
-// Any device -> this server -> remote PC (tunnel/IP) -> the PC's disk.
-const initialConfig = readMediaConfig();
-let REMOTE_MEDIA_URL = typeof initialConfig.remoteMediaUrl === 'string'
-  ? initialConfig.remoteMediaUrl.replace(/\/+$/, '')
-  : '';
+let MEDIA_DIR = path.resolve(__dirname, 'projects_media');
 
 // Ensure media folder exists on disk
 if (!fs.existsSync(MEDIA_DIR)) {
   fs.mkdirSync(MEDIA_DIR, { recursive: true });
-}
-
-// Normalizes a filename for loose comparison: lowercase, collapse runs of
-// non-alphanumeric chars (_, -, space, dots) into a single underscore.
-function normalizeMediaKey(name) {
-  return String(name || '')
-    .toLowerCase()
-    .replace(/\.[^/.]+$/, '')        // strip extension
-    .replace(/[^a-z0-9]+/g, '_')     // collapse any separated runs to _
-    .replace(/^_+|_+$/g, '');       // trim leading/trailing _
-}
-
-// Resolves a requested /media-library subpath to a real file on disk.
-// Tries the exact path first; if missing, performs a normalized-name search
-// across MEDIA_DIR so assets whose stored names drifted (e.g. single vs double
-// underscore) still resolve instead of 404-ing.
-function resolveMediaFile(safePath) {
-  const exact = path.join(MEDIA_DIR, safePath);
-  if (exact.startsWith(MEDIA_DIR) && fs.existsSync(exact) && fs.statSync(exact).isFile()) {
-    return exact;
-  }
-
-  const requestedBase = path.basename(safePath);
-  const requestedKey = normalizeMediaKey(requestedBase);
-  const ext = path.extname(requestedBase).toLowerCase();
-  if (!requestedKey) return null;
-
-  let match = null;
-  const walk = (dir) => {
-    if (match) return;
-    let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (_) { return; }
-    for (const e of entries) {
-      if (match) return;
-      const full = path.join(dir, e.name);
-      if (e.isDirectory()) {
-        walk(full);
-      } else if (e.isFile()) {
-        const eExt = path.extname(e.name).toLowerCase();
-        if (ext && eExt !== ext) continue;
-        if (normalizeMediaKey(e.name) === requestedKey) {
-          match = full;
-          return;
-        }
-      }
-    }
-  };
-  walk(MEDIA_DIR);
-  return match;
 }
 
 // In-memory cache for DuckDuckGo search tokens (vqd)
@@ -401,48 +305,6 @@ const CURATED_STOCK_LIBRARY = {
   ]
 };
 
-// Proxies a /media-library request to the configured remote media server (the user's PC).
-// Streams the response back (supports GET/HEAD and HTTP Range for video seeking).
-async function proxyRemoteMedia(req, res, remoteBase) {
-  const remoteUrl = remoteBase + req.url;
-  const headers = {};
-  if (req.headers.range) headers.Range = req.headers.range;
-  if (req.headers['if-none-match']) headers['If-None-Match'] = req.headers['if-none-match'];
-  if (req.headers['if-modified-since']) headers['If-Modified-Since'] = req.headers['if-modified-since'];
-
-  let upstream;
-  try {
-    upstream = await fetch(remoteUrl, { method: req.method, headers });
-  } catch (err) {
-    res.statusCode = 502;
-    res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify({ error: 'Remote media server unreachable', detail: err.message }));
-    return;
-  }
-
-  res.statusCode = upstream.status;
-  // Copy useful headers
-  const passthrough = ['content-type', 'content-length', 'content-range', 'accept-ranges', 'last-modified', 'etag', 'cache-control'];
-  for (const h of passthrough) {
-    const v = upstream.headers.get(h);
-    if (v) res.setHeader(h, v);
-  }
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('X-Media-Source', 'remote');
-
-  if (req.method === 'HEAD' || !upstream.body) {
-    res.end();
-    return;
-  }
-
-  try {
-    const { Readable } = await import('node:stream');
-    Readable.fromWeb(upstream.body).pipe(res);
-  } catch (_) {
-    res.end();
-  }
-}
-
 function mediaStoragePlugin() {
   const plugin = {
     name: 'media-storage-middleware',
@@ -453,14 +315,9 @@ function mediaStoragePlugin() {
           const rawSubpath = req.url.replace(/^\/media-library\//, '').split('?')[0];
           const decodedPath = decodeURIComponent(rawSubpath);
           const safePath = path.normalize(decodedPath).replace(/^(\.\.(\/|\\|$))+/, '');
-          // Exact match first, then tolerant normalized-name fallback (self-heals drifted filenames)
-          const filePath = resolveMediaFile(safePath);
+          const filePath = path.join(MEDIA_DIR, safePath);
 
-          if (!filePath) {
-            // Not on this server's disk: proxy to the remote media server (user's PC) if configured.
-            if (REMOTE_MEDIA_URL) {
-              return proxyRemoteMedia(req, res, REMOTE_MEDIA_URL);
-            }
+          if (!filePath.startsWith(MEDIA_DIR) || !fs.existsSync(filePath)) {
             res.statusCode = 404;
             res.setHeader('Content-Type', 'application/json');
             res.end(JSON.stringify({ error: 'Media file not found on disk' }));
@@ -545,8 +402,7 @@ function mediaStoragePlugin() {
             res.setHeader('Access-Control-Allow-Origin', '*');
             res.end(JSON.stringify({
               baseMediaDir: MEDIA_DIR,
-              exists: fs.existsSync(MEDIA_DIR),
-              remoteMediaUrl: REMOTE_MEDIA_URL || null
+              exists: fs.existsSync(MEDIA_DIR)
             }));
             return;
           }
@@ -555,37 +411,20 @@ function mediaStoragePlugin() {
             req.on('data', chunk => { bodyRaw += chunk; });
             req.on('end', () => {
               try {
-                const body = JSON.parse(bodyRaw || '{}');
-                let updated = false;
-
-                if (body.baseMediaDir && typeof body.baseMediaDir === 'string') {
-                  const resolved = path.resolve(body.baseMediaDir);
+                const { baseMediaDir } = JSON.parse(bodyRaw || '{}');
+                if (baseMediaDir && typeof baseMediaDir === 'string') {
+                  const resolved = path.resolve(baseMediaDir);
                   if (!fs.existsSync(resolved)) {
                     fs.mkdirSync(resolved, { recursive: true });
                   }
                   MEDIA_DIR = resolved;
-                  persistMediaDir(resolved); // Survive restarts/redeploys
-                  updated = true;
-                }
-
-                if (typeof body.remoteMediaUrl === 'string') {
-                  REMOTE_MEDIA_URL = body.remoteMediaUrl.trim().replace(/\/+$/, '');
-                  writeMediaConfig({ remoteMediaUrl: REMOTE_MEDIA_URL });
-                  updated = true;
-                }
-
-                if (updated) {
                   res.statusCode = 200;
                   res.setHeader('Content-Type', 'application/json');
                   res.setHeader('Access-Control-Allow-Origin', '*');
-                  res.end(JSON.stringify({
-                    success: true,
-                    baseMediaDir: MEDIA_DIR,
-                    remoteMediaUrl: REMOTE_MEDIA_URL || null
-                  }));
+                  res.end(JSON.stringify({ success: true, baseMediaDir: MEDIA_DIR }));
                 } else {
                   res.statusCode = 400;
-                  res.end(JSON.stringify({ error: 'Nada que actualizar' }));
+                  res.end(JSON.stringify({ error: 'Ruta base inválida' }));
                 }
               } catch (err) {
                 res.statusCode = 500;
@@ -594,35 +433,6 @@ function mediaStoragePlugin() {
             });
             return;
           }
-        }
-
-        // Remote media server connectivity test
-        if (req.url && req.url.startsWith('/api/media/remote-status')) {
-          (async () => {
-            const configured = Boolean(REMOTE_MEDIA_URL);
-            let reachable = false;
-            let detail = null;
-            if (configured) {
-              try {
-                const controller = new AbortController();
-                const timer = setTimeout(() => controller.abort(), 5000);
-                const probe = await fetch(`${REMOTE_MEDIA_URL}/api/media/config`, { signal: controller.signal });
-                clearTimeout(timer);
-                reachable = probe.ok;
-                if (reachable) {
-                  const data = await probe.json().catch(() => ({}));
-                  detail = { baseMediaDir: data.baseMediaDir || null };
-                }
-              } catch (err) {
-                detail = err.message;
-              }
-            }
-            res.statusCode = 200;
-            res.setHeader('Content-Type', 'application/json');
-            res.setHeader('Access-Control-Allow-Origin', '*');
-            res.end(JSON.stringify({ configured, reachable, url: REMOTE_MEDIA_URL || null, detail }));
-          })();
-          return;
         }
 
         // 3. Project Media Folders Listing Endpoint
@@ -661,148 +471,6 @@ function mediaStoragePlugin() {
           } catch (err) {
             res.statusCode = 500;
             res.end(JSON.stringify({ error: err.message, folders: [] }));
-          }
-          return;
-        }
-
-        // 3.5. Media File Listing Endpoint: Enumerates actual files inside a project folder
-        // Used so the editor can auto-discover media already present on disk (not just app-downloaded assets)
-        if (req.url && req.url.startsWith('/api/media/list')) {
-          try {
-            const urlObj = new URL(req.url, `http://${req.headers.host || 'localhost:5173'}`);
-            const requestedFolder = (urlObj.searchParams.get('folder') || '').trim();
-
-            const safeFolder = requestedFolder
-              .replace(/[^a-zA-Z0-9_\-\s]/g, '_')
-              .replace(/\.\./g, '')
-              .replace(/\s+/g, '_');
-
-            const targetDir = safeFolder ? path.join(MEDIA_DIR, safeFolder) : MEDIA_DIR;
-
-            if (!targetDir.startsWith(MEDIA_DIR) || !fs.existsSync(targetDir)) {
-              res.statusCode = 200;
-              res.setHeader('Content-Type', 'application/json');
-              res.setHeader('Access-Control-Allow-Origin', '*');
-              res.end(JSON.stringify({ folder: safeFolder || null, exists: false, files: [] }));
-              return;
-            }
-
-            const VIDEO_EXT = new Set(['.mp4', '.webm', '.mov', '.m4v', '.mkv', '.avi']);
-            const IMAGE_EXT = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.svg', '.avif']);
-            const AUDIO_EXT = new Set(['.mp3', '.wav', '.m4a', '.ogg', '.aac', '.flac']);
-
-            const files = [];
-            const entries = fs.readdirSync(targetDir, { withFileTypes: true });
-            for (const e of entries) {
-              if (!e.isFile()) continue;
-              const ext = path.extname(e.name).toLowerCase();
-              let type = null;
-              if (VIDEO_EXT.has(ext)) type = 'video';
-              else if (IMAGE_EXT.has(ext)) type = 'image';
-              else if (AUDIO_EXT.has(ext)) type = 'audio';
-              if (!type) continue;
-
-              let size = 0;
-              let mtimeMs = 0;
-              try {
-                const st = fs.statSync(path.join(targetDir, e.name));
-                size = st.size;
-                mtimeMs = st.mtimeMs;
-              } catch (_) {}
-
-              const encodedFolder = safeFolder ? `${encodeURIComponent(safeFolder)}/` : '';
-              files.push({
-                filename: e.name,
-                type,
-                ext,
-                size,
-                mtimeMs,
-                url: `/media-library/${encodedFolder}${encodeURIComponent(e.name)}`,
-                contentType: MIME_TYPES[ext] || 'application/octet-stream'
-              });
-            }
-
-            // Newest first
-            files.sort((a, b) => b.mtimeMs - a.mtimeMs);
-
-            res.statusCode = 200;
-            res.setHeader('Content-Type', 'application/json');
-            res.setHeader('Access-Control-Allow-Origin', '*');
-            res.end(JSON.stringify({
-              folder: safeFolder || null,
-              exists: true,
-              count: files.length,
-              files
-            }));
-          } catch (err) {
-            console.error('Error listing media folder:', err);
-            res.statusCode = 500;
-            res.setHeader('Content-Type', 'application/json');
-            res.end(JSON.stringify({ error: err.message, files: [] }));
-          }
-          return;
-        }
-
-        // 3.6. Media Locate Endpoint: Finds a file by name anywhere in MEDIA_DIR (recursive)
-        // Used to self-heal broken asset URLs after the media folder changed.
-        if (req.url && req.url.startsWith('/api/media/locate')) {
-          try {
-            const urlObj = new URL(req.url, `http://${req.headers.host || 'localhost:5173'}`);
-            const filename = (urlObj.searchParams.get('filename') || '').trim();
-
-            if (!filename) {
-              res.statusCode = 400;
-              res.setHeader('Content-Type', 'application/json');
-              res.end(JSON.stringify({ error: 'Missing filename param' }));
-              return;
-            }
-
-            const targetLower = filename.toLowerCase();
-            const targetKey = normalizeMediaKey(filename);
-            const targetExt = path.extname(filename).toLowerCase();
-            let found = null;
-
-            const search = (dir, relParts) => {
-              if (found) return;
-              let entries;
-              try {
-                entries = fs.readdirSync(dir, { withFileTypes: true });
-              } catch (_) {
-                return;
-              }
-              for (const e of entries) {
-                if (found) return;
-                const full = path.join(dir, e.name);
-                if (e.isDirectory()) {
-                  search(full, [...relParts, e.name]);
-                } else if (e.isFile()) {
-                  const eExt = path.extname(e.name).toLowerCase();
-                  const extOk = !targetExt || eExt === targetExt;
-                  const exact = e.name.toLowerCase() === targetLower;
-                  const loose = extOk && normalizeMediaKey(e.name) === targetKey;
-                  if (exact || loose) {
-                    const encodedRel = [...relParts, e.name].map(p => encodeURIComponent(p)).join('/');
-                    found = {
-                      filename: e.name,
-                      folder: relParts.join('/') || null,
-                      diskPath: full,
-                      url: `/media-library/${encodedRel}`
-                    };
-                  }
-                }
-              }
-            };
-
-            search(MEDIA_DIR, []);
-
-            res.statusCode = 200;
-            res.setHeader('Content-Type', 'application/json');
-            res.setHeader('Access-Control-Allow-Origin', '*');
-            res.end(JSON.stringify({ found: Boolean(found), ...(found || {}) }));
-          } catch (err) {
-            res.statusCode = 500;
-            res.setHeader('Content-Type', 'application/json');
-            res.end(JSON.stringify({ error: err.message, found: false }));
           }
           return;
         }

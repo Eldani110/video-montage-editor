@@ -5,8 +5,6 @@
  * and registers them as standard project resources without touching IndexedDB.
  */
 
-import { getConnectedMediaFolder, writeLocalMediaFile } from './localMedia';
-
 const STORAGE_KEY_STOCK = 'montage_stock_config';
 const API_BASE = typeof window !== 'undefined' ? '' : 'http://localhost:5173';
 
@@ -317,64 +315,6 @@ export function getProjectMediaFolder(project) {
  * Downloads a chosen stock media item directly to the project's disk folder
  * Returns metadata and static /media-library/ URL
  */
-/**
- * Attempts to persist a stock media item straight into the user's connected local
- * media folder. Returns { asset, downloadResult } on success, or null when no local
- * folder is connected (in which case the caller falls back to the server).
- */
-async function tryWriteStockMediaLocally({ mediaItem, targetFolder, filename }) {
-  try {
-    const connected = await getConnectedMediaFolder(false);
-    if (!connected || !connected.handle || connected.needsPermission) return null;
-
-    const remoteUrl = mediaItem.downloadUrl;
-    const resp = await fetch(remoteUrl);
-    if (!resp.ok) return null;
-    const blob = await resp.blob();
-
-    const written = await writeLocalMediaFile({
-      rootHandle: connected.handle,
-      filename,
-      blob
-    });
-
-    const isVideo = mediaItem.type === 'video' || (blob.type || '').includes('video');
-    const assetId = `asset_broll_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
-
-    const newAsset = {
-      id: assetId,
-      name: written.filename,
-      type: isVideo ? 'video' : 'image',
-      url: written.objectUrl,
-      diskPath: written.diskPath,
-      localDisk: true,
-      size: written.size,
-      duration: mediaItem.duration || 10,
-      width: mediaItem.width || 1280,
-      height: mediaItem.height || 720,
-      thumbnail: mediaItem.thumbnail || written.objectUrl,
-      color: isVideo ? '#06b6d4' : '#6366f1',
-      source: 'stock_api',
-      isBroll: true
-    };
-
-    return {
-      asset: newAsset,
-      downloadResult: {
-        success: true,
-        filename: written.filename,
-        localUrl: written.objectUrl,
-        diskPath: written.diskPath,
-        size: written.size,
-        local: true
-      }
-    };
-  } catch (err) {
-    console.warn('Local media write failed, falling back to server:', err);
-    return null;
-  }
-}
-
 export async function downloadStockMediaToDisk({
   mediaItem,
   projectId = 'default',
@@ -403,18 +343,6 @@ export async function downloadStockMediaToDisk({
 
   const targetFolder = (projectFolder || projectId || 'default').trim();
 
-  // 1. Try saving directly to the user's LOCAL disk folder (Clipchamp-style),
-  //    so media lives on the user's machine regardless of where the app is served.
-  const localResult = await tryWriteStockMediaLocally({
-    mediaItem,
-    targetFolder,
-    filename
-  });
-  if (localResult) {
-    return localResult;
-  }
-
-  // 2. Fallback: server-side download into projects_media (original behaviour)
   const payload = {
     url: mediaItem.downloadUrl,
     fallbackUrl: mediaItem.fallbackUrl || mediaItem.thumbnail || null,
@@ -493,106 +421,6 @@ export async function getStorageDiskInfo(projectFolder = null) {
 }
 
 /**
- * Lists the actual media files present inside a project's disk folder.
- * Enables the editor to auto-discover media already on disk (not just app-registered assets).
- */
-export async function listDiskMediaFiles(projectFolder = null) {
-  try {
-    const url = projectFolder
-      ? `${API_BASE}/api/media/list?folder=${encodeURIComponent(projectFolder)}`
-      : `${API_BASE}/api/media/list`;
-    const res = await fetch(url);
-    if (res.ok) {
-      const data = await res.json();
-      return data.files || [];
-    }
-  } catch (err) {
-    console.warn('Could not list disk media files:', err);
-  }
-  return [];
-}
-
-/**
- * Locates a media file by name anywhere inside the base media dir (recursive).
- * Returns { found, url, folder, filename } — used to self-heal broken asset URLs.
- */
-export async function locateMediaFile(filename) {
-  if (!filename) return { found: false };
-  try {
-    const res = await fetch(`${API_BASE}/api/media/locate?filename=${encodeURIComponent(filename)}`);
-    if (res.ok) return await res.json();
-  } catch (err) {
-    console.warn('Could not locate media file:', err);
-  }
-  return { found: false };
-}
-
-/**
- * Repairs asset URLs: for each asset whose file can no longer be found at its
- * stored path, tries to locate it elsewhere and rewrites the URL.
- * Returns a new array of assets (only changed ones differ).
- */
-export async function repairAssetUrls(assets = [], onProgress = null) {
-  const repaired = [];
-  let fixedCount = 0;
-  let checkedCount = 0;
-
-  for (const asset of assets) {
-    checkedCount++;
-    if (onProgress) onProgress(checkedCount, assets.length);
-
-    // Only disk-backed assets with a name can be repaired
-    const isDiskAsset = asset.url && String(asset.url).includes('/media-library/');
-    if (!isDiskAsset || !asset.name) {
-      repaired.push(asset);
-      continue;
-    }
-
-    const bareUrl = String(asset.url).split('?')[0];
-
-    // Resolve the canonical on-disk location for this asset name.
-    // This also reconciles file-name drift (e.g. single vs double underscore).
-    const loc = await locateMediaFile(asset.name);
-
-    if (loc && loc.found && loc.url) {
-      const canonicalBare = String(loc.url).split('?')[0];
-      const nameChanged = loc.filename && loc.filename !== asset.name;
-      const urlChanged = canonicalBare !== bareUrl;
-
-      if (nameChanged || urlChanged) {
-        repaired.push({
-          ...asset,
-          name: loc.filename || asset.name,
-          url: canonicalBare + '?t=' + Date.now(),
-          diskPath: canonicalBare
-        });
-        fixedCount++;
-      } else {
-        repaired.push(asset);
-      }
-      continue;
-    }
-
-    // Could not locate anywhere: only keep the asset if its URL still responds
-    let alive = false;
-    try {
-      const head = await fetch(bareUrl, { method: 'HEAD' });
-      alive = head.ok;
-    } catch (_) {
-      alive = false;
-    }
-
-    repaired.push(asset);
-    if (!alive) {
-      // Mark as missing so the UI can flag it (kept in project to avoid data loss)
-      repaired[repaired.length - 1] = { ...asset, missing: true };
-    }
-  }
-
-  return { assets: repaired, fixedCount };
-}
-
-/**
  * Fetches the list of subfolders in the media directory
  */
 export async function getDiskMediaFolders() {
@@ -619,36 +447,6 @@ export async function getStorageConfig() {
     console.warn('Could not fetch storage config:', err);
   }
   return { baseMediaDir: 'projects_media', exists: true };
-}
-
-/**
- * Sets the remote media server URL (your PC). The server proxies /media-library
- * requests to it when a file is not present locally.
- */
-export async function setRemoteMediaUrl(url) {
-  const res = await fetch(`${API_BASE}/api/media/config`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ remoteMediaUrl: url || '' })
-  });
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    throw new Error(data.error || `HTTP ${res.status}`);
-  }
-  return await res.json();
-}
-
-/**
- * Tests connectivity to the configured remote media server.
- */
-export async function getRemoteMediaStatus() {
-  try {
-    const res = await fetch(`${API_BASE}/api/media/remote-status`);
-    if (res.ok) return await res.json();
-  } catch (err) {
-    console.warn('Could not query remote media status:', err);
-  }
-  return { configured: false, reachable: false, url: null };
 }
 
 /**
