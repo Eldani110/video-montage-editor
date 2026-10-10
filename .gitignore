@@ -10,6 +10,9 @@ projects_media/*
 !projects_media/.gitkeep
 scratch/
 
+# Persistent local media base-dir config (machine/VPS specific)
+.media-config.json
+
 # Environment files
 .env
 .env.local

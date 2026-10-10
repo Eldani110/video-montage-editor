@@ -41,6 +41,7 @@ import { AutoBrollBatchModal } from './AutoBrollBatchModal';
 import { StockMediaSearchModal } from './StockMediaSearchModal';
 import { saveProjectToDisk, hasDiskFileHandle } from '../utils/fileSystem';
 import { saveProjectToCache, getMediaBlob, saveMediaBlob } from '../utils/storage';
+import { repairAssetUrls } from '../utils/stockMediaClient';
 import { getAutosaveConfig, saveAutosaveConfig } from '../utils/autosaveConfig';
 import { AutosaveSettingsModal } from './AutosaveSettingsModal';
 import { extractAudioTrackToWavBlob } from '../utils/audioExtractor';
@@ -322,6 +323,7 @@ export function EditorPage({
   const projectRef = useRef(project);
   projectRef.current = project;
 
+
   // Restore local media blobs from IndexedDB if URLs need revivification (Clipchamp-style)
   useEffect(() => {
     let isCancelled = false;
@@ -553,6 +555,42 @@ export function EditorPage({
       setSaveStatusText('Autoguardado desactivado (Usa Ctrl+S)');
     }
   };
+
+  // Ref mirror so effects/timeouts can call the latest updateProjectData without stale closures
+  const updateProjectDataRef = useRef(updateProjectData);
+  updateProjectDataRef.current = updateProjectData;
+
+  // Auto-heal broken disk asset URLs (e.g. after the project media folder changed
+  // or the file was moved). Runs once per project load, silently in the background.
+  const repairedOnceRef = useRef(false);
+  useEffect(() => {
+    repairedOnceRef.current = false;
+  }, [project?.id]);
+
+  useEffect(() => {
+    if (!project?.assets || project.assets.length === 0) return;
+    if (repairedOnceRef.current) return;
+
+    const diskAssets = project.assets.filter(a => a.url && String(a.url).includes('/media-library/'));
+    if (diskAssets.length === 0) return;
+
+    repairedOnceRef.current = true;
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const { assets: fixedAssets, fixedCount } = await repairAssetUrls(projectRef.current.assets);
+        if (cancelled || fixedCount === 0) return;
+        console.log(`[auto-repair] Reparadas ${fixedCount} URL(s) de medios.`);
+        const current = projectRef.current;
+        updateProjectDataRef.current?.({ ...current, assets: fixedAssets }, false, false);
+      } catch (err) {
+        console.warn('Asset URL auto-repair failed:', err);
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [project?.id, project?.assets]);
 
   // Undo and Redo handlers
   const handleUndo = () => {
@@ -883,6 +921,61 @@ export function EditorPage({
   const handleAddAsset = (asset) => {
     const updatedAssets = [...(project.assets || []), asset];
     updateProjectData({ ...project, assets: updatedAssets });
+  };
+
+  // Batch add multiple assets at once (used by folder scan auto-discovery).
+  // Reads the freshest state ref so sequential disk files don't overwrite each other.
+  // If a discovered file matches an existing (possibly broken) asset by name, its URL is
+  // refreshed to point at the newly found location instead of creating a duplicate.
+  const handleAddAssets = (newAssets) => {
+    if (!Array.isArray(newAssets) || newAssets.length === 0) return;
+    const current = projectRef.current || project;
+    const existing = current.assets || [];
+
+    const byName = new Map();
+    for (const a of existing) {
+      if (a.name) byName.set(String(a.name).toLowerCase(), a);
+    }
+    const existingUrlKeys = new Set(
+      existing.filter(a => a.url).map(a => String(a.url).split('?')[0].toLowerCase())
+    );
+
+    const merged = [...existing];
+    const toAppend = [];
+    let repairedCount = 0;
+
+    for (const a of newAssets) {
+      const nameKey = a.name ? String(a.name).toLowerCase() : null;
+      const urlKey = a.url ? String(a.url).split('?')[0].toLowerCase() : null;
+
+      if (urlKey && existingUrlKeys.has(urlKey)) continue; // already present & identical
+
+      if (nameKey && byName.has(nameKey)) {
+        // Same filename already exists -> refresh its URL/path (self-heal after folder change)
+        const idx = merged.findIndex(m => m.name && String(m.name).toLowerCase() === nameKey);
+        if (idx !== -1) {
+          const old = merged[idx];
+          if (String(old.url).split('?')[0] !== String(a.url).split('?')[0]) {
+            merged[idx] = {
+              ...old,
+              url: a.url,
+              diskPath: a.diskPath || a.url,
+              width: old.width || a.width,
+              height: old.height || a.height,
+              duration: old.duration || a.duration,
+              thumbnail: old.thumbnail || a.thumbnail
+            };
+            repairedCount++;
+          }
+        }
+        continue;
+      }
+
+      toAppend.push(a);
+    }
+
+    if (toAppend.length === 0 && repairedCount === 0) return;
+    updateProjectData({ ...current, assets: [...merged, ...toAppend] }, true, true);
   };
 
   const handleDeleteAsset = (assetId) => {
@@ -1331,6 +1424,7 @@ export function EditorPage({
               <MediaLibrary
                 assets={project.assets || []}
                 onAddAsset={handleAddAsset}
+                onAddAssets={handleAddAssets}
                 onDeleteAsset={handleDeleteAsset}
                 onAddToTimeline={handleAddToTimeline}
                 project={project}

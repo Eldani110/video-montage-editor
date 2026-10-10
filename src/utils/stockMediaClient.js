@@ -421,6 +421,90 @@ export async function getStorageDiskInfo(projectFolder = null) {
 }
 
 /**
+ * Lists the actual media files present inside a project's disk folder.
+ * Enables the editor to auto-discover media already on disk (not just app-registered assets).
+ */
+export async function listDiskMediaFiles(projectFolder = null) {
+  try {
+    const url = projectFolder
+      ? `${API_BASE}/api/media/list?folder=${encodeURIComponent(projectFolder)}`
+      : `${API_BASE}/api/media/list`;
+    const res = await fetch(url);
+    if (res.ok) {
+      const data = await res.json();
+      return data.files || [];
+    }
+  } catch (err) {
+    console.warn('Could not list disk media files:', err);
+  }
+  return [];
+}
+
+/**
+ * Locates a media file by name anywhere inside the base media dir (recursive).
+ * Returns { found, url, folder, filename } — used to self-heal broken asset URLs.
+ */
+export async function locateMediaFile(filename) {
+  if (!filename) return { found: false };
+  try {
+    const res = await fetch(`${API_BASE}/api/media/locate?filename=${encodeURIComponent(filename)}`);
+    if (res.ok) return await res.json();
+  } catch (err) {
+    console.warn('Could not locate media file:', err);
+  }
+  return { found: false };
+}
+
+/**
+ * Repairs asset URLs: for each asset whose file can no longer be found at its
+ * stored path, tries to locate it elsewhere and rewrites the URL.
+ * Returns a new array of assets (only changed ones differ).
+ */
+export async function repairAssetUrls(assets = [], onProgress = null) {
+  const repaired = [];
+  let fixedCount = 0;
+  let checkedCount = 0;
+
+  for (const asset of assets) {
+    checkedCount++;
+    if (onProgress) onProgress(checkedCount, assets.length);
+
+    // Only disk-backed assets with a name can be repaired
+    const isDiskAsset = asset.url && String(asset.url).includes('/media-library/');
+    if (!isDiskAsset || !asset.name) {
+      repaired.push(asset);
+      continue;
+    }
+
+    const bareUrl = String(asset.url).split('?')[0];
+    // Probe if the current URL still resolves
+    let alive = false;
+    try {
+      const head = await fetch(bareUrl, { method: 'HEAD' });
+      alive = head.ok;
+    } catch (_) {
+      alive = false;
+    }
+
+    if (alive) {
+      repaired.push(asset);
+      continue;
+    }
+
+    // Broken: try locating by filename
+    const loc = await locateMediaFile(asset.name);
+    if (loc && loc.found && loc.url) {
+      repaired.push({ ...asset, url: loc.url + '?t=' + Date.now(), diskPath: loc.url });
+      fixedCount++;
+    } else {
+      repaired.push(asset);
+    }
+  }
+
+  return { assets: repaired, fixedCount };
+}
+
+/**
  * Fetches the list of subfolders in the media directory
  */
 export async function getDiskMediaFolders() {

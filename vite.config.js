@@ -9,7 +9,35 @@ import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-let MEDIA_DIR = path.resolve(__dirname, 'projects_media');
+
+// Persistent storage config file (survives server restarts/redeploys)
+const MEDIA_CONFIG_FILE = path.resolve(__dirname, '.media-config.json');
+
+function loadPersistedMediaDir() {
+  try {
+    if (fs.existsSync(MEDIA_CONFIG_FILE)) {
+      const raw = fs.readFileSync(MEDIA_CONFIG_FILE, 'utf-8');
+      const parsed = JSON.parse(raw || '{}');
+      if (parsed.baseMediaDir && typeof parsed.baseMediaDir === 'string') {
+        const resolved = path.resolve(parsed.baseMediaDir);
+        if (fs.existsSync(resolved)) return resolved;
+      }
+    }
+  } catch (err) {
+    console.warn('[media-config] No se pudo leer la config persistida:', err.message);
+  }
+  return null;
+}
+
+function persistMediaDir(dir) {
+  try {
+    fs.writeFileSync(MEDIA_CONFIG_FILE, JSON.stringify({ baseMediaDir: dir }, null, 2), 'utf-8');
+  } catch (err) {
+    console.warn('[media-config] No se pudo persistir la config:', err.message);
+  }
+}
+
+let MEDIA_DIR = loadPersistedMediaDir() || path.resolve(__dirname, 'projects_media');
 
 // Ensure media folder exists on disk
 if (!fs.existsSync(MEDIA_DIR)) {
@@ -418,6 +446,7 @@ function mediaStoragePlugin() {
                     fs.mkdirSync(resolved, { recursive: true });
                   }
                   MEDIA_DIR = resolved;
+                  persistMediaDir(resolved); // Survive restarts/redeploys
                   res.statusCode = 200;
                   res.setHeader('Content-Type', 'application/json');
                   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -471,6 +500,140 @@ function mediaStoragePlugin() {
           } catch (err) {
             res.statusCode = 500;
             res.end(JSON.stringify({ error: err.message, folders: [] }));
+          }
+          return;
+        }
+
+        // 3.5. Media File Listing Endpoint: Enumerates actual files inside a project folder
+        // Used so the editor can auto-discover media already present on disk (not just app-downloaded assets)
+        if (req.url && req.url.startsWith('/api/media/list')) {
+          try {
+            const urlObj = new URL(req.url, `http://${req.headers.host || 'localhost:5173'}`);
+            const requestedFolder = (urlObj.searchParams.get('folder') || '').trim();
+
+            const safeFolder = requestedFolder
+              .replace(/[^a-zA-Z0-9_\-\s]/g, '_')
+              .replace(/\.\./g, '')
+              .replace(/\s+/g, '_');
+
+            const targetDir = safeFolder ? path.join(MEDIA_DIR, safeFolder) : MEDIA_DIR;
+
+            if (!targetDir.startsWith(MEDIA_DIR) || !fs.existsSync(targetDir)) {
+              res.statusCode = 200;
+              res.setHeader('Content-Type', 'application/json');
+              res.setHeader('Access-Control-Allow-Origin', '*');
+              res.end(JSON.stringify({ folder: safeFolder || null, exists: false, files: [] }));
+              return;
+            }
+
+            const VIDEO_EXT = new Set(['.mp4', '.webm', '.mov', '.m4v', '.mkv', '.avi']);
+            const IMAGE_EXT = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.svg', '.avif']);
+            const AUDIO_EXT = new Set(['.mp3', '.wav', '.m4a', '.ogg', '.aac', '.flac']);
+
+            const files = [];
+            const entries = fs.readdirSync(targetDir, { withFileTypes: true });
+            for (const e of entries) {
+              if (!e.isFile()) continue;
+              const ext = path.extname(e.name).toLowerCase();
+              let type = null;
+              if (VIDEO_EXT.has(ext)) type = 'video';
+              else if (IMAGE_EXT.has(ext)) type = 'image';
+              else if (AUDIO_EXT.has(ext)) type = 'audio';
+              if (!type) continue;
+
+              let size = 0;
+              let mtimeMs = 0;
+              try {
+                const st = fs.statSync(path.join(targetDir, e.name));
+                size = st.size;
+                mtimeMs = st.mtimeMs;
+              } catch (_) {}
+
+              const encodedFolder = safeFolder ? `${encodeURIComponent(safeFolder)}/` : '';
+              files.push({
+                filename: e.name,
+                type,
+                ext,
+                size,
+                mtimeMs,
+                url: `/media-library/${encodedFolder}${encodeURIComponent(e.name)}`,
+                contentType: MIME_TYPES[ext] || 'application/octet-stream'
+              });
+            }
+
+            // Newest first
+            files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+            res.statusCode = 200;
+            res.setHeader('Content-Type', 'application/json');
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.end(JSON.stringify({
+              folder: safeFolder || null,
+              exists: true,
+              count: files.length,
+              files
+            }));
+          } catch (err) {
+            console.error('Error listing media folder:', err);
+            res.statusCode = 500;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ error: err.message, files: [] }));
+          }
+          return;
+        }
+
+        // 3.6. Media Locate Endpoint: Finds a file by name anywhere in MEDIA_DIR (recursive)
+        // Used to self-heal broken asset URLs after the media folder changed.
+        if (req.url && req.url.startsWith('/api/media/locate')) {
+          try {
+            const urlObj = new URL(req.url, `http://${req.headers.host || 'localhost:5173'}`);
+            const filename = (urlObj.searchParams.get('filename') || '').trim();
+
+            if (!filename) {
+              res.statusCode = 400;
+              res.setHeader('Content-Type', 'application/json');
+              res.end(JSON.stringify({ error: 'Missing filename param' }));
+              return;
+            }
+
+            const targetLower = filename.toLowerCase();
+            let found = null;
+
+            const search = (dir, relParts) => {
+              if (found) return;
+              let entries;
+              try {
+                entries = fs.readdirSync(dir, { withFileTypes: true });
+              } catch (_) {
+                return;
+              }
+              for (const e of entries) {
+                if (found) return;
+                const full = path.join(dir, e.name);
+                if (e.isDirectory()) {
+                  search(full, [...relParts, e.name]);
+                } else if (e.isFile() && e.name.toLowerCase() === targetLower) {
+                  const encodedRel = [...relParts, e.name].map(p => encodeURIComponent(p)).join('/');
+                  found = {
+                    filename: e.name,
+                    folder: relParts.join('/') || null,
+                    diskPath: full,
+                    url: `/media-library/${encodedRel}`
+                  };
+                }
+              }
+            };
+
+            search(MEDIA_DIR, []);
+
+            res.statusCode = 200;
+            res.setHeader('Content-Type', 'application/json');
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.end(JSON.stringify({ found: Boolean(found), ...(found || {}) }));
+          } catch (err) {
+            res.statusCode = 500;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ error: err.message, found: false }));
           }
           return;
         }
