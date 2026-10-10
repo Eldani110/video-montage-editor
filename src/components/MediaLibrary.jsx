@@ -9,7 +9,7 @@ import {
   getConnectedMediaFolder,
   disconnectMediaFolder,
   listLocalMediaFiles,
-  readLocalMediaFile,
+  readLocalMediaFileByPath,
   writeLocalMediaFile
 } from '../utils/localMedia';
 
@@ -219,7 +219,11 @@ export const MediaLibrary = React.memo(function MediaLibrary({
       if (connected && connected.handle && !connected.needsPermission) {
         setLocalFolder(connected);
         await scanLocalFolder(connected.handle);
+      } else if (connected && connected.needsPermission) {
+        setLocalFolder(connected);
+        setScanMessage({ type: 'error', text: `Necesitas conceder permiso a la carpeta "${connected.name}". Pulsa "Reconectar".` });
       } else {
+        // No local folder connected: fall back to the server-side projects_media folder
         await scanServerFolder();
       }
     } catch (err) {
@@ -231,12 +235,13 @@ export const MediaLibrary = React.memo(function MediaLibrary({
     }
   };
 
-  // Scan the connected local disk folder (File System Access API)
+  // Scan the connected local disk folder (File System Access API) — flat, files
+  // live directly inside the chosen folder (Clipchamp-style).
   const scanLocalFolder = async (rootHandle) => {
-    const files = await listLocalMediaFiles({ rootHandle, projectFolder });
+    const files = await listLocalMediaFiles({ rootHandle, recursive: true });
 
     if (!files.length) {
-      setScanMessage({ type: 'empty', text: `La carpeta local "${localFolder?.name || ''}/${projectFolder}" no contiene archivos multimedia.` });
+      setScanMessage({ type: 'empty', text: `La carpeta "${localFolder?.name || ''}" no contiene archivos multimedia.` });
       return;
     }
 
@@ -252,7 +257,7 @@ export const MediaLibrary = React.memo(function MediaLibrary({
     for (const f of newFiles) {
       let objectUrl = null;
       try {
-        const read = await readLocalMediaFile({ rootHandle, projectFolder, filename: f.filename });
+        const read = await readLocalMediaFileByPath({ rootHandle, relPath: f.relPath });
         objectUrl = read.objectUrl;
       } catch (_) {
         objectUrl = null;
@@ -264,7 +269,7 @@ export const MediaLibrary = React.memo(function MediaLibrary({
         name: f.filename,
         type: f.type,
         url: objectUrl,
-        diskPath: `${projectFolder}/${f.filename}`,
+        diskPath: f.relPath,
         localDisk: true,
         size: f.size || 0,
         duration: f.type === 'image' ? 5 : (f.type === 'audio' ? 10 : 5),
@@ -276,7 +281,7 @@ export const MediaLibrary = React.memo(function MediaLibrary({
       enrichedAssets.push(asset);
     }
 
-    applyScannedAssets(enrichedAssets, `la carpeta local "${localFolder?.name || ''}/${projectFolder}"`);
+    applyScannedAssets(enrichedAssets, `la carpeta "${localFolder?.name || ''}"`);
   };
 
   // Scan the server-side projects_media folder (fallback / legacy)
@@ -345,7 +350,6 @@ export const MediaLibrary = React.memo(function MediaLibrary({
         try {
           const written = await writeLocalMediaFile({
             rootHandle: localFolder.handle,
-            projectFolder,
             filename: file.name,
             blob: file
           });
@@ -557,7 +561,7 @@ export const MediaLibrary = React.memo(function MediaLibrary({
                 <FolderOpen size={13} style={{ color: '#34d399', flexShrink: 0 }} />
                 <span style={{ color: '#34d399', fontWeight: 600, whiteSpace: 'nowrap' }}>Carpeta local:</span>
                 <span style={{ fontFamily: 'monospace', color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={localFolder.name}>
-                  {localFolder.name}/{projectFolder}/
+                  {localFolder.name}/
                 </span>
               </>
             ) : localFolder && localFolder.needsPermission ? (

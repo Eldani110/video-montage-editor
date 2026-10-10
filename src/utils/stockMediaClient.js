@@ -334,7 +334,6 @@ async function tryWriteStockMediaLocally({ mediaItem, targetFolder, filename }) 
 
     const written = await writeLocalMediaFile({
       rootHandle: connected.handle,
-      projectFolder: targetFolder,
       filename,
       blob
     });
@@ -347,7 +346,7 @@ async function tryWriteStockMediaLocally({ mediaItem, targetFolder, filename }) 
       name: written.filename,
       type: isVideo ? 'video' : 'image',
       url: written.objectUrl,
-      diskPath: `${written.folder}/${written.filename}`,
+      diskPath: written.diskPath,
       localDisk: true,
       size: written.size,
       duration: mediaItem.duration || 10,
@@ -364,9 +363,8 @@ async function tryWriteStockMediaLocally({ mediaItem, targetFolder, filename }) 
       downloadResult: {
         success: true,
         filename: written.filename,
-        folder: written.folder,
         localUrl: written.objectUrl,
-        diskPath: `${written.folder}/${written.filename}`,
+        diskPath: written.diskPath,
         size: written.size,
         local: true
       }

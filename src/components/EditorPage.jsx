@@ -43,7 +43,7 @@ import { StockMediaSearchModal } from './StockMediaSearchModal';
 import { saveProjectToDisk, hasDiskFileHandle } from '../utils/fileSystem';
 import { saveProjectToCache, getMediaBlob, saveMediaBlob } from '../utils/storage';
 import { repairAssetUrls } from '../utils/stockMediaClient';
-import { getConnectedMediaFolder, readLocalMediaFile } from '../utils/localMedia';
+import { getConnectedMediaFolder, readLocalMediaFileByPath } from '../utils/localMedia';
 import { getAutosaveConfig, saveAutosaveConfig } from '../utils/autosaveConfig';
 import { AutosaveSettingsModal } from './AutosaveSettingsModal';
 import { extractAudioTrackToWavBlob } from '../utils/audioExtractor';
@@ -355,11 +355,9 @@ export function EditorPage({
               try {
                 const connected = await getConnectedMediaFolder(false);
                 if (connected && connected.handle && !connected.needsPermission) {
-                  const folder = getProjectMediaFolder(projectRef.current || project);
-                  const read = await readLocalMediaFile({
+                  const read = await readLocalMediaFileByPath({
                     rootHandle: connected.handle,
-                    projectFolder: folder,
-                    filename: currentAsset.name
+                    relPath: currentAsset.diskPath || currentAsset.name
                   });
                   if (read && read.objectUrl) {
                     hasRestored = true;
@@ -600,15 +598,13 @@ export function EditorPage({
       if (connected && connected.handle && !connected.needsPermission) {
         setLocalFolderMissing(false);
         // Re-read all localDisk assets from the folder
-        const folder = getProjectMediaFolder(projectRef.current || project);
         const current = projectRef.current || project;
         const updated = await Promise.all((current.assets || []).map(async (asset) => {
           if (!asset.localDisk || !asset.name) return asset;
           try {
-            const read = await readLocalMediaFile({
+            const read = await readLocalMediaFileByPath({
               rootHandle: connected.handle,
-              projectFolder: folder,
-              filename: asset.name
+              relPath: asset.diskPath || asset.name
             });
             if (read && read.objectUrl) {
               return { ...asset, url: read.objectUrl, needsLocalFolder: false, missing: false };
