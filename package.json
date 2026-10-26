@@ -1,7 +1,7 @@
 {
   "name": "video-montage-editor",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Video Montage Editor Studio",
   "author": "Daniel <daniel@thisoftcore.com>",
   "type": "module",
