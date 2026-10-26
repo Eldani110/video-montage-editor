@@ -6,10 +6,100 @@
 
 import { drawGraphicCanvas } from './graphicEngine.js';
 import { preloadWebCodecsVideoSources } from './webCodecsVideoEngine.js';
+import { resolveProjectAssetsOnDisk } from './stockMediaClient.js';
 
 // In-memory media caches
 const imageCache = new Map();
 const videoCache = new Map();
+const exportFallbackVideoCache = new Map();
+
+/**
+ * Resolves the best Chromium-compatible video URL for an asset (matching PreviewPlayer.jsx)
+ */
+export function resolveEffectiveExportVideoUrl(asset) {
+  if (!asset) return '';
+  const assetName = asset.name || asset.fileName || (typeof asset.url === 'string' && !asset.url.startsWith('blob:') ? asset.url.split('?')[0].split('/').pop() : '') || '';
+  const isMovOrSpecial = /\.(mov|qt|mkv|avi|wmv|flv|ts|m2ts)$/i.test(assetName);
+
+  let diskPath = asset.diskPath || null;
+  if (!diskPath && typeof asset.url === 'string' && asset.url.includes('path=')) {
+    try {
+      const u = new URL(asset.url, 'http://localhost');
+      diskPath = u.searchParams.get('path') || null;
+    } catch { }
+  }
+
+  const streamFallback = diskPath
+    ? `/media-library/stream?path=${encodeURIComponent(diskPath)}`
+    : (assetName ? `/media-library/stream?name=${encodeURIComponent(assetName)}` : null);
+
+  const hasValidStream = !!streamFallback;
+  const isPreviewRawMov = typeof asset.previewUrl === 'string' && /\.(mov|qt|mkv|avi|wmv|flv|ts|m2ts)$/i.test(asset.previewUrl.split('?')[0]);
+  const isPreviewStreamEndpoint = typeof asset.previewUrl === 'string' && asset.previewUrl.startsWith('/media-library/stream');
+
+  return (
+    (isPreviewStreamEndpoint ? asset.previewUrl : null) ||
+    (isMovOrSpecial && hasValidStream ? streamFallback : null) ||
+    (!isPreviewRawMov ? asset.previewUrl : null) ||
+    streamFallback ||
+    asset.previewUrl ||
+    asset.url ||
+    ''
+  );
+}
+
+/**
+ * Gets or initializes a ready HTMLVideoElement as a fail-safe decoder when WebCodecs cannot decode an asset
+ */
+async function getOrLoadExportVideoElement(asset, fallbackVideosMap) {
+  if (!asset || !asset.id) return null;
+  const map = fallbackVideosMap || exportFallbackVideoCache;
+  if (map.has(asset.id)) {
+    const existing = map.get(asset.id);
+    if (existing && existing.readyState >= 1) return existing;
+  }
+
+  const primarySrc = resolveEffectiveExportVideoUrl(asset);
+  const secondarySrc = asset.url && asset.url !== primarySrc ? asset.url : null;
+  if (!primarySrc && !secondarySrc) return null;
+
+  const tryLoadVideo = (srcUrl) => new Promise((resolve) => {
+    const vid = document.createElement('video');
+    vid.crossOrigin = 'anonymous';
+    vid.preload = 'auto';
+    vid.muted = true;
+    vid.playsInline = true;
+
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      vid.removeEventListener('loadeddata', onReady);
+      vid.removeEventListener('canplay', onReady);
+      vid.removeEventListener('error', onErr);
+      resolve(ok ? vid : null);
+    };
+    const onReady = () => finish(vid.videoWidth > 0);
+    const onErr = () => finish(false);
+    const timer = setTimeout(() => finish(vid.readyState >= 1 && vid.videoWidth > 0), 5000);
+
+    vid.addEventListener('loadeddata', onReady, { once: true });
+    vid.addEventListener('canplay', onReady, { once: true });
+    vid.addEventListener('error', onErr, { once: true });
+    vid.src = srcUrl;
+    try { vid.load(); } catch { }
+  });
+
+  let vid = primarySrc ? await tryLoadVideo(primarySrc) : null;
+  if (!vid && secondarySrc) {
+    vid = await tryLoadVideo(secondarySrc);
+  }
+  if (vid) {
+    map.set(asset.id, vid);
+  }
+  return vid;
+}
 
 // Dedicated offscreen canvas for atomic double-buffering (eliminates 100% of flicker)
 let offscreenCanvas = null;
@@ -253,39 +343,63 @@ export async function preloadExportAssets(project) {
     }
   }
 
+  // Ensure any stale blob: URLs or missing diskPath/previewUrl are resolved against backend disk before export
+  try {
+    const resolvedProject = await Promise.race([
+      resolveProjectAssetsOnDisk(project),
+      new Promise(resolve => setTimeout(() => resolve(project), 3000))
+    ]);
+    if (resolvedProject && Array.isArray(resolvedProject.assets)) {
+      project.assets = resolvedProject.assets;
+    }
+  } catch (e) {
+    console.warn('Disk asset resolution warning before export:', e);
+  }
+
   const assets = project.assets || [];
   const images = new Map();
+  const fallbackVideos = new Map();
 
   // 1. Preload Pure WebCodecs hardware decoders
   let webCodecsSources = null;
   try {
     webCodecsSources = await preloadWebCodecsVideoSources(project);
   } catch (err) {
-    console.error('WebCodecs video preload failed:', err);
-    throw new Error(`Error inicializando decodificadores WebCodecs: ${err.message || err}`);
+    console.warn('WebCodecs video preload warning (will use HTMLVideoElement fallback):', err);
   }
-  const webCodecsDecoders = webCodecsSources?.decoders || new Map();
 
-  // 2. Preload image assets
-  const loadPromises = assets.map(async (asset) => {
-    if (!asset || !asset.url) return;
-    if (asset.type === 'image') {
-      const img = new Image();
-      img.crossOrigin = 'anonymous';
-      img.src = asset.url;
-      await new Promise((res) => {
-        if (img.complete && img.naturalWidth > 0) return res();
-        img.onload = res;
-        img.onerror = res;
-        setTimeout(res, 3000);
+  // 2. Preload only image assets actually present on the timeline
+  const usedAssetIds = new Set();
+  (project.tracks || [])
+    .filter(t => t.type === 'video' && t.visible !== false)
+    .forEach(t => {
+      (t.clips || []).forEach(c => {
+        if (c && c.assetId) usedAssetIds.add(c.assetId);
       });
-      images.set(asset.id, img);
-    }
+    });
+
+  const assetsMap = new Map(assets.map(a => [a.id, a]));
+  const imageAssetsToLoad = [...usedAssetIds]
+    .map(id => assetsMap.get(id))
+    .filter(asset => asset && asset.type === 'image' && (asset.url || asset.diskPath));
+
+  const loadPromises = imageAssetsToLoad.map(async (asset) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.src = asset.url || `/media-library/abs?path=${encodeURIComponent(asset.diskPath)}`;
+    await new Promise((res) => {
+      if (img.complete && img.naturalWidth > 0) return res();
+      img.onload = res;
+      img.onerror = res;
+      setTimeout(res, 2000);
+    });
+    images.set(asset.id, img);
   });
 
   await Promise.all(loadPromises);
   return {
     images,
+    fallbackVideos,
     webCodecsDecoders: webCodecsSources?.decoders || webCodecsSources?.decoderPool,
     decoderPool: webCodecsSources?.decoderPool || webCodecsSources?.decoders,
     cleanup: () => {
@@ -293,7 +407,17 @@ export async function preloadExportAssets(project) {
         if (webCodecsSources?.cleanup) {
           webCodecsSources.cleanup();
         }
-      } catch {}
+      } catch { }
+      try {
+        for (const vid of fallbackVideos.values()) {
+          if (vid) {
+            vid.pause?.();
+            vid.removeAttribute?.('src');
+            vid.load?.();
+          }
+        }
+        fallbackVideos.clear();
+      } catch { }
     }
   };
 }
@@ -321,6 +445,14 @@ export function drawStyledMedia(ctx, media, mw, mh, cw, ch, clip) {
   const contrast = clip.contrast !== undefined ? clip.contrast : 1.0;
   const saturate = clip.saturate !== undefined ? clip.saturate : 1.0;
   const blur = clip.blur || 0;
+  const temperature = Number(clip.temperature || 0); // -100 to 100
+  const tint = Number(clip.tint || 0); // -100 to 100
+  const vignette = Number(clip.vignette || 0); // 0 to 100
+
+  const cropTop = Math.max(0, Math.min(45, Number(clip.cropTop || 0))) / 100;
+  const cropBottom = Math.max(0, Math.min(45, Number(clip.cropBottom || 0))) / 100;
+  const cropLeft = Math.max(0, Math.min(45, Number(clip.cropLeft || 0))) / 100;
+  const cropRight = Math.max(0, Math.min(45, Number(clip.cropRight || 0))) / 100;
 
   ctx.save();
 
@@ -332,12 +464,28 @@ export function drawStyledMedia(ctx, media, mw, mh, cw, ch, clip) {
     ctx.globalCompositeOperation = blendMode;
   }
 
-  // Filters
+  const hueRotate = Number(clip.hueRotate || 0);
+  const sepia = Number(clip.sepia || 0);
+  const grayscale = Number(clip.grayscale || 0);
+  const invert = Number(clip.invert || 0);
+  const dropShadow = Number(clip.dropShadow || 0);
+
+  // Filters (including Lumetri temperature & tint approximations)
   const filterParts = [];
   if (brightness !== 1.0) filterParts.push(`brightness(${brightness})`);
   if (contrast !== 1.0) filterParts.push(`contrast(${contrast})`);
   if (saturate !== 1.0) filterParts.push(`saturate(${saturate})`);
+  if (sepia > 0) filterParts.push(`sepia(${sepia / 100})`);
+  if (grayscale > 0) filterParts.push(`grayscale(${grayscale / 100})`);
+  if (invert > 0) filterParts.push(`invert(${invert / 100})`);
+  if (hueRotate !== 0) filterParts.push(`hue-rotate(${hueRotate}deg)`);
+  if (temperature > 0) filterParts.push(`sepia(${(temperature / 250).toFixed(2)})`);
+  if (tint !== 0 || temperature < 0) {
+    const hueDeg = Math.round((tint * 0.45) + (temperature < 0 ? temperature * 0.25 : 0));
+    if (hueDeg !== 0) filterParts.push(`hue-rotate(${hueDeg}deg)`);
+  }
   if (blur > 0) filterParts.push(`blur(${blur}px)`);
+  if (dropShadow > 0) filterParts.push(`drop-shadow(0 ${Math.round(dropShadow * 0.4)}px ${dropShadow}px rgba(0,0,0,0.85))`);
   if (filterParts.length > 0) {
     ctx.filter = filterParts.join(' ');
   }
@@ -373,8 +521,9 @@ export function drawStyledMedia(ctx, media, mw, mh, cw, ch, clip) {
   const finalW = baseW * scale;
   const finalH = baseH * scale;
 
-  // Center coordinate of media layer (proportional to canvas dimension)
-  const normFactor = cw / 1280;
+  // Center coordinate of media layer (proportional to canvas dimension & orientation)
+  const refW = ch > cw ? 720 : 1280;
+  const normFactor = cw / refW;
   const centerX = (cw / 2) + (posX * normFactor);
   const centerY = (ch / 2) + (posY * normFactor);
 
@@ -384,16 +533,19 @@ export function drawStyledMedia(ctx, media, mw, mh, cw, ch, clip) {
   }
   ctx.scale(flipX, flipY);
 
-  // Border radius clipping if requested
-  if (borderRadius > 0) {
+  // Crop + Border radius clipping if requested
+  const hasCrop = cropTop > 0 || cropBottom > 0 || cropLeft > 0 || cropRight > 0;
+  if (borderRadius > 0 || hasCrop) {
     ctx.beginPath();
-    const r = Math.min(borderRadius, finalW / 2, finalH / 2);
-    const rx = -finalW / 2;
-    const ry = -finalH / 2;
-    if (typeof ctx.roundRect === 'function') {
-      ctx.roundRect(rx, ry, finalW, finalH, r);
+    const rx = -finalW / 2 + finalW * cropLeft;
+    const ry = -finalH / 2 + finalH * cropTop;
+    const rw = Math.max(2, finalW * (1 - cropLeft - cropRight));
+    const rh = Math.max(2, finalH * (1 - cropTop - cropBottom));
+    const r = Math.min(borderRadius, rw / 2, rh / 2);
+    if (r > 0 && typeof ctx.roundRect === 'function') {
+      ctx.roundRect(rx, ry, rw, rh, r);
     } else {
-      ctx.rect(rx, ry, finalW, finalH);
+      ctx.rect(rx, ry, rw, rh);
     }
     ctx.clip();
   }
@@ -402,6 +554,18 @@ export function drawStyledMedia(ctx, media, mw, mh, cw, ch, clip) {
     ctx.drawImage(media, -finalW / 2, -finalH / 2, finalW, finalH);
   } catch (err) {
     // ignore drawing glitch during video frame seek
+  }
+
+  // Optional Lumetri Vignette overlay
+  if (vignette > 0) {
+    ctx.filter = 'none';
+    const maxR = Math.hypot(finalW, finalH) * 0.55;
+    const innerR = maxR * Math.max(0.15, 1 - (vignette / 115));
+    const grad = ctx.createRadialGradient(0, 0, innerR, 0, 0, maxR);
+    grad.addColorStop(0, 'rgba(0,0,0,0)');
+    grad.addColorStop(1, `rgba(0,0,0,${Math.min(0.92, vignette / 100)})`);
+    ctx.fillStyle = grad;
+    ctx.fillRect(-finalW / 2, -finalH / 2, finalW, finalH);
   }
 
   ctx.restore();
@@ -473,12 +637,16 @@ export function renderFrame(visibleCanvas, time, project, options = {}) {
         if (isVideo) {
           const vid = getCachedVideo(asset.url, onNeedRedraw);
           if (vid) {
-            const clipOffset = (time - clipStart) + (clip.sourceStart || 0);
+            const speed = Number(clip.playbackRate || 1.0);
+            const clipOffset = ((time - clipStart) * speed) + (clip.sourceStart || 0);
+            if (Math.abs((vid.playbackRate || 1.0) - speed) > 0.01) {
+              vid.playbackRate = speed;
+            }
 
             if (isPlaying) {
               if (vid.paused) {
                 vid.currentTime = clipOffset;
-                vid.play().catch(() => {});
+                vid.play().catch(() => { });
               } else if (Math.abs(vid.currentTime - clipOffset) > 0.25) {
                 vid.currentTime = clipOffset;
               }
@@ -566,7 +734,12 @@ export async function renderExportFrameAsync(canvas, time, project, preloadedMed
   const width = canvas.width || 1920;
   const height = canvas.height || 1080;
   const assetsMap = new Map((project.assets || []).map(a => [a.id, a]));
-  const { images, webCodecsDecoders, decoderPool } = preloadedMedia || { images: new Map(), webCodecsDecoders: null, decoderPool: null };
+  const {
+    images,
+    fallbackVideos = new Map(),
+    webCodecsDecoders,
+    decoderPool
+  } = preloadedMedia || { images: new Map(), fallbackVideos: new Map(), webCodecsDecoders: null, decoderPool: null };
   const pool = decoderPool || webCodecsDecoders;
 
   const videoTracks = (project.tracks || [])
@@ -589,7 +762,8 @@ export async function renderExportFrameAsync(canvas, time, project, preloadedMed
 
         if (asset.type === 'video') {
           const webCodecsDecoder = webCodecsDecoders ? webCodecsDecoders.get(asset.id) : null;
-          const rawOffset = (time - clipStart) + (clip.sourceStart || 0);
+          const speed = Number(clip.playbackRate || 1.0);
+          const rawOffset = ((time - clipStart) * speed) + (clip.sourceStart || 0);
           const maxDuration = Number(webCodecsDecoder?.duration) || Number(asset.duration) || 0;
           const safeOffset = (maxDuration > 0.1) ? Math.min(rawOffset, maxDuration - 0.005) : rawOffset;
           activeMediaClips.push({ type: 'video', clip, track, asset, webCodecsDecoder, rawOffset: safeOffset });
@@ -649,7 +823,35 @@ export async function renderExportFrameAsync(canvas, time, project, preloadedMed
   }
 
   if (activeVideoSeeks.length > 0) {
-    await Promise.all(activeVideoSeeks);
+    await Promise.race([
+      Promise.all(activeVideoSeeks),
+      new Promise(r => setTimeout(r, 1500))
+    ]);
+  }
+
+  // Fallback to deterministic HTMLVideoElement seek for any video clip where WebCodecs did not produce a frame
+  const fallbackSeeks = [];
+  for (const item of activeMediaClips) {
+    if (item.type === 'video' && (!item.webCodecsDecoder || !item.webCodecsDecoder.hasGoodFrame)) {
+      fallbackSeeks.push((async () => {
+        try {
+          const vid = await getOrLoadExportVideoElement(item.asset, fallbackVideos);
+          if (vid && vid.videoWidth > 0) {
+            await seekVideoToTime(vid, item.rawOffset);
+            item.fallbackVideo = vid;
+          }
+        } catch (err) {
+          console.warn('Fallback HTMLVideoElement seek notice:', err);
+        }
+      })());
+    }
+  }
+
+  if (fallbackSeeks.length > 0) {
+    await Promise.race([
+      Promise.all(fallbackSeeks),
+      new Promise(r => setTimeout(r, 1500))
+    ]);
   }
 
   // Draw active media layers in ascending layer order
@@ -662,9 +864,29 @@ export async function renderExportFrameAsync(canvas, time, project, preloadedMed
           drawStyledMedia(ctx, frameSource.canvas, frameSource.width, frameSource.height, width, height, item.clip);
           renderedAny = true;
         }
+      } else if (item.fallbackVideo && item.fallbackVideo.videoWidth > 0) {
+        const vid = item.fallbackVideo;
+        const mediaSource = (vid._hasGoodFrame && vid._frameCanvas) ? vid._frameCanvas : vid;
+        drawStyledMedia(ctx, mediaSource, vid.videoWidth, vid.videoHeight, width, height, item.clip);
+        renderedAny = true;
       }
     } else if (item.type === 'image') {
-      const img = images ? images.get(item.asset.id) : null;
+      let img = images ? images.get(item.asset.id) : null;
+      if ((!img || !img.naturalWidth) && (item.asset.url || item.asset.diskPath)) {
+        const onDemandImg = new Image();
+        onDemandImg.crossOrigin = 'anonymous';
+        onDemandImg.src = item.asset.url || `/media-library/abs?path=${encodeURIComponent(item.asset.diskPath)}`;
+        await new Promise((res) => {
+          if (onDemandImg.complete && onDemandImg.naturalWidth > 0) return res();
+          onDemandImg.onload = res;
+          onDemandImg.onerror = res;
+          setTimeout(res, 1200);
+        });
+        if (onDemandImg.naturalWidth > 0) {
+          img = onDemandImg;
+          if (images) images.set(item.asset.id, img);
+        }
+      }
       if (img && img.naturalWidth > 0) {
         drawStyledMedia(ctx, img, img.naturalWidth, img.naturalHeight, width, height, item.clip);
         renderedAny = true;
@@ -677,31 +899,6 @@ export async function renderExportFrameAsync(canvas, time, project, preloadedMed
     drawGraphicCanvas(ctx, clip, time, width, height);
     renderedAny = true;
   }
-
-  // Multi-Point Anti-Green Hardware Glitch Shield:
-  // Detects and purges corrupted uninitialized (Y=0, U=0, V=0) hardware textures
-  try {
-    const checkCoords = [
-      [Math.floor(width / 2), Math.floor(height / 2)],
-      [Math.floor(width / 4), Math.floor(height / 4)],
-      [Math.floor((3 * width) / 4), Math.floor((3 * height) / 4)],
-      [Math.min(width - 1, 32), Math.min(height - 1, 32)],
-      [Math.max(0, width - 32), Math.max(0, height - 32)]
-    ];
-    let greenDetectedCount = 0;
-    for (const [cx, cy] of checkCoords) {
-      const p = ctx.getImageData(cx, cy, 1, 1).data;
-      if (isHardwareGreenTexture(p[0], p[1], p[2])) {
-        greenDetectedCount++;
-      }
-    }
-    // If majority of check points hit uninitialized YUV green, wipe to clean studio black
-    if (greenDetectedCount >= 3) {
-      ctx.fillStyle = '#05070c';
-      ctx.fillRect(0, 0, width, height);
-      return { isBlackFrame: true };
-    }
-  } catch {}
 
   return { isBlackFrame: !renderedAny };
 }
@@ -748,7 +945,7 @@ export class AudioManager {
             const offset = (time - clipStart) + (clip.sourceStart || 0);
             media.currentTime = offset;
             const p = media.play();
-            if (p) p.catch(() => {});
+            if (p) p.catch(() => { });
           } else {
             // Clip starts in future
             const delayMs = (clipStart - time) * 1000;
@@ -756,7 +953,7 @@ export class AudioManager {
               if (this.isPlaying) {
                 media.currentTime = clip.sourceStart || 0;
                 const p = media.play();
-                if (p) p.catch(() => {});
+                if (p) p.catch(() => { });
               }
             }, delayMs);
             media._scheduleTimer = timer;

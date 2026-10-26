@@ -34,7 +34,8 @@ import {
   Play,
   ArrowUp,
   ArrowDown,
-  CheckSquare
+  CheckSquare,
+  Download
 } from 'lucide-react';
 import { formatTimecode } from '../utils/timeFormat';
 import {
@@ -44,8 +45,729 @@ import {
   ANIMATION_OUT_TYPES,
   GRAPHIC_TYPES,
   GRAPHIC_COLOR_THEMES,
-  POSITION_PRESETS
+  POSITION_PRESETS,
+  SUBTITLE_STYLE_PRESETS
 } from '../utils/graphicEngine';
+import {
+  isSubtitleClip,
+  applyGlobalSubtitleStyle,
+  getDefaultSubtitleSettings,
+  generateSubtitlesTrackFromTranscript
+} from '../utils/transcriptOps';
+
+function SubtitleClipInspector({
+  selectedClip,
+  track,
+  onUpdateClip,
+  onDeleteClip,
+  onDuplicateClip,
+  project,
+  onUpdateProject
+}) {
+  const currentPresetId = selectedClip.subtitleStyle || project?.subtitleSettings?.styleId || 'hormozi_active';
+  const applyToAll = project?.subtitleSettings?.applyToAll !== false;
+  const [justRegenerated, setJustRegenerated] = React.useState(false);
+
+  const handleRegenerateAllSubtitles = () => {
+    if (!onUpdateProject || !project) return;
+    const updated = generateSubtitlesTrackFromTranscript(project, { enabled: true });
+    onUpdateProject(updated);
+    setJustRegenerated(true);
+    setTimeout(() => setJustRegenerated(false), 2200);
+  };
+
+  const handleUpdate = (updates) => {
+    onUpdateClip(selectedClip.id, updates);
+  };
+
+  const handleToggleApplyToAll = (newVal) => {
+    if (onUpdateProject && project) {
+      onUpdateProject({
+        ...project,
+        subtitleSettings: {
+          ...getDefaultSubtitleSettings(project),
+          ...(project.subtitleSettings || {}),
+          applyToAll: newVal
+        }
+      });
+    }
+  };
+
+  const handleApplyCurrentStyleToAll = () => {
+    if (onUpdateProject && project) {
+      const updated = applyGlobalSubtitleStyle(project, {
+        styleId: selectedClip.subtitleStyle || 'hormozi_active',
+        fontFamily: selectedClip.fontFamily,
+        fontSize: selectedClip.fontSize,
+        textColor: selectedClip.textColor,
+        accentColor: selectedClip.accentColor,
+        bgColor: selectedClip.bgColor,
+        strokeColor: selectedClip.strokeColor,
+        strokeWidth: selectedClip.strokeWidth,
+        textTransform: selectedClip.textTransform,
+        backdropGlass: selectedClip.backdropGlass,
+        highlightWordMode: selectedClip.highlightWordMode,
+        letterSpacing: selectedClip.letterSpacing,
+        textShadowBlur: selectedClip.textShadowBlur,
+        textShadowOffsetY: selectedClip.textShadowOffsetY,
+        textShadowColor: selectedClip.textShadowColor,
+        animationIn: selectedClip.animationIn,
+        animationInDuration: selectedClip.animationInDuration,
+        animationLoop: selectedClip.animationLoop,
+        animationOut: selectedClip.animationOut,
+        animationOutDuration: selectedClip.animationOutDuration,
+        posX: selectedClip.position?.x ?? selectedClip.positionX,
+        posY: selectedClip.position?.y ?? selectedClip.positionY,
+        scale: selectedClip.position?.scale ?? selectedClip.scale,
+        opacity: selectedClip.opacity
+      });
+      onUpdateProject(updated);
+    }
+  };
+
+  const handlePresetSelect = (presetId) => {
+    const preset = SUBTITLE_STYLE_PRESETS.find(p => p.id === presetId);
+    if (!preset) return;
+    handleUpdate({
+      subtitleStyle: preset.id,
+      fontFamily: preset.fontFamily,
+      fontSize: preset.fontSize,
+      textColor: preset.textColor,
+      accentColor: preset.accentColor,
+      bgColor: preset.bgColor,
+      strokeColor: preset.strokeColor,
+      strokeWidth: preset.strokeWidth,
+      textTransform: preset.textTransform,
+      backdropGlass: preset.backdropGlass,
+      highlightWordMode: preset.highlightWordMode
+    });
+  };
+
+  const handlePositionPreset = (presetId) => {
+    let x = 0;
+    let y = 235;
+    let s = 1.0;
+    if (presetId === 'bottom') {
+      y = 235;
+    } else if (presetId === 'center') {
+      y = 0;
+    } else if (presetId === 'top') {
+      y = -220;
+    }
+    handleUpdate({
+      position: {
+        ...(selectedClip.position || {}),
+        preset: presetId,
+        x,
+        y,
+        scale: s
+      },
+      positionX: x,
+      positionY: y,
+      scale: s
+    });
+  };
+
+  const posX = selectedClip.position?.x ?? selectedClip.positionX ?? 0;
+  const posY = selectedClip.position?.y ?? selectedClip.positionY ?? 235;
+  const scale = selectedClip.position?.scale ?? selectedClip.scale ?? 1.0;
+  const opacity = selectedClip.opacity !== undefined ? selectedClip.opacity : 1.0;
+  const strokeW = selectedClip.strokeWidth !== undefined ? Number(selectedClip.strokeWidth) : 5;
+  const strokeColor = selectedClip.strokeColor || '#000000';
+  const subtitleText = selectedClip.title !== undefined ? selectedClip.title : (selectedClip.text || selectedClip.name || '');
+
+  const animationIn = selectedClip.animationIn || selectedClip.animation?.inType || 'pop';
+  const animationInDuration = selectedClip.animationInDuration !== undefined ? selectedClip.animationInDuration : (selectedClip.animation?.inDuration ?? 0.15);
+
+  return (
+    <div className="clip-inspector graphic-inspector-view subtitle-inspector-view">
+      {/* Header */}
+      <div className="inspector-header">
+        <div className="inspector-title-row">
+          <div
+            className="inspector-color-dot"
+            style={{ backgroundColor: '#eab308', boxShadow: '0 0 10px rgba(234, 179, 8, 0.6)' }}
+          />
+          <input
+            type="text"
+            className="inspector-name-input"
+            value={selectedClip.name || `Sub: ${subtitleText.slice(0, 24)}`}
+            onChange={(e) => handleUpdate({ name: e.target.value })}
+            title="Nombre del clip en la línea de tiempo"
+          />
+        </div>
+        <span className="badge" style={{ background: '#eab308', color: '#000000', fontWeight: '800' }}>
+          {track?.name || 'S1 (Subtítulos)'}
+        </span>
+      </div>
+
+      {/* CapCut Apply to All Banner & Toggle */}
+      <div className={`capcut-apply-banner ${applyToAll ? 'is-global' : 'is-individual'}`}>
+        <div className="capcut-apply-top">
+          <div className="capcut-apply-info">
+            <div
+              className="capcut-icon-pill"
+              style={{
+                background: applyToAll ? 'rgba(234, 179, 8, 0.22)' : 'rgba(255, 255, 255, 0.08)',
+                color: applyToAll ? '#facc15' : '#94a3b8'
+              }}
+            >
+              <Sparkles size={16} />
+            </div>
+            <div>
+              <div className="capcut-apply-title-row">
+                <span className="capcut-apply-title">Aplicar a todos los subtítulos</span>
+                <span className="capcut-badge">{applyToAll ? 'CapCut ON' : 'OFF'}</span>
+              </div>
+              <p className="capcut-apply-desc">
+                {applyToAll
+                  ? 'Los cambios de fuente, tamaño, colores, borde y posición se sincronizan en todos los subtítulos.'
+                  : 'Edición individual: Los cambios de estilo solo afectarán a este subtítulo seleccionado.'}
+              </p>
+            </div>
+          </div>
+
+          <label className="switch-toggle switch-amber" title="Activar/Desactivar sincronización de estilo en todos los subtítulos (modo CapCut)">
+            <input
+              type="checkbox"
+              checked={applyToAll}
+              onChange={(e) => handleToggleApplyToAll(e.target.checked)}
+            />
+            <span className="slider-round" />
+          </label>
+        </div>
+
+        {!applyToAll && (
+          <button
+            type="button"
+            className="btn-secondary btn-xs"
+            onClick={handleApplyCurrentStyleToAll}
+            style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px', marginTop: '2px', borderColor: 'rgba(234, 179, 8, 0.4)', color: '#fde047' }}
+            title="Copiar las propiedades visuales de este subtítulo a todos los demás"
+          >
+            <Copy size={12} />
+            <span>Copiar este estilo a todos los subtítulos</span>
+          </button>
+        )}
+      </div>
+
+      {/* Contenido / Frase del Subtítulo */}
+      <div className="inspector-section">
+        <div className="section-title-row">
+          <Type size={13} className="text-amber" />
+          <h5>Texto de este Subtítulo</h5>
+        </div>
+
+        <div className="inspector-field">
+          <textarea
+            className="input-field"
+            rows={2}
+            value={subtitleText}
+            onChange={(e) => {
+              const val = e.target.value;
+              handleUpdate({
+                title: val,
+                text: val,
+                name: `Sub: ${val.slice(0, 26)}`
+              });
+            }}
+            placeholder="Escribe el texto que se mostrará en pantalla..."
+            style={{ resize: 'vertical', minHeight: '52px', fontSize: '13px', lineHeight: '1.4' }}
+          />
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px', color: '#94a3b8', marginTop: '4px' }}>
+            <span>{subtitleText.trim().split(/\s+/).filter(Boolean).length} palabras</span>
+            <span>Duración: {selectedClip.duration}s</span>
+          </div>
+        </div>
+      </div>
+
+      {/* Presets de Estilo Rápido (Hormozi, MrBeast, etc.) */}
+      <div className="inspector-section">
+        <div className="section-title-row">
+          <Sparkles size={13} className="text-amber" />
+          <h5>Estilos Predefinidos (Viral Presets)</h5>
+        </div>
+
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: '6px' }}>
+          {SUBTITLE_STYLE_PRESETS.map((p) => {
+            const isPresetActive = (selectedClip.subtitleStyle || currentPresetId) === p.id;
+            return (
+              <button
+                key={p.id}
+                type="button"
+                onClick={() => handlePresetSelect(p.id)}
+                style={{
+                  padding: '8px 10px',
+                  borderRadius: '6px',
+                  border: isPresetActive ? '1.5px solid #eab308' : '1px solid rgba(255, 255, 255, 0.08)',
+                  background: isPresetActive ? 'rgba(234, 179, 8, 0.14)' : 'rgba(0, 0, 0, 0.25)',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'flex-start',
+                  gap: '4px',
+                  cursor: 'pointer',
+                  textAlign: 'left'
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', width: '100%' }}>
+                  <div style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: p.accentColor }} />
+                  <span style={{ fontSize: '11px', fontWeight: '700', color: isPresetActive ? '#fef08a' : '#f1f5f9' }}>
+                    {p.name.split(' ')[0]}
+                  </span>
+                </div>
+                <span style={{ fontSize: '10px', color: '#94a3b8' }}>
+                  {p.fontFamily} • {p.accentColor}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Tipografía & Formato */}
+      <div className="inspector-section">
+        <div className="section-title-row">
+          <Type size={13} className="text-indigo" />
+          <h5>Tipografía & Formato</h5>
+        </div>
+
+        <div className="inspector-field">
+          <label>Fuente (Google Fonts)</label>
+          <select
+            className="inspector-select"
+            value={selectedClip.fontFamily || 'Montserrat'}
+            onChange={(e) => handleUpdate({ fontFamily: e.target.value })}
+          >
+            {FONT_OPTIONS.map(f => (
+              <option key={f.id} value={f.id} style={{ fontFamily: f.family }}>
+                {f.name}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div className="inspector-grid-2">
+          <div className="inspector-field">
+            <div className="field-label-group">
+              <label>Tamaño Fuente</label>
+              <span className="field-val">{selectedClip.fontSize || 40}px</span>
+            </div>
+            <input
+              type="range"
+              min="20"
+              max="80"
+              step="2"
+              className="range-slider"
+              value={selectedClip.fontSize || 40}
+              onChange={(e) => handleUpdate({ fontSize: Number(e.target.value) })}
+            />
+          </div>
+
+          <div className="inspector-field">
+            <div className="field-label-group">
+              <label>Espaciado Letras</label>
+              <span className="field-val">{selectedClip.letterSpacing || 1}px</span>
+            </div>
+            <input
+              type="range"
+              min="0"
+              max="8"
+              step="1"
+              className="range-slider"
+              value={selectedClip.letterSpacing || 1}
+              onChange={(e) => handleUpdate({ letterSpacing: Number(e.target.value) })}
+            />
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '6px', background: 'rgba(0, 0, 0, 0.25)', padding: '10px 12px', borderRadius: '8px' }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', color: '#fef08a', cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={selectedClip.highlightWordMode !== false}
+              onChange={(e) => handleUpdate({ highlightWordMode: e.target.checked })}
+              style={{ accentColor: '#eab308' }}
+            />
+            <span style={{ fontWeight: '600' }}>Resaltar Palabra Activa (Efecto Hormozi / Viral)</span>
+          </label>
+          <span style={{ fontSize: '10px', color: '#94a3b8', lineHeight: '1.4' }}>
+            Destaca la palabra clave con el color de acento y escala para maximizar la retención.
+          </span>
+
+          <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', color: '#cbd5e1', cursor: 'pointer', marginTop: '4px' }}>
+            <input
+              type="checkbox"
+              checked={selectedClip.textTransform === 'uppercase'}
+              onChange={(e) => handleUpdate({ textTransform: e.target.checked ? 'uppercase' : 'none' })}
+              style={{ accentColor: '#eab308' }}
+            />
+            <span>Forzar Todo en Mayúsculas (Uppercase)</span>
+          </label>
+        </div>
+      </div>
+
+      {/* Colores, Borde (Stroke) & Fondo */}
+      <div className="inspector-section">
+        <div className="section-title-row">
+          <Palette size={13} className="text-amber" />
+          <h5>Colores, Contorno (Borde) & Fondo</h5>
+        </div>
+
+        <div className="inspector-grid-2">
+          <div className="inspector-field">
+            <label>Color Texto Base</label>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <input
+                type="color"
+                value={selectedClip.textColor || '#ffffff'}
+                onChange={(e) => handleUpdate({ textColor: e.target.value })}
+                style={{ width: '32px', height: '28px', border: 'none', background: 'transparent', cursor: 'pointer' }}
+              />
+              <span style={{ fontSize: '11px', color: '#cbd5e1' }}>{selectedClip.textColor || '#ffffff'}</span>
+            </div>
+          </div>
+
+          <div className="inspector-field">
+            <label>Color Palabra Resaltada</label>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <input
+                type="color"
+                value={selectedClip.accentColor || '#facc15'}
+                onChange={(e) => handleUpdate({ accentColor: e.target.value })}
+                style={{ width: '32px', height: '28px', border: 'none', background: 'transparent', cursor: 'pointer' }}
+              />
+              <span style={{ fontSize: '11px', color: '#cbd5e1' }}>{selectedClip.accentColor || '#facc15'}</span>
+            </div>
+          </div>
+        </div>
+
+        {/* Grosor de Contorno / Borde Exterior (Stroke) */}
+        <div className="inspector-grid-2" style={{ marginTop: '4px' }}>
+          <div className="inspector-field">
+            <div className="field-label-group">
+              <label>Grosor Contorno (Borde)</label>
+              <span className="field-val">{strokeW}px</span>
+            </div>
+            <input
+              type="range"
+              min="0"
+              max="14"
+              step="1"
+              className="range-slider"
+              value={strokeW}
+              onChange={(e) => handleUpdate({ strokeWidth: Number(e.target.value) })}
+            />
+          </div>
+
+          <div className="inspector-field">
+            <label>Color del Contorno</label>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <input
+                type="color"
+                value={strokeColor}
+                onChange={(e) => handleUpdate({ strokeColor: e.target.value })}
+                style={{ width: '32px', height: '28px', border: 'none', background: 'transparent', cursor: 'pointer' }}
+              />
+              <span style={{ fontSize: '11px', color: '#cbd5e1' }}>{strokeColor}</span>
+            </div>
+          </div>
+        </div>
+
+        {/* Tarjeta Glassmorphism */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '8px', background: 'rgba(0, 0, 0, 0.25)', padding: '10px 12px', borderRadius: '8px' }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', color: '#f1f5f9', cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={selectedClip.backdropGlass === true}
+              onChange={(e) => handleUpdate({ backdropGlass: e.target.checked })}
+              style={{ accentColor: '#eab308' }}
+            />
+            <span style={{ fontWeight: '600' }}>Tarjeta de Fondo Glassmorphism</span>
+          </label>
+          {selectedClip.backdropGlass && (
+            <div className="inspector-field" style={{ marginTop: '4px' }}>
+              <label>Color y Opacidad de Tarjeta</label>
+              <input
+                type="text"
+                className="input-field"
+                value={selectedClip.bgColor || 'rgba(0, 0, 0, 0.75)'}
+                onChange={(e) => handleUpdate({ bgColor: e.target.value })}
+                placeholder="rgba(0, 0, 0, 0.75)"
+              />
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Posición & Escala en Pantalla */}
+      <div className="inspector-section">
+        <div className="section-title-row">
+          <Move size={13} className="text-amber" />
+          <h5>Posición & Escala en Pantalla</h5>
+        </div>
+
+        <div className="inspector-field">
+          <label>Presets de Posición Rápida</label>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '6px' }}>
+            {[
+              { id: 'bottom', name: 'Inferior (Clásico)' },
+              { id: 'center', name: 'Centro' },
+              { id: 'top', name: 'Superior' }
+            ].map(pos => {
+              const isActive = (pos.id === 'bottom' && posY >= 150) || (pos.id === 'center' && posY >= -50 && posY < 150) || (pos.id === 'top' && posY < -50);
+              return (
+                <button
+                  key={pos.id}
+                  type="button"
+                  onClick={() => handlePositionPreset(pos.id)}
+                  className={`btn-ghost btn-xs ${isActive ? 'active' : ''}`}
+                  style={{
+                    fontSize: '11px',
+                    padding: '5px 8px',
+                    borderColor: isActive ? '#eab308' : undefined,
+                    color: isActive ? '#fef08a' : undefined
+                  }}
+                >
+                  {pos.name}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="inspector-grid-2">
+          <div className="inspector-field">
+            <div className="field-label-group">
+              <label>Posición Y (Vertical)</label>
+              <span className="field-val">{posY}px</span>
+            </div>
+            <input
+              type="range"
+              min="-350"
+              max="350"
+              step="5"
+              className="range-slider"
+              value={posY}
+              onChange={(e) => {
+                const newY = Number(e.target.value);
+                handleUpdate({
+                  position: { ...(selectedClip.position || {}), y: newY },
+                  positionY: newY
+                });
+              }}
+            />
+          </div>
+
+          <div className="inspector-field">
+            <div className="field-label-group">
+              <label>Posición X (Horizontal)</label>
+              <span className="field-val">{posX}px</span>
+            </div>
+            <input
+              type="range"
+              min="-300"
+              max="300"
+              step="5"
+              className="range-slider"
+              value={posX}
+              onChange={(e) => {
+                const newX = Number(e.target.value);
+                handleUpdate({
+                  position: { ...(selectedClip.position || {}), x: newX },
+                  positionX: newX
+                });
+              }}
+            />
+          </div>
+        </div>
+
+        <div className="inspector-grid-2">
+          <div className="inspector-field">
+            <div className="field-label-group">
+              <label>Escala</label>
+              <span className="field-val">{scale.toFixed(2)}x</span>
+            </div>
+            <input
+              type="range"
+              min="0.5"
+              max="2.0"
+              step="0.05"
+              className="range-slider"
+              value={scale}
+              onChange={(e) => {
+                const newScale = Number(e.target.value);
+                handleUpdate({
+                  position: { ...(selectedClip.position || {}), scale: newScale },
+                  scale: newScale
+                });
+              }}
+            />
+          </div>
+
+          <div className="inspector-field">
+            <div className="field-label-group">
+              <label>Opacidad</label>
+              <span className="field-val">{Math.round(opacity * 100)}%</span>
+            </div>
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.02"
+              className="range-slider"
+              value={opacity}
+              onChange={(e) => handleUpdate({ opacity: Number(e.target.value) })}
+            />
+          </div>
+        </div>
+
+        <div className="inspector-field" style={{ marginTop: '8px' }}>
+          <div className="field-label-group">
+            <label>Espacio a lo Ancho (Ancho de Caja)</label>
+            <span className="field-val">{selectedClip.boxWidth ? `${selectedClip.boxWidth}px` : 'Óptimo (2 líneas)'}</span>
+          </div>
+          <input
+            type="range"
+            min="300"
+            max={project?.settings?.aspectRatio === '9:16' ? 680 : 1100}
+            step="10"
+            className="range-slider"
+            value={selectedClip.boxWidth || (project?.settings?.aspectRatio === '9:16' ? 605 : 960)}
+            onChange={(e) => {
+              const val = Number(e.target.value);
+              handleUpdate({
+                boxWidth: val,
+                position: {
+                  ...(selectedClip.position || {}),
+                  boxWidth: val
+                }
+              });
+            }}
+          />
+          <span style={{ fontSize: '10px', color: '#94a3b8' }}>
+            Amplía el espacio horizontal para que el texto se organice en 2 líneas sin alterar el tamaño de letra.
+          </span>
+        </div>
+      </div>
+
+      {/* Animación (Motion FX) */}
+      <div className="inspector-section">
+        <div className="section-title-row">
+          <Zap size={13} className="text-amber" />
+          <h5>Animación de Entrada & Salida</h5>
+        </div>
+
+        <div className="inspector-grid-2">
+          <div className="inspector-field">
+            <label>Animación de Entrada</label>
+            <select
+              className="inspector-select"
+              value={animationIn}
+              onChange={(e) => handleUpdate({
+                animationIn: e.target.value,
+                animation: { ...(selectedClip.animation || {}), inType: e.target.value }
+              })}
+            >
+              {ANIMATION_IN_TYPES.map(an => (
+                <option key={an.id} value={an.id}>
+                  {an.name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="inspector-field">
+            <div className="field-label-group">
+              <label>Duración Entrada</label>
+              <span className="field-val">{animationInDuration.toFixed(2)}s</span>
+            </div>
+            <input
+              type="range"
+              min="0.05"
+              max="0.8"
+              step="0.05"
+              className="range-slider"
+              value={animationInDuration}
+              onChange={(e) => handleUpdate({
+                animationInDuration: Number(e.target.value),
+                animation: { ...(selectedClip.animation || {}), inDuration: Number(e.target.value) }
+              })}
+            />
+          </div>
+        </div>
+      </div>
+
+      {/* Tiempo & Duración */}
+      <div className="inspector-section">
+        <div className="section-title-row">
+          <Clock size={13} className="text-cyan" />
+          <h5>Tiempo & Duración</h5>
+        </div>
+
+        <div className="inspector-grid-2">
+          <div className="inspector-field">
+            <label>Inicio (Línea de Tiempo)</label>
+            <div className="inspector-input-with-badge">
+              <input
+                type="number"
+                step="0.05"
+                min="0"
+                className="input-field"
+                value={selectedClip.startTime}
+                onChange={(e) => handleUpdate({ startTime: Math.max(0, Number(e.target.value)) })}
+              />
+              <span className="input-unit timecode">{formatTimecode(selectedClip.startTime)}</span>
+            </div>
+          </div>
+
+          <div className="inspector-field">
+            <label>Duración</label>
+            <div className="inspector-input-with-badge">
+              <input
+                type="number"
+                step="0.05"
+                min="0.3"
+                className="input-field"
+                value={selectedClip.duration}
+                onChange={(e) => handleUpdate({ duration: Math.max(0.3, Number(e.target.value)) })}
+              />
+              <span className="input-unit">seg</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Acciones del Clip */}
+      <div className="inspector-actions" style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+        <button
+          type="button"
+          className="btn-secondary btn-sm"
+          style={{
+            width: '100%',
+            borderColor: justRegenerated ? '#10b981' : 'rgba(234, 179, 8, 0.45)',
+            background: justRegenerated ? 'rgba(16, 185, 129, 0.15)' : 'rgba(234, 179, 8, 0.12)',
+            color: justRegenerated ? '#34d399' : '#fef08a'
+          }}
+          onClick={handleRegenerateAllSubtitles}
+          title="Regenerar y volver a crear todos los clips de subtítulos a partir del guion de la línea de tiempo"
+        >
+          {justRegenerated ? <Check size={13} className="text-emerald" /> : <RotateCcw size={13} />}
+          <span>{justRegenerated ? '¡Subtítulos Regenerados!' : 'Volver a Subtitular Todo desde el Guion'}</span>
+        </button>
+
+        <button
+          type="button"
+          className="btn-danger btn-sm"
+          style={{ width: '100%' }}
+          onClick={() => onDeleteClip(selectedClip.id)}
+        >
+          <Trash2 size={13} />
+          <span>Eliminar este Subtítulo</span>
+        </button>
+      </div>
+    </div>
+  );
+}
 
 function GraphicClipInspector({
   selectedClip,
@@ -1231,12 +1953,17 @@ export const ClipInspector = React.memo(function ClipInspector({
   selectedClipIds = [],
   project,
   onUpdateClip,
+  onBeginTransform = null,
+  onEndTransform = null,
   onDeleteClip,
   onDuplicateClip,
   onSeparateAudio,
   onUnlinkClip,
   onOpenProjectSettings,
-  onUpdateProject
+  onUpdateProject,
+  onOpenGraphicForScene,
+  onOpenSceneBroll,
+  onSelectScene = null
 }) {
   // If MULTIPLE clips are selected, show dedicated Multi-Clip Batch Inspector
   if (selectedClipIds && selectedClipIds.length > 1) {
@@ -1390,6 +2117,45 @@ export const ClipInspector = React.memo(function ClipInspector({
   const isSceneTrack = track?.type === 'scene';
   const isMediaClip = !isGuideTrack && !isSceneTrack;
   const asset = project?.assets?.find(a => a.id === selectedClip.assetId);
+  const graphicsTrack = (project?.tracks || []).find(t => t.id === 'track-graphics-g1' || t.type === 'graphics');
+  const existingGraphicClip = isSceneTrack
+    ? graphicsTrack?.clips?.find(c => c.sceneNumber === selectedClip.sceneNumber || c.sceneId === selectedClip.id)
+    : null;
+  const sceneTrack = (project?.tracks || []).find(t => t.type === 'scene');
+  const matchingScene = React.useMemo(() => {
+    if (isSceneTrack || selectedClip.isGraphic) return null;
+    if (sceneTrack && Array.isArray(sceneTrack.clips)) {
+      const sClip = sceneTrack.clips.find(sc => selectedClip.startTime >= sc.startTime && selectedClip.startTime < (sc.startTime + sc.duration));
+      if (sClip) {
+        const sNum = sClip.sceneNumber ? Number(sClip.sceneNumber) : null;
+        const nameMatch = sClip.name?.match(/\[E\s*0*(\d+)\]/i) || sClip.title?.match(/\[E\s*0*(\d+)\]/i);
+        const extractedNum = nameMatch ? Number(nameMatch[1]) : null;
+        const targetNum = sNum || extractedNum;
+        const full = (project?.scenes?.list || []).find(s =>
+          (targetNum && Number(s.sceneNumber) === targetNum) ||
+          (sClip.sceneId && s.id === sClip.sceneId) ||
+          (sClip.id && s.id === sClip.id)
+        );
+        if (full) return full;
+      }
+    }
+    return (project?.scenes?.list || []).find(s => selectedClip.startTime >= s.startTime && selectedClip.startTime < s.endTime) || null;
+  }, [isSceneTrack, selectedClip, sceneTrack, project?.scenes?.list]);
+
+  // --- Subtitle Clip Selected View ---
+  if (isSubtitleClip(selectedClip, track)) {
+    return (
+      <SubtitleClipInspector
+        selectedClip={selectedClip}
+        track={track}
+        onUpdateClip={onUpdateClip}
+        onDeleteClip={onDeleteClip}
+        onDuplicateClip={onDuplicateClip}
+        project={project}
+        onUpdateProject={onUpdateProject}
+      />
+    );
+  }
 
   // --- Graphic Clip Selected View ---
   if (selectedClip.isGraphic) {
@@ -1400,6 +2166,8 @@ export const ClipInspector = React.memo(function ClipInspector({
         onUpdateClip={onUpdateClip}
         onDeleteClip={onDeleteClip}
         onDuplicateClip={onDuplicateClip}
+        project={project}
+        onUpdateProject={onUpdateProject}
       />
     );
   }
@@ -1513,6 +2281,256 @@ export const ClipInspector = React.memo(function ClipInspector({
           </div>
         )}
       </div>
+      {/* Scene Track: Dedicated Motion Graphics & Storyboard Card */}
+      {isSceneTrack && (
+        <div
+          className="inspector-section"
+          style={{
+            background: 'linear-gradient(180deg, rgba(6, 182, 212, 0.08) 0%, rgba(99, 102, 241, 0.05) 100%)',
+            border: '1px solid rgba(6, 182, 212, 0.25)',
+            borderRadius: '10px',
+            padding: '14px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '12px'
+          }}
+        >
+          <div className="section-title-row" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <Sparkles size={14} className="text-cyan" />
+              <h5 style={{ margin: 0, color: '#38bdf8', fontSize: '13px', fontWeight: '700' }}>
+                Efecto Visual & Motion Graphics (G1)
+              </h5>
+            </div>
+            {existingGraphicClip && (
+              <span className="badge badge-cyan" style={{ fontSize: '10px' }}>
+                Activo en G1
+              </span>
+            )}
+          </div>
+
+          {onSelectScene && (
+            <button
+              type="button"
+              className="btn-secondary w-full"
+              onClick={() => onSelectScene(selectedClip)}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: '6px',
+                padding: '8px 12px',
+                fontSize: '11px',
+                color: '#38bdf8',
+                borderColor: 'rgba(56, 189, 248, 0.4)',
+                background: 'rgba(6, 182, 212, 0.12)',
+                fontWeight: '600',
+                borderRadius: '6px'
+              }}
+            >
+              <Film size={13} />
+              <span>Ubicar y Editar en Panel Escenas IA</span>
+            </button>
+          )}
+
+          {existingGraphicClip ? (
+            <div
+              style={{
+                background: 'rgba(6, 182, 212, 0.1)',
+                border: '1px solid rgba(6, 182, 212, 0.3)',
+                borderRadius: '8px',
+                padding: '10px 12px',
+                fontSize: '11px',
+                color: '#e2e8f0',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '4px'
+              }}
+            >
+              <div style={{ fontWeight: '600', color: '#38bdf8', fontSize: '12px' }}>
+                {existingGraphicClip.name || existingGraphicClip.title || 'Efecto Visual'}
+              </div>
+              <div style={{ color: 'var(--text-secondary)' }}>
+                Tipo: <strong style={{ color: '#fff' }}>{existingGraphicClip.graphicType || 'Gráfico'}</strong> • Tema: <strong style={{ color: '#fff' }}>{existingGraphicClip.themeId || 'cyan_tech'}</strong>
+              </div>
+              {existingGraphicClip.subtitle && (
+                <div style={{ fontStyle: 'italic', color: '#94a3b8' }}>
+                  "{existingGraphicClip.subtitle}"
+                </div>
+              )}
+            </div>
+          ) : (
+            <p style={{ margin: 0, fontSize: '12px', color: 'var(--text-secondary)', lineHeight: '1.4' }}>
+              Esta escena no tiene un efecto visual asignado en la pista G1. Puedes generarlo con IA documental o heurística instantánea.
+            </p>
+          )}
+
+          {onOpenGraphicForScene && (
+            <button
+              type="button"
+              className="btn-primary w-full"
+              onClick={() => onOpenGraphicForScene(selectedClip)}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: '8px',
+                padding: '9px 12px',
+                background: 'linear-gradient(135deg, #06b6d4, #6366f1)',
+                color: '#fff',
+                fontWeight: '600',
+                fontSize: '12px',
+                borderRadius: '8px',
+                boxShadow: '0 4px 14px rgba(6, 182, 212, 0.3)',
+                cursor: 'pointer'
+              }}
+            >
+              <Sparkles size={15} />
+              <span>{existingGraphicClip ? 'Editar / Re-generar Efecto Visual IA' : '✨ Generar Efecto Visual para esta Escena'}</span>
+            </button>
+          )}
+
+          {onOpenSceneBroll && (
+            <button
+              type="button"
+              className="btn-secondary w-full"
+              onClick={() => {
+                const sNum = selectedClip.sceneNumber ? Number(selectedClip.sceneNumber) : null;
+                const nameMatch = selectedClip.name?.match(/\[E\s*0*(\d+)\]/i) || selectedClip.title?.match(/\[E\s*0*(\d+)\]/i);
+                const extractedNum = nameMatch ? Number(nameMatch[1]) : null;
+                const targetNum = sNum || extractedNum;
+                const fullScene = (project?.scenes?.list || []).find(s =>
+                  (targetNum && Number(s.sceneNumber) === targetNum) ||
+                  (selectedClip.sceneId && s.id === selectedClip.sceneId) ||
+                  (selectedClip.id && s.id === selectedClip.id)
+                );
+                onOpenSceneBroll({
+                  ...(fullScene || {}),
+                  ...selectedClip,
+                  id: selectedClip.sceneId || fullScene?.id || selectedClip.id,
+                  sceneNumber: targetNum || fullScene?.sceneNumber || 1,
+                  searchKeywords: fullScene?.searchKeywords || selectedClip.searchKeywords || [],
+                  visualDescription: fullScene?.visualDescription || selectedClip.visualDescription || '',
+                  title: selectedClip.title || fullScene?.title || selectedClip.name || `Escena ${targetNum || 1}`,
+                  startTime: Number(selectedClip.startTime.toFixed(2)),
+                  duration: Number(selectedClip.duration.toFixed(2)),
+                  endTime: Number((selectedClip.startTime + selectedClip.duration).toFixed(2))
+                });
+              }}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: '8px',
+                padding: '9px 12px',
+                background: 'rgba(6, 182, 212, 0.12)',
+                color: '#38bdf8',
+                border: '1px solid rgba(56, 189, 248, 0.35)',
+                fontWeight: '600',
+                fontSize: '12px',
+                borderRadius: '8px',
+                cursor: 'pointer'
+              }}
+            >
+              <Download size={15} />
+              <span>🎬 Buscar / Asignar Video B-Roll</span>
+            </button>
+          )}
+
+          {/* Scene text / script preview */}
+          {(selectedClip.text || selectedClip.visualDescription) && (
+            <div
+              style={{
+                marginTop: '4px',
+                paddingTop: '10px',
+                borderTop: '1px solid rgba(255,255,255,0.08)',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '6px'
+              }}
+            >
+              <span style={{ fontSize: '10px', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'var(--text-dim)', fontWeight: '700' }}>
+                Guion Narrativo de la Escena
+              </span>
+              <p style={{ margin: 0, fontSize: '11px', color: '#cbd5e1', lineHeight: '1.45', maxHeight: '100px', overflowY: 'auto' }}>
+                {selectedClip.text || selectedClip.visualDescription}
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Non-scene media clip: Convenient scene graphic generator shortcut */}
+      {!isSceneTrack && !selectedClip.isGraphic && matchingScene && onOpenGraphicForScene && (
+        <div
+          className="inspector-section"
+          style={{
+            background: 'rgba(255,255,255,0.02)',
+            border: '1px solid rgba(255,255,255,0.08)',
+            borderRadius: '8px',
+            padding: '10px 12px'
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
+            <span style={{ fontSize: '11px', color: 'var(--text-secondary)' }}>
+              Escena #{matchingScene.sceneNumber}: {matchingScene.title}
+            </span>
+            <span className="badge badge-indigo" style={{ fontSize: '9px' }}>Pista G1</span>
+          </div>
+          <button
+            type="button"
+            className="btn-secondary w-full btn-xs"
+            onClick={() => {
+              const nameMatch = selectedClip.name?.match(/\[E\s*0*(\d+)\]/i) || selectedClip.name?.match(/\bEscena\s*0*(\d+)\b/i);
+              const extractedNum = nameMatch ? Number(nameMatch[1]) : null;
+              onOpenGraphicForScene({
+                ...(matchingScene || {}),
+                ...selectedClip,
+                id: selectedClip.id,
+                sceneId: selectedClip.sceneId || matchingScene?.id,
+                sceneNumber: selectedClip.sceneNumber || extractedNum || matchingScene?.sceneNumber || 1,
+                title: selectedClip.title || matchingScene?.title || selectedClip.name,
+                scriptText: selectedClip.text || matchingScene?.scriptText || selectedClip.name || '',
+                visualDescription: selectedClip.visualDescription || matchingScene?.visualDescription || '',
+                visualType: selectedClip.visualType || 'video',
+                startTime: Number(selectedClip.startTime.toFixed(2)),
+                duration: Number(selectedClip.duration.toFixed(2)),
+                isTimelineClip: true
+              });
+            }}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: '6px',
+              color: '#38bdf8',
+              borderColor: 'rgba(56, 189, 248, 0.3)'
+            }}
+          >
+            <Sparkles size={12} />
+            <span>Generar Efecto Visual para esta Escena</span>
+          </button>
+          {onSelectScene && (
+            <button
+              type="button"
+              className="btn-ghost btn-xs w-full"
+              onClick={() => onSelectScene(matchingScene)}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: '5px',
+                fontSize: '11px',
+                color: '#38bdf8',
+                marginTop: '6px'
+              }}
+            >
+              <Film size={11} />
+              <span>Ver Propiedades en Escenas IA</span>
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Visual Transform & Geometry (For Video and Image clips) */}
       {!isAudioTrack && isMediaClip && (

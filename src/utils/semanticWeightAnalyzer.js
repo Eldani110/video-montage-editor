@@ -431,7 +431,12 @@ export function extractDialogueVisualCore(phraseText, sceneIndex = 0, visualType
     'una', 'su', 'al', 'lo', 'como', 'más', 'pero', 'sus', 'le', 'ya', 'o', 'este', 'sí', 'porque', 'esta',
     'entre', 'cuando', 'muy', 'sin', 'sobre', 'también', 'me', 'hasta', 'hay', 'donde', 'quien', 'desde',
     'enfrenta', 'hace', 'tiene', 'tienen', 'cada', 'todo', 'todos', 'esta', 'estos', 'estas', 'ser', 'son',
-    'fue', 'era', 'había', 'habia', 'decidió', 'decidio', 'vio', 'iban', 'así', 'asi', 'esto', 'eso'
+    'fue', 'era', 'había', 'habia', 'decidió', 'decidio', 'vio', 'iban', 'así', 'asi', 'esto', 'eso',
+    'alguna', 'alguno', 'algun', 'algún', 'algunas', 'algunos', 'vez', 'veces', 'has', 'he', 'ha', 'hemos',
+    'han', 'habían', 'habian', 'tenido', 'sido', 'puede', 'pueden', 'podría', 'podria', 'podían', 'podian',
+    'bueno', 'pues', 'entonces', 'mientras', 'tanto', 'aquí', 'aqui', 'allí', 'alli', 'ahí', 'ahi', 'bien',
+    'mal', 'hacer', 'hizo', 'hacía', 'hacia', 'dar', 'dio', 'ver', 'visto', 'mirar', 'saber', 'sabía', 'sabia',
+    'decir', 'dijo', 'decía', 'decia', 'otro', 'otra', 'otros', 'otras', 'mismo', 'misma'
   ]);
 
   const meaningfulWords = rawWords
@@ -445,7 +450,7 @@ export function extractDialogueVisualCore(phraseText, sceneIndex = 0, visualType
   } else if (properNouns.length > 0) {
     visualAnchor = properNouns.slice(0, 3).join(' ');
   } else if (isBrewingOrFood) {
-    const brewTerm = meaningfulWords.find(w => /cerveza|cervecer|ginebra|levadura|barril|fábrica|lúpulo|receta/i.test(w)) || 'Cervecería';
+    const brewTerm = meaningfulWords.find(w => /cerveza|cervecer|ginebra|levadura|barril|fábrica|lúpulo|receta|botella|vaso|espuma/i.test(w)) || 'Cerveza';
     visualAnchor = `${brewTerm.charAt(0).toUpperCase() + brewTerm.slice(1)} ${timeContext || ''}`.trim();
   } else {
     visualAnchor = meaningfulWords.slice(0, 2).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ') || `Momento ${sceneIndex + 1}`;
@@ -483,15 +488,19 @@ export function extractDialogueVisualCore(phraseText, sceneIndex = 0, visualType
     shotPrompt = `Plano cinematográfico con encuadre medio y suave movimiento de cámara enfocado en ${meaningfulWords.slice(0, 3).join(' ')}, ilustrando directamente el relato: "${rawText.slice(0, 85)}" con iluminación estética cuidada.`;
   }
 
-  // Keywords
+  // Keywords - Prioritize concrete visual subjects first
   const keywords = [];
+  if (visualAnchor) keywords.push(visualAnchor);
   if (properNouns.length > 0) keywords.push(properNouns.join(' '));
+  if (meaningfulWords.length > 0) {
+    keywords.push(meaningfulWords.slice(0, 3).join(' '));
+    meaningfulWords.slice(0, 3).forEach(w => keywords.push(w.toLowerCase()));
+  }
   if (timeContext) keywords.push(timeContext);
-  if (isHistorical) keywords.push('vintage historic 19th century');
-  if (isBrewingOrFood) keywords.push('brewery beer craft');
+  if (isHistorical) keywords.push('vintage historic');
+  if (isBrewingOrFood) keywords.push('craft beer brewery');
   if (isScienceOrLab) keywords.push('laboratory science research');
   if (isBusinessOrMoney) keywords.push('business money investment');
-  meaningfulWords.slice(0, 3).forEach(w => keywords.push(w.toLowerCase()));
 
   const uniqueKeywords = Array.from(new Set(keywords)).slice(0, 6);
 

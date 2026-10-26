@@ -7,7 +7,7 @@
  * 4. Multimodal Vision AI final curation (Anti-Cliché, cinematic lighting, narrative fit)
  */
 import { sendAiChatCompletion, parseAiJsonResponse, getSavedAiConfig } from './aiClient.js';
-import { buildVisualCandidateCollage } from './visualCollageBuilder.js';
+import { buildVisualCandidateCollage, buildDualSceneVisualCollage } from './visualCollageBuilder.js';
 import { analyzePhraseVisualWeights } from './semanticWeightAnalyzer.js';
 import { extractSceneConceptPills } from './stockMediaClient.js';
 
@@ -326,6 +326,135 @@ Aplica el Cerebro de Editor: formula entre 2 y 3 búsquedas precisas en inglés 
 }
 
 /**
+ * Planificación en Lote de Estrategias de Búsqueda (Batch Visual Strategy):
+ * Agrupa las escenas en lotes de máx 8 escenas y formula en 1 sola llamada a Ollama Cloud
+ * las consultas de búsqueda para todo el bloque.
+ * Reduce el consumo de peticiones y tokens en un ~85% y garantiza continuidad visual y variedad.
+ */
+export async function generateBatchSceneSearchStrategiesWithAI({
+  scenes = [],
+  globalVideoTopic = null,
+  aiConfig = null,
+  signal = null,
+  onLog = () => {}
+}) {
+  const strategiesMap = new Map();
+  if (!scenes || scenes.length === 0) return strategiesMap;
+
+  const configToUse = aiConfig || getSavedAiConfig();
+  const BATCH_SIZE = 8;
+  const batches = [];
+  for (let i = 0; i < scenes.length; i += BATCH_SIZE) {
+    batches.push(scenes.slice(i, i + BATCH_SIZE));
+  }
+
+  const topicContext = globalVideoTopic ? `
+TEMA PRINCIPAL DEL VIDEO: "${globalVideoTopic.coreTopic}" (Universo visual: ${globalVideoTopic.visualDomain || 'Profesional y cinematográfico'})
+` : '';
+
+  const systemPrompt = `Eres un Director de Fotografía y Montajista Audiovisual de Élite (Cerebro de Editor).
+Tu objetivo es analizar una secuencia de escenas consecutivas y formular para CADA UNA exactamente entre 2 y 3 búsquedas precisas, naturales y cinematográficas en INGLÉS para bancos de stock (Pexels, Pixabay), tal como un editor humano las escribiría.
+${topicContext}
+CÓMO PIENSA EL CEREBRO DE UN EDITOR:
+1. LA TOMA SUGERIDA ES LA PRIORIDAD #1:
+   - Si la toma sugerida pide un plano u objeto concreto (ej: "Plano cenital de un mapa antiguo", "Servidores con luces LED", "Manos firmando contrato"), formula una búsqueda directa en inglés (ej: "ancient world map table vintage", "data center server rack lights", "hands signing contract desk").
+2. SUJETO, ENTORNO O LOCALIZACIÓN TANGIBLE:
+   - Si la escena menciona un lugar específico o atmósfera (ej: Ámsterdam, oficina moderna, puerto marítimo), formula una búsqueda para capturar ese lugar (ej: "amsterdam canal historic aerial", "busy modern office meeting").
+3. CONTINUIDAD VISUAL Y VARIEDAD:
+   - Asegura variedad cinematográfica entre escenas contiguas. NO repitas las mismas palabras exactas en escenas consecutivas.
+4. REGLAS DE ORO:
+   - 2 a 4 palabras clave en INGLÉS por consulta. Términos naturales y cinematográficos. Cero clichés vacíos.
+
+Responde ÚNICAMENTE en JSON con la clave "strategies" como un arreglo de objetos:
+{
+  "strategies": [
+    {
+      "sceneNumber": 1,
+      "concept": "Enfoque cinematográfico en 1 frase",
+      "queries": ["búsqueda en inglés 1", "búsqueda en inglés 2"]
+    }
+  ]
+}`;
+
+  for (let bIdx = 0; bIdx < batches.length; bIdx++) {
+    if (signal && signal.aborted) throw new Error('Operación cancelada por el usuario.');
+    const currentBatch = batches[bIdx];
+
+    onLog({
+      phase: 'Planificación en Lote',
+      text: `Analizando con IA el Lote ${bIdx + 1}/${batches.length} (Escenas ${currentBatch[0].sceneNumber || 1} a ${currentBatch[currentBatch.length - 1].sceneNumber || currentBatch.length})...`,
+      icon: '🧠'
+    });
+
+    const scenesSummaryText = currentBatch.map(s => {
+      const pills = extractSceneConceptPills(s).map(p => p.label).slice(0, 4).join(', ');
+      return `[ESCENA ${s.sceneNumber || 1}] "${s.title || ''}"
+  - Guion: "${(s.scriptText || s.scriptExcerpt || s.visualDescription || '').substring(0, 180)}"
+  - Toma sugerida: "${s.visualDescription || s.visualAnchor || s.title || ''}"
+  - Ancla visual: "${s.visualAnchor || s.title || ''}"
+  - Formato: ${s.visualType === 'image' ? 'Foto' : 'Video B-Roll'}${pills ? `\n  - Conceptos clave: [${pills}]` : ''}`;
+    }).join('\n\n');
+
+    const userPrompt = `Formula las 2-3 mejores búsquedas de stock en inglés para las siguientes ${currentBatch.length} escenas consecutivas:
+
+${scenesSummaryText}
+
+Responde ÚNICAMENTE con el JSON que contiene la clave "strategies".`;
+
+    try {
+      const response = await sendAiChatCompletion({
+        systemPrompt,
+        userPrompt,
+        config: configToUse,
+        jsonMode: true,
+        signal,
+        timeoutMs: 35000
+      });
+
+      const parsed = parseAiJsonResponse(response.content);
+      const rawStrategies = parsed?.strategies || (Array.isArray(parsed) ? parsed : null);
+
+      if (Array.isArray(rawStrategies) && rawStrategies.length > 0) {
+        for (const strat of rawStrategies) {
+          const sNum = Number(strat.sceneNumber || strat.sceneIndex);
+          const matchedScene = currentBatch.find(s => (s.sceneNumber || 1) === sNum) || currentBatch[rawStrategies.indexOf(strat)];
+          if (matchedScene) {
+            const rawQueries = Array.isArray(strat.queries) ? strat.queries : [];
+            const cleanQueries = rawQueries
+              .map(q => typeof q === 'string' ? q : (q.query || ''))
+              .filter(q => Boolean(q && typeof q === 'string' && q.trim().length > 2))
+              .map(q => q.trim().replace(/["']/g, ''));
+
+            if (cleanQueries.length > 0) {
+              const strategyObj = {
+                concept: strat.concept || matchedScene.visualAnchor || matchedScene.title,
+                queries: cleanQueries.slice(0, 3)
+              };
+              strategiesMap.set(matchedScene.id, strategyObj);
+              strategiesMap.set(matchedScene.sceneNumber, strategyObj);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      if (signal && signal.aborted) throw err;
+      console.warn(`[VisualCurator] Fallo en planificación en lote ${bIdx + 1}, usando respaldo analítico:`, err.message);
+    }
+
+    // Asegurar que cada escena del lote tenga una estrategia (rellenar con fallback si la IA omitió alguna)
+    for (const s of currentBatch) {
+      if (!strategiesMap.has(s.id) && !strategiesMap.has(s.sceneNumber)) {
+        const fallback = fallbackQueryGenerator(s, globalVideoTopic);
+        strategiesMap.set(s.id, fallback);
+        strategiesMap.set(s.sceneNumber, fallback);
+      }
+    }
+  }
+
+  return strategiesMap;
+}
+
+/**
  * Re-analyzes the full script sentence when initial searches yielded poor results
  * to discover alternative, non-obvious visual keywords within the global video topic.
  */
@@ -616,22 +745,12 @@ SISTEMA THINKING (EVALUACIÓN Y CRITERIO DE VARA ALTA):
 4. FILTRO ANTI-STOCK CLICHÉ:
    - Descarta modelos mirando a la cámara o poses artificiales.
 
-FORMATO JSON ULTRA-CONCISO (MÁXIMA VELOCIDAD, SIN ENSAYOS):
+FORMATO JSON ULTRA-COMPACTO OBLIGATORIO (MÁXIMA VELOCIDAD, SIN ENSAYOS):
 Responde ÚNICAMENTE con esta estructura JSON:
 {
-  "allRejected": false, // true SOLO si ninguno alcanza ${minAcceptableScore}/10
-  "rejectionReason": null, // Solo si allRejected es true
-  "suggestedRescueAngle": null, // Consulta alternativa si allRejected es true
-  "candidateScores": [
-    { "index": 1, "score": 4.5, "verdict": "RECHAZADO" },
-    { "index": 2, "score": 9.2, "verdict": "EXCELENTE" }
-  ],
-  "winnerIndex": 2, // Número del 1 al ${candidateMap.length}
-  "winnerScore": 9.2,
-  "winnerReason": "Explicación de 1 sola frase (máximo 18 palabras) de por qué gana.",
-  "alternatives": [
-    { "candidateIndex": 5, "note": "Alternativa viable (máx 8 palabras)" }
-  ]
+  "winner": 2, // Número del 1 al ${candidateMap.length}
+  "score": 8.5, // 1.0 al 10.0
+  "alts": [1, 3] // índices de alternativas
 }`;
 
   const anchorText = scene.visualAnchor ? `Ancla Visual Requerida: "${scene.visualAnchor}"` : '';
@@ -690,38 +809,43 @@ Aplica el Sistema Thinking inspeccionando minuciosamente cada uno de los ${candi
         };
       }
 
-      if (parsed.winnerIndex) {
-        const winnerItem = candidateMap.find(c => c.candidateIndex === Number(parsed.winnerIndex)) || candidateMap[0];
+      const rawWinner = parsed.winnerIndex ?? parsed.winner ?? parsed.selected;
+      if (rawWinner) {
+        const winnerIdxNum = Number(rawWinner);
+        const winnerItem = candidateMap.find(c => c.candidateIndex === winnerIdxNum) || candidateMap[0];
+        const winnerScoreVal = Number(parsed.score || parsed.winnerScore || 8.5);
 
         // Extract alternatives (up to 3)
-        const altIndices = Array.isArray(parsed.alternatives)
-          ? parsed.alternatives.map(a => Number(a.candidateIndex))
-          : normalizedReviews.filter(r => Number(r.candidateIndex) !== Number(parsed.winnerIndex) && (r.score || 0) >= 6.5).slice(0, 3).map(r => Number(r.candidateIndex));
+        const rawAlts = Array.isArray(parsed.alts) ? parsed.alts : (Array.isArray(parsed.alternatives) ? parsed.alternatives : []);
+        const altIndices = rawAlts
+          .map(a => typeof a === 'number' ? a : Number(a.candidateIndex || a.index))
+          .filter(idx => !isNaN(idx) && idx !== winnerItem.candidateIndex);
 
         const validAlternatives = altIndices
           .map(idx => {
             const found = candidateMap.find(c => c.candidateIndex === idx);
-            if (!found || found.candidateIndex === winnerItem.candidateIndex) return null;
-            const altNote = parsed.alternatives?.find(a => Number(a.candidateIndex) === idx)?.note ||
-                            normalizedReviews.find(r => Number(r.candidateIndex) === idx)?.critique ||
-                            'Opción secundaria evaluada por la IA';
+            if (!found) return null;
             return {
               ...found.mediaItem,
               candidateIndex: found.candidateIndex,
-              alternativeReason: altNote
+              alternativeReason: 'Opción secundaria evaluada por la IA'
             };
           })
           .filter(Boolean);
 
+        const fallbackAlts = candidateMap
+          .filter(c => c.candidateIndex !== winnerItem.candidateIndex)
+          .slice(0, 3)
+          .map(c => c.mediaItem);
+
         return {
           winner: winnerItem.mediaItem,
-          alternatives: validAlternatives.slice(0, 3),
+          alternatives: validAlternatives.length > 0 ? validAlternatives : fallbackAlts,
           allRejected: false,
           critique: {
-            winnerIndex: parsed.winnerIndex,
-            winnerScore: parsed.winnerScore || 9.0,
-            winnerReason: parsed.winnerReason || 'Seleccionado por óptima concordancia visual con el ancla y superación de la vara alta.',
-            critiqueSummary: parsed.critiqueSummary,
+            winnerIndex: winnerIdxNum,
+            winnerScore: winnerScoreVal,
+            winnerReason: parsed.winnerReason || `Seleccionado con Ojo Crítico [Candidato #${winnerIdxNum}] (${winnerScoreVal}/10)`,
             candidateReviews: normalizedReviews,
             modelUsed: aiResponse.model
           },
@@ -736,6 +860,167 @@ Aplica el Sistema Thinking inspeccionando minuciosamente cada uno de los ${candi
 
   // 3. Graceful Editorial Heuristic Fallback with High Bar & Global Video Topic
   return runHeuristicVisualEvaluation({ scene, globalVideoTopic, candidateMap, collageDataUrl, minAcceptableScore });
+}
+
+/**
+ * Evaluates TWO scenes in a single Multimodal Vision request (Solution 1: Mosaico Dual & Solution 3: Compact Output):
+ * Uses a Dual Collage with Scene A on top (A1-A4) and Scene B on bottom (B1-B4).
+ * Returns compact verdicts for both scenes in a single LLM response, saving 50% of requests and 85% of output tokens.
+ */
+export async function evaluateDualScenesWithVisionAI({
+  sceneA,
+  candidatesA = [],
+  sceneB = null,
+  candidatesB = [],
+  globalVideoTopic = null,
+  aiConfig = null,
+  signal = null
+}) {
+  if (!sceneA || candidatesA.length === 0) {
+    throw new Error('No hay candidatos para evaluar en la Escena A.');
+  }
+
+  // If Scene B has no candidates, fall back to single-scene evaluation
+  if (!sceneB || !candidatesB || candidatesB.length === 0) {
+    const singleResult = await evaluateSceneCandidatesWithVisionAI({
+      scene: sceneA,
+      candidates: candidatesA,
+      globalVideoTopic,
+      aiConfig,
+      minAcceptableScore: 7.5,
+      signal
+    });
+    return {
+      sceneA: singleResult,
+      sceneB: null
+    };
+  }
+
+  // 1. Build Dual Visual Collage (up to 12 candidates per scene in 2x6 grid = 24 total on canvas)
+  const { collageDataUrl, base64Jpeg, candidateMapA, candidateMapB } = await buildDualSceneVisualCollage({
+    sceneA,
+    candidatesA: candidatesA.slice(0, 12),
+    sceneB,
+    candidatesB: candidatesB.slice(0, 12)
+  });
+
+  const configToUse = aiConfig || getSavedAiConfig();
+
+  // 2. Compact Prompt (Solution 3: Minimal Output Tokens)
+  const systemPrompt = `Eres Director de Fotografía y Curador de Cine (Ojo Crítico).
+Observa el MOSAICO DUAL adjunto que contiene DOS ESCENAS distintas en una sola imagen:
+- SECCIÓN SUPERIOR: Candidatos [A1] a [A${candidateMapA.length}] para la ESCENA A (en cuadrícula de 2 filas).
+- SECCIÓN INFERIOR: Candidatos [B1] a [B${candidateMapB.length}] para la ESCENA B (en cuadrícula de 2 filas).
+
+Para cada escena, elige el MEJOR candidato visual considerando cinematografía, iluminación, textura y coherencia absoluta con el guion.
+Descarta poses fingidas, clichés y elementos discordantes frente al tema global "${globalVideoTopic?.coreTopic || 'el video'}".
+
+CRITERIO DE INDEPENDENCIA Y VARA ALTA:
+Cada escena es 100% independiente. Si en alguna de las dos escenas NINGÚN candidato tiene calidad cinematográfica aceptable o todos son discordantes, asigna para esa escena: "winner": 0 y "score": 4.5 (activará auto-rescate para esa escena). La otra escena puede ser aprobada normalmente.
+
+FORMATO JSON ULTRA-COMPACTO OBLIGATORIO:
+{
+  "sceneA": { "winner": 7, "score": 8.5, "alts": [2, 5, 9] },
+  "sceneB": { "winner": 4, "score": 9.0, "alts": [1, 8, 12] }
+}`;
+
+  const userPrompt = `TEMA: "${globalVideoTopic?.coreTopic || 'General'}"
+ESCENA A (#${sceneA.sceneNumber || 1}) "${sceneA.title}": Guion "${(sceneA.scriptText || sceneA.visualDescription || '').substring(0, 100)}" | Toma: "${sceneA.visualDescription || sceneA.visualAnchor || ''}"
+ESCENA B (#${sceneB.sceneNumber || 2}) "${sceneB.title}": Guion "${(sceneB.scriptText || sceneB.visualDescription || '').substring(0, 100)}" | Toma: "${sceneB.visualDescription || sceneB.visualAnchor || ''}"
+
+Responde ÚNICAMENTE con el JSON ultra-compacto.`;
+
+  try {
+    const aiResponse = await sendAiChatCompletion({
+      systemPrompt,
+      userPrompt,
+      config: configToUse,
+      jsonMode: true,
+      signal,
+      timeoutMs: 45000,
+      images: [base64Jpeg],
+      thinkingMode: 'low'
+    });
+
+    const parsed = parseAiJsonResponse(aiResponse.content);
+
+    // Parse Scene A result (independiente)
+    const rawA = parsed?.sceneA || parsed?.A || parsed;
+    const wIdxA = Number(rawA?.winner || rawA?.winnerIndex || 0);
+    const scoreA = Number(rawA?.score || rawA?.winnerScore || (wIdxA > 0 ? 8.0 : 4.5));
+    const isRejectedA = wIdxA === 0 || scoreA < 7.0;
+    const winnerItemA = isRejectedA ? null : (candidatesA[wIdxA - 1] || candidatesA[0]);
+    const rawAltsA = Array.isArray(rawA?.alts) ? rawA.alts : (Array.isArray(rawA?.alternatives) ? rawA.alternatives : []);
+    const alternativesA = rawAltsA
+      .map(idx => candidatesA[Number(idx) - 1])
+      .filter(item => item && (!winnerItemA || item.id !== winnerItemA.id));
+
+    const resultA = {
+      winner: winnerItemA,
+      alternatives: alternativesA.length > 0 ? alternativesA : candidatesA.filter(c => !winnerItemA || c.id !== winnerItemA.id).slice(0, 6),
+      allRejected: isRejectedA,
+      score: scoreA,
+      critique: {
+        winnerIndex: isRejectedA ? 0 : wIdxA,
+        winnerScore: scoreA,
+        winnerReason: isRejectedA
+          ? `Candidatos no superaron la vara de calidad (${scoreA}/10)`
+          : `Seleccionado con Ojo Crítico [A${wIdxA}] (${scoreA}/10)`
+      },
+      collageDataUrl
+    };
+
+    // Parse Scene B result (independiente)
+    const rawB = parsed?.sceneB || parsed?.B;
+    const wIdxB = Number(rawB?.winner || rawB?.winnerIndex || 0);
+    const scoreB = Number(rawB?.score || rawB?.winnerScore || (wIdxB > 0 ? 8.0 : 4.5));
+    const isRejectedB = wIdxB === 0 || scoreB < 7.0;
+    const winnerItemB = isRejectedB ? null : (candidatesB[wIdxB - 1] || candidatesB[0]);
+    const rawAltsB = Array.isArray(rawB?.alts) ? rawB.alts : (Array.isArray(rawB?.alternatives) ? rawB.alternatives : []);
+    const alternativesB = rawAltsB
+      .map(idx => candidatesB[Number(idx) - 1])
+      .filter(item => item && (!winnerItemB || item.id !== winnerItemB.id));
+
+    const resultB = {
+      winner: winnerItemB,
+      alternatives: alternativesB.length > 0 ? alternativesB : candidatesB.filter(c => !winnerItemB || c.id !== winnerItemB.id).slice(0, 6),
+      allRejected: isRejectedB,
+      score: scoreB,
+      critique: {
+        winnerIndex: isRejectedB ? 0 : wIdxB,
+        winnerScore: scoreB,
+        winnerReason: isRejectedB
+          ? `Candidatos no superaron la vara de calidad (${scoreB}/10)`
+          : `Seleccionado con Ojo Crítico [B${wIdxB}] (${scoreB}/10)`
+      },
+      collageDataUrl
+    };
+
+    return {
+      sceneA: resultA,
+      sceneB: resultB
+    };
+  } catch (err) {
+    if (signal && signal.aborted) throw err;
+    console.warn('[VisualCurator] Fallo en evaluación dual con IA, usando respaldo:', err.message);
+
+    return {
+      sceneA: {
+        winner: candidatesA[0] || null,
+        alternatives: candidatesA.slice(1, 12),
+        score: 7.5,
+        critique: { winnerScore: 7.5, winnerReason: 'Selección analítica de respaldo' },
+        collageDataUrl
+      },
+      sceneB: {
+        winner: candidatesB[0] || null,
+        alternatives: candidatesB.slice(1, 12),
+        score: 7.5,
+        critique: { winnerScore: 7.5, winnerReason: 'Selección analítica de respaldo' },
+        collageDataUrl
+      }
+    };
+  }
 }
 
 /**
@@ -891,7 +1176,7 @@ function runHeuristicVisualEvaluation({
 /**
  * Fallback query generator based on scene text, visual anchors and Global Video Topic if AI connection is unavailable
  */
-function fallbackQueryGenerator(scene, globalVideoTopic = null) {
+export function fallbackQueryGenerator(scene, globalVideoTopic = null) {
   const contextKw = globalVideoTopic?.mandatoryKeywords?.[0] || '';
 
   // 1. Prioritize concept pills from the B-Roll Explorer modal

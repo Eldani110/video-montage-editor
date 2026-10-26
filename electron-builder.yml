@@ -1,0 +1,73 @@
+appId: com.thisoftcore.videomontageeditor
+productName: Montage Studio
+copyright: Copyright © 2026 Thisoftcore
+
+# Auto-update and distribution via GitHub Releases
+publish:
+  provider: github
+  owner: Eldani110
+  repo: video-montage-editor
+  releaseType: release
+
+directories:
+  output: release
+  buildResources: build-resources
+
+files:
+  - dist/**/*
+  - electron/**/*
+  - server/**/*
+  - package.json
+
+# Linux (Kubuntu, Ubuntu, Debian, etc.)
+linux:
+  target:
+    - target: deb
+      arch:
+        - x64
+    - target: AppImage
+      arch:
+        - x64
+  category: AudioVideo
+  maintainer: Daniel <daniel@thisoftcore.com>
+  synopsis: Editor de video y montajes profesional
+  description: Aplicación de escritorio para edición de secuencias, sincronización de audio y montaje de video.
+  icon: build-resources/icon.png
+
+# Windows (10, 11)
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: build-resources/icon.ico
+  artifactName: ${productName}-Setup-${version}.${ext}
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Montage Studio
+  uninstallDisplayName: Montage Studio
+
+# macOS
+mac:
+  target:
+    - target: zip
+      arch:
+        - x64
+  category: public.app-category.video
+  icon: build-resources/icon.icns
+  hardenedRuntime: true
+  gatekeeperAssess: false
+
+dmg:
+  title: Instalador Montage Studio
+  contents:
+    - x: 130
+      y: 220
+    - x: 410
+      y: 220
+      type: link
+      path: /Applications

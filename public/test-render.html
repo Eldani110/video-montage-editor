@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<body>
+<video id="v" muted playsinline style="width:320px;height:180px;"></video>
+<canvas id="c" width="320" height="180"></canvas>
+<script>
+const v = document.getElementById('v');
+const c = document.getElementById('c');
+const ctx = c.getContext('2d');
+
+v.src = '/media-library/abs?path=/tmp/test_h264.mov';
+v.onloadeddata = () => {
+  v.currentTime = 0.5;
+};
+v.onseeked = () => {
+  ctx.drawImage(v, 0, 0, 320, 180);
+  const data = ctx.getImageData(0, 0, 320, 180).data;
+  let nonZero = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    if (data[i] > 10 || data[i+1] > 10 || data[i+2] > 10) nonZero++;
+  }
+  console.log('TEST_H264_NON_ZERO_PIXELS:', nonZero, 'TOTAL:', data.length / 4);
+};
+v.onerror = (e) => console.log('VIDEO_ERROR:', v.error ? v.error.message : e);
+</script>
+</body>
+</html>

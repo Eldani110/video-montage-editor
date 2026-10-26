@@ -12,9 +12,11 @@ import {
   ExternalLink,
   Scissors,
   Volume2,
-  Layers,
-  Film,
-  Check
+  Check,
+  Zap,
+  Award,
+  Globe,
+  RotateCcw
 } from 'lucide-react';
 import { applyTranscriptToProject } from '../utils/transcriptOps';
 import { formatTimecode } from '../utils/timeFormat';
@@ -24,10 +26,73 @@ import {
   getTimelineAudioSummary,
   filterSegmentsToTimelineCuts
 } from '../utils/timelineAudioRenderer';
+import { useAuth } from '../context/AuthContext';
+import { saveUserGeneralSettings } from '../services/userSettingsService';
 
 const STORAGE_KEY_GEMINI = 'montage_pro_gemini_api_key';
+const STORAGE_KEY_WHISPER_MODEL = 'montage_pro_whisper_model';
+
+export const LOCAL_WHISPER_MODELS = [
+  {
+    id: 'whisper-base',
+    onnxModel: 'onnx-community/whisper-base',
+    name: 'Whisper Base',
+    badge: 'Recomendado',
+    badgeColor: '#38bdf8',
+    badgeBg: 'rgba(6, 182, 212, 0.15)',
+    badgeBorder: 'rgba(6, 182, 212, 0.35)',
+    size: '74 MB',
+    speed: 'Rápido',
+    accuracy: 'Equilibrada',
+    desc: 'Equilibrio ideal de velocidad y precisión en español. Detecta correctamente nombres y reduce confusiones fonéticas.',
+    icon: Cpu
+  },
+  {
+    id: 'whisper-tiny',
+    onnxModel: 'onnx-community/whisper-tiny',
+    name: 'Whisper Tiny',
+    badge: 'Ultra Rápido',
+    badgeColor: '#facc15',
+    badgeBg: 'rgba(234, 179, 8, 0.15)',
+    badgeBorder: 'rgba(234, 179, 8, 0.35)',
+    size: '39 MB',
+    speed: 'Instantáneo',
+    accuracy: 'Estándar',
+    desc: 'El modelo más ligero y veloz. Mínimo consumo de RAM; ideal para computadoras portátiles o revisiones rápidas.',
+    icon: Zap
+  },
+  {
+    id: 'whisper-small',
+    onnxModel: 'onnx-community/whisper-small',
+    name: 'Whisper Small',
+    badge: 'Alta Calidad',
+    badgeColor: '#c084fc',
+    badgeBg: 'rgba(168, 85, 247, 0.15)',
+    badgeBorder: 'rgba(168, 85, 247, 0.35)',
+    size: '244 MB',
+    speed: 'Moderado',
+    accuracy: 'Muy Alta',
+    desc: 'Mayor fidelidad en acentos regionales (Colombia, México, etc.), jerga y dicción rápida. Menor tasa de errores.',
+    icon: Sparkles
+  },
+  {
+    id: 'whisper-large-v3-turbo',
+    onnxModel: 'onnx-community/whisper-large-v3-turbo',
+    name: 'Whisper Large v3 Turbo',
+    badge: 'Estudio Pro',
+    badgeColor: '#34d399',
+    badgeBg: 'rgba(16, 185, 129, 0.15)',
+    badgeBorder: 'rgba(16, 185, 129, 0.35)',
+    size: '800 MB',
+    speed: 'Intensivo',
+    accuracy: 'Máxima',
+    desc: 'Máxima fidelidad de estudio para audios con ruido de fondo, música o múltiples oradores. Requiere buena CPU/GPU.',
+    icon: Award
+  }
+];
 
 export function TranscribeModal({ isOpen, onClose, project, onUpdateProject, initialAssetId = null }) {
+  const { user } = useAuth();
   // Summary of audio currently cut and placed on the timeline
   const timelineSummary = useMemo(() => getTimelineAudioSummary(project), [project]);
 
@@ -48,6 +113,23 @@ export function TranscribeModal({ isOpen, onClose, project, onUpdateProject, ini
   const [extractedSegments, setExtractedSegments] = useState(null);
   const [errorMessage, setErrorMessage] = useState(null);
   const [whisperScope, setWhisperScope] = useState('sample'); // 'sample' (first 2m safe) | 'full'
+  const [whisperModel, setWhisperModel] = useState(() => {
+    if (typeof localStorage !== 'undefined') {
+      return (
+        localStorage.getItem(STORAGE_KEY_WHISPER_MODEL) ||
+        localStorage.getItem('montage_autocut_model') ||
+        'whisper-base'
+      );
+    }
+    return 'whisper-base';
+  });
+
+  const handleSelectWhisperModel = (modelId) => {
+    setWhisperModel(modelId);
+    try {
+      localStorage.setItem(STORAGE_KEY_WHISPER_MODEL, modelId);
+    } catch (_) {}
+  };
 
   const abortControllerRef = useRef(null);
 
@@ -82,7 +164,7 @@ export function TranscribeModal({ isOpen, onClose, project, onUpdateProject, ini
 
   const handleSaveApiKey = (key) => {
     setApiKey(key);
-    localStorage.setItem(STORAGE_KEY_GEMINI, key);
+    saveUserGeneralSettings(user, { geminiApiKey: key });
   };
 
   const handleCancelTranscription = () => {
@@ -162,14 +244,22 @@ export function TranscribeModal({ isOpen, onClose, project, onUpdateProject, ini
         // Whisper Local via background Web Worker
         const { transcribeWithWhisperLocal } = await import('../utils/whisperTranscriber');
         const maxChunks = (isLongDuration && whisperScope === 'sample') ? 4 : null;
+        const selectedModelObj = LOCAL_WHISPER_MODELS.find((m) => m.id === whisperModel);
+        const onnxModelId = selectedModelObj ? selectedModelObj.onnxModel : 'onnx-community/whisper-base';
+
         rawSegments = await transcribeWithWhisperLocal(audioInput, {
           language,
+          model: onnxModelId,
+          whisperModel: onnxModelId,
           maxChunks,
           abortController,
           onProgress: (prog) => {
+            const scaledPercent = sourceType === 'timeline'
+              ? Math.round(35 + (prog.percent || 0) * 0.65)
+              : Math.round(prog.percent || 0);
             setProgressState({
-              percent: Math.round(35 + prog.percent * 0.65),
-              message: prog.message
+              percent: Math.min(100, Math.max(1, scaledPercent)),
+              message: prog.message || 'Procesando transcripción...'
             });
           }
         });
@@ -203,7 +293,7 @@ export function TranscribeModal({ isOpen, onClose, project, onUpdateProject, ini
     if (!extractedSegments) return;
 
     const sourceId = sourceType === 'timeline' ? 'timeline_audio' : selectedAssetId;
-    const updated = applyTranscriptToProject(project, extractedSegments, sourceId);
+    const updated = applyTranscriptToProject(project, extractedSegments, sourceId, { enableSubtitles: true });
     onUpdateProject(updated);
     onClose();
   };
@@ -216,7 +306,7 @@ export function TranscribeModal({ isOpen, onClose, project, onUpdateProject, ini
 
   return (
     <div className="modal-backdrop">
-      <div className="modal-container modal-large">
+      <div className="modal-container modal-large transcribe-modal-container">
         <div className="modal-header">
           <div className="modal-title-group">
             <div className="modal-icon-badge" style={{ background: '#8b5cf626' }}>
@@ -243,20 +333,21 @@ export function TranscribeModal({ isOpen, onClose, project, onUpdateProject, ini
           {!extractedSegments && (
             <>
               {/* Step 1: Select Source (Timeline Audio Tracks vs Full Raw File) */}
-              <div className="form-group">
-                <label>1. Origen del Audio a Transcribir</label>
-                <div className="aspect-ratio-selector" style={{ gridTemplateColumns: '1fr 1fr', marginBottom: '12px' }}>
+              <div className="form-group" style={{ gap: '5px' }}>
+                <label style={{ fontSize: '12px', fontWeight: 600 }}>1. Origen del Audio a Transcribir</label>
+                <div className="aspect-ratio-selector" style={{ gridTemplateColumns: '1fr 1fr', marginBottom: '8px', gap: '8px' }}>
                   <button
                     type="button"
                     className={`ratio-btn ${sourceType === 'timeline' ? 'active' : ''}`}
+                    style={{ padding: '8px 12px' }}
                     onClick={() => setSourceType('timeline')}
                     disabled={isProcessing || !timelineSummary.hasTimelineAudio}
                   >
                     <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                      <Scissors size={18} style={{ color: '#06b6d4' }} />
+                      <Scissors size={16} style={{ color: '#06b6d4' }} />
                       <span className="ratio-label">Pistas de la Línea de Tiempo</span>
                     </div>
-                    <span className="ratio-sub">
+                    <span className="ratio-sub" style={{ fontSize: '10px' }}>
                       {timelineSummary.hasTimelineAudio
                         ? `✓ Respeta cortes y achiques (${timelineSummary.totalAudioClips} clips • ${timelineSummary.effectiveAudioDuration.toFixed(1)}s)`
                         : 'Sin clips en la línea de tiempo'}
@@ -266,14 +357,15 @@ export function TranscribeModal({ isOpen, onClose, project, onUpdateProject, ini
                   <button
                     type="button"
                     className={`ratio-btn ${sourceType === 'library' ? 'active' : ''}`}
+                    style={{ padding: '8px 12px' }}
                     onClick={() => setSourceType('library')}
                     disabled={isProcessing || mediaAssets.length === 0}
                   >
                     <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                      <FileText size={18} style={{ color: '#a5b4fc' }} />
+                      <FileText size={16} style={{ color: '#a5b4fc' }} />
                       <span className="ratio-label">Archivo Completo (Biblioteca)</span>
                     </div>
-                    <span className="ratio-sub">
+                    <span className="ratio-sub" style={{ fontSize: '10px' }}>
                       {mediaAssets.length > 0 ? `${mediaAssets.length} archivos en biblioteca` : 'Sin archivos'}
                     </span>
                   </button>
@@ -358,40 +450,46 @@ export function TranscribeModal({ isOpen, onClose, project, onUpdateProject, ini
               </div>
 
               {/* Step 2: Choose AI Provider */}
-              <div className="form-group">
-                <label>2. Motor de Inteligencia Artificial</label>
-                <div className="aspect-ratio-selector" style={{ gridTemplateColumns: '1fr 1fr' }}>
+              <div className="form-group" style={{ gap: '5px' }}>
+                <label style={{ fontSize: '12px', fontWeight: 600 }}>2. Motor de Inteligencia Artificial</label>
+                <div className="aspect-ratio-selector" style={{ gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
                   <button
                     type="button"
                     className={`ratio-btn ${provider === 'gemini' ? 'active' : ''}`}
+                    style={{ padding: '8px 12px' }}
                     onClick={() => setProvider('gemini')}
                     disabled={isProcessing}
                   >
-                    <Cloud size={24} style={{ color: '#6366f1' }} />
-                    <span className="ratio-label">Google Gemini API</span>
-                    <span className="ratio-sub">
-                      {isLongDuration ? '⚡ Recomendado (Procesa en 10 seg)' : 'Ultrarrápido y ultrapreciso'}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      <Cloud size={16} style={{ color: '#6366f1' }} />
+                      <span className="ratio-label">Google Gemini API</span>
+                    </div>
+                    <span className="ratio-sub" style={{ fontSize: '10px' }}>
+                      {isLongDuration ? '⚡ Recomendado (Procesa en 10 seg)' : 'Ultrarrápido y ultrapreciso en la nube'}
                     </span>
                   </button>
 
                   <button
                     type="button"
                     className={`ratio-btn ${provider === 'whisper' ? 'active' : ''}`}
+                    style={{ padding: '8px 12px' }}
                     onClick={() => setProvider('whisper')}
                     disabled={isProcessing}
                   >
-                    <Cpu size={24} style={{ color: '#06b6d4' }} />
-                    <span className="ratio-label">Whisper Local (Web Worker)</span>
-                    <span className="ratio-sub">100% privado en segundo plano (Sin claves)</span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      <Cpu size={16} style={{ color: '#06b6d4' }} />
+                      <span className="ratio-label">Whisper Local (Web Worker)</span>
+                    </div>
+                    <span className="ratio-sub" style={{ fontSize: '10px' }}>100% privado en tu equipo (Sin claves)</span>
                   </button>
                 </div>
               </div>
 
               {/* Provider details */}
               {provider === 'gemini' && (
-                <div className="form-group" style={{ background: 'var(--bg-input)', padding: '14px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-subtle)' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
-                    <label style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <div className="form-group" style={{ background: 'var(--bg-input)', padding: '12px 14px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-subtle)', gap: '8px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <label style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px' }}>
                       <Key size={13} style={{ color: '#6366f1' }} /> Clave API de Google Gemini (Gratuita)
                     </label>
                     <a
@@ -400,7 +498,7 @@ export function TranscribeModal({ isOpen, onClose, project, onUpdateProject, ini
                       rel="noreferrer"
                       style={{ fontSize: '11px', color: '#818cf8', display: 'flex', alignItems: 'center', gap: '4px', textDecoration: 'none' }}
                     >
-                      Obtener clave gratis en 1 clic <ExternalLink size={11} />
+                      Obtener clave gratis <ExternalLink size={11} />
                     </a>
                   </div>
                   <input
@@ -410,25 +508,161 @@ export function TranscribeModal({ isOpen, onClose, project, onUpdateProject, ini
                     value={apiKey}
                     onChange={(e) => handleSaveApiKey(e.target.value)}
                     disabled={isProcessing}
+                    style={{ padding: '7px 10px' }}
                   />
-                  <span style={{ fontSize: '11px', color: 'var(--text-dim)', marginTop: '4px', display: 'block' }}>
-                    ✓ Procesa el audio de tu montaje en segundos con marcas de tiempo exactas. Se guarda de forma local en tu navegador.
+                  <span style={{ fontSize: '11px', color: 'var(--text-dim)', display: 'block' }}>
+                    ✓ Procesa el audio en segundos con marcas de tiempo exactas. Se guarda localmente.
                   </span>
+
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px', paddingTop: '6px', borderTop: '1px solid var(--border-subtle)' }}>
+                    <label style={{ fontSize: '11.5px', color: 'var(--text-secondary)', margin: 0, display: 'flex', alignItems: 'center', gap: '6px', whiteSpace: 'nowrap' }}>
+                      <Globe size={13} style={{ color: '#6366f1' }} /> Idioma del audio:
+                    </label>
+                    <select
+                      className="input-field"
+                      style={{ fontSize: '12px', padding: '4px 8px', maxWidth: '220px' }}
+                      value={language}
+                      onChange={(e) => setLanguage(e.target.value)}
+                      disabled={isProcessing}
+                    >
+                      <option value="spanish">Español (Recomendado)</option>
+                      <option value="english">Inglés (English)</option>
+                      <option value="portuguese">Portugués</option>
+                      <option value="french">Francés</option>
+                      <option value="italian">Italiano</option>
+                      <option value="german">Alemán</option>
+                      <option value="auto">Detectar automáticamente</option>
+                    </select>
+                  </div>
                 </div>
               )}
 
               {provider === 'whisper' && (
-                <div className="form-group" style={{ background: 'var(--bg-input)', padding: '14px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-subtle)', display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                    <Cpu size={16} style={{ color: '#06b6d4' }} />
-                    <span style={{ fontSize: '13px', fontWeight: 600 }}>Whisper Local (WebAssembly Cuantizado)</span>
+                <div
+                  className="form-group"
+                  style={{
+                    background: 'var(--bg-input)',
+                    padding: '12px 14px',
+                    borderRadius: 'var(--radius-sm)',
+                    border: '1px solid var(--border-subtle)',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '10px'
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      <div
+                        style={{
+                          width: '24px',
+                          height: '24px',
+                          borderRadius: '5px',
+                          background: 'rgba(6, 182, 212, 0.15)',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center'
+                        }}
+                      >
+                        <Cpu size={14} style={{ color: '#06b6d4' }} />
+                      </div>
+                      <div>
+                        <span style={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--text-primary)' }}>
+                          Whisper Local (WebAssembly Cuantizado)
+                        </span>
+                        <span style={{ fontSize: '11px', color: 'var(--text-secondary)', marginLeft: '8px' }}>
+                          — 100% privado en Web Worker sin enviar audio fuera
+                        </span>
+                      </div>
+                    </div>
                   </div>
-                  <span style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
-                    Ejecuta el modelo Whisper en un <strong>hilo Web Worker aislado</strong> en tu equipo sin subir audio a servidores externos.
-                  </span>
+
+                  {/* Model Choice 2x2 Grid */}
+                  <div>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '8px' }}>
+                      {LOCAL_WHISPER_MODELS.map((m) => {
+                        const isSelected = whisperModel === m.id;
+                        const IconComponent = m.icon;
+                        return (
+                          <div
+                            key={m.id}
+                            onClick={() => !isProcessing && handleSelectWhisperModel(m.id)}
+                            style={{
+                              background: isSelected ? 'rgba(6, 182, 212, 0.12)' : 'var(--bg-card)',
+                              border: isSelected ? '1.5px solid #06b6d4' : '1px solid var(--border-subtle)',
+                              borderRadius: '7px',
+                              padding: '8px 10px',
+                              cursor: isProcessing ? 'not-allowed' : 'pointer',
+                              transition: 'all 0.15s ease',
+                              display: 'flex',
+                              flexDirection: 'column',
+                              gap: '4px',
+                              position: 'relative',
+                              boxShadow: isSelected ? '0 0 12px rgba(6, 182, 212, 0.22)' : 'none'
+                            }}
+                          >
+                            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '6px' }}>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                <IconComponent size={14} style={{ color: isSelected ? '#38bdf8' : 'var(--text-secondary)' }} />
+                                <span style={{ fontSize: '12px', fontWeight: 600, color: isSelected ? '#fff' : 'var(--text-primary)' }}>
+                                  {m.name}
+                                </span>
+                              </div>
+                              <span
+                                style={{
+                                  fontSize: '9.5px',
+                                  fontWeight: 600,
+                                  color: m.badgeColor,
+                                  background: m.badgeBg,
+                                  border: `1px solid ${m.badgeBorder}`,
+                                  borderRadius: '999px',
+                                  padding: '1px 5px'
+                                }}
+                              >
+                                {m.badge}
+                              </span>
+                            </div>
+
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '10.5px', color: 'var(--text-dim)' }}>
+                              <span>{m.size}</span>
+                              <span>•</span>
+                              <span>{m.speed}</span>
+                              <span>•</span>
+                              <span>{m.accuracy}</span>
+                            </div>
+
+                            <div style={{ fontSize: '10.5px', color: 'var(--text-secondary)', lineHeight: '1.25' }}>
+                              {m.desc}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Language Selector */}
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px', paddingTop: '6px', borderTop: '1px solid var(--border-subtle)' }}>
+                    <label style={{ fontSize: '11.5px', color: 'var(--text-secondary)', margin: 0, display: 'flex', alignItems: 'center', gap: '6px', whiteSpace: 'nowrap' }}>
+                      <Globe size={13} style={{ color: '#06b6d4' }} /> Idioma del audio:
+                    </label>
+                    <select
+                      className="input-field"
+                      style={{ fontSize: '12px', padding: '4px 8px', maxWidth: '240px' }}
+                      value={language}
+                      onChange={(e) => setLanguage(e.target.value)}
+                      disabled={isProcessing}
+                    >
+                      <option value="spanish">Español (Recomendado)</option>
+                      <option value="english">Inglés (English)</option>
+                      <option value="portuguese">Portugués</option>
+                      <option value="french">Francés</option>
+                      <option value="italian">Italiano</option>
+                      <option value="german">Alemán</option>
+                      <option value="auto">Detectar automáticamente</option>
+                    </select>
+                  </div>
 
                   {isLongDuration && (
-                    <div style={{ background: 'rgba(245, 158, 11, 0.08)', border: '1px solid rgba(245, 158, 11, 0.25)', borderRadius: '6px', padding: '10px', marginTop: '4px' }}>
+                    <div style={{ background: 'rgba(245, 158, 11, 0.08)', border: '1px solid rgba(245, 158, 11, 0.25)', borderRadius: '6px', padding: '10px', marginTop: '2px' }}>
                       <div style={{ display: 'flex', alignItems: 'flex-start', gap: '8px', color: '#f59e0b', fontSize: '12px', fontWeight: 500, marginBottom: '6px' }}>
                         <AlertCircle size={16} style={{ flexShrink: 0, marginTop: '1px' }} />
                         <span>Audio extenso ({Math.round(effectiveDuration / 60)} minutos) detectado:</span>
@@ -574,10 +808,21 @@ export function TranscribeModal({ isOpen, onClose, project, onUpdateProject, ini
               )}
             </button>
           ) : (
-            <button className="btn-primary" onClick={handleApplyToTimeline}>
-              <FileText size={15} />
-              Insertar Línea Guía en la Línea de Tiempo
-            </button>
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={() => setExtractedSegments(null)}
+              >
+                <RotateCcw size={14} />
+                Volver a Transcribir / Configurar
+              </button>
+
+              <button className="btn-primary" onClick={handleApplyToTimeline}>
+                <Sparkles size={15} />
+                Insertar y Subtitular en Línea de Tiempo
+              </button>
+            </div>
           )}
         </div>
       </div>

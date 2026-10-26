@@ -236,7 +236,7 @@ export function AutoBrollBatchModal({
                 <span className="badge badge-emerald" style={{ fontSize: '10px' }}>Ojo Crítico Multimodal</span>
               </h3>
               <p style={{ margin: '2px 0 0', fontSize: '11px', color: 'var(--text-secondary)' }}>
-                Búsqueda con criterio editorial humano (estándar de explorador), mosaico 4x4 de 16 candidatos, carga ultra-rápida en paralelo y evaluación visual concisa.
+                Búsqueda con criterio editorial humano, Mosaico Dual (2 escenas por lienzo de visión) y Formato Compacto para máxima eficiencia en peticiones.
               </p>
             </div>
           </div>
@@ -274,7 +274,7 @@ export function AutoBrollBatchModal({
                   disabled={isRunning}
                   style={{ cursor: 'pointer' }}
                 />
-                <strong>Mosaico 4x4 (16 Candidatos) & Ojo Crítico Activo</strong>
+                <strong>Mosaico Dual & Ojo Crítico Multimodal</strong>
               </label>
             </div>
 
@@ -289,25 +289,25 @@ export function AutoBrollBatchModal({
                 🎬 Toma Sugerida Prioritaria
               </span>
               <span className="badge" style={{ fontSize: '10px', background: 'rgba(6, 182, 212, 0.15)', color: '#38bdf8', border: '1px solid rgba(6, 182, 212, 0.3)' }}>
-                🔍 Búsqueda Estilo Editor (Píldoras del explorador)
+                🔍 Búsqueda Estilo Editor (Píldoras)
               </span>
               <span className="badge" style={{ fontSize: '10px', background: 'rgba(168, 85, 247, 0.15)', color: '#c084fc', border: '1px solid rgba(168, 85, 247, 0.3)' }}>
-                🧩 Mosaico 4x4 (16 Candidatos)
+                🧩 Mosaico Dual (12 Candidatos / Escena)
               </span>
               <span className="badge" style={{ fontSize: '10px', background: 'rgba(59, 130, 246, 0.15)', color: '#60a5fa', border: '1px solid rgba(59, 130, 246, 0.3)' }}>
-                🧠 Sistema Thinking (Evaluación Uno por Uno)
+                ⚡ Salida Compacta (Menos Tokens)
               </span>
               <span className="badge" style={{ fontSize: '10px', background: 'rgba(239, 68, 68, 0.15)', color: '#f87171', border: '1px solid rgba(239, 68, 68, 0.3)' }}>
-                🛑 Vara Alta (Saber Decir NO & Auto-Rescate)
+                🛑 Vara Alta (Auto-Rescate)
               </span>
               <span className="badge" style={{ fontSize: '10px', background: 'rgba(16, 185, 129, 0.15)', color: '#34d399', border: '1px solid rgba(16, 185, 129, 0.3)' }}>
                 🎯 Concordancia con Ancla Visual
               </span>
               <span className="badge" style={{ fontSize: '10px', background: 'rgba(34, 197, 94, 0.15)', color: '#4ade80', border: '1px solid rgba(34, 197, 94, 0.3)' }}>
-                🛡️ Anti-Repetición (0 Duplicados en Proyecto)
+                🛡️ Anti-Repetición (0 Duplicados)
               </span>
               <span className="badge" style={{ fontSize: '10px', background: 'rgba(245, 158, 11, 0.15)', color: '#fbbf24', border: '1px solid rgba(245, 158, 11, 0.3)' }}>
-                🌐 Web Abierta (Bing/Wikimedia en Paralelo)
+                🌐 Búsqueda Multifuente Paralela
               </span>
             </div>
           </div>
@@ -653,7 +653,12 @@ export function AutoBrollBatchModal({
                       <span>Carpeta destino:</span>
                       {isEditingFolder ? (
                         <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
-                          <span style={{ fontFamily: 'monospace', color: 'var(--text-dim)' }}>projects_media/</span>
+                          <span
+                            style={{ fontFamily: 'monospace', color: 'var(--text-dim)' }}
+                            title={`Ruta base: ${diskInfo?.mediaDir || 'projects_media'}`}
+                          >
+                            {(diskInfo?.mediaDir ? diskInfo.mediaDir.split('/').filter(Boolean).pop() : 'projects_media')}/
+                          </span>
                           <input
                             type="text"
                             value={batchFolder}
@@ -674,7 +679,12 @@ export function AutoBrollBatchModal({
                         </div>
                       ) : (
                         <>
-                          <strong style={{ color: '#38bdf8', fontFamily: 'monospace' }}>projects_media/{batchFolder}/</strong>
+                          <strong
+                            style={{ color: '#38bdf8', fontFamily: 'monospace' }}
+                            title={`Ruta completa: ${(diskInfo?.mediaDir || 'projects_media').replace(/\/+$/, '')}/${batchFolder}/`}
+                          >
+                            {(diskInfo?.mediaDir || 'projects_media').replace(/\/+$/, '')}/{batchFolder}/
+                          </strong>
                           <button
                             type="button"
                             onClick={() => setIsEditingFolder(true)}
@@ -767,7 +777,7 @@ export function AutoBrollBatchModal({
                   Inspección Visual en Tiempo Real: [Escena #{currentCollage.sceneNumber}] {currentCollage.sceneTitle}
                 </span>
                 <span className="badge badge-emerald" style={{ fontSize: '10px' }}>
-                  ✓ Ganador Candidato #{currentCollage.critique?.winnerIndex || 1}
+                  ✓ Ganador {String(currentCollage.critique?.winnerIndex || '').includes('|') ? `[${currentCollage.critique?.winnerIndex}]` : `Candidato #${currentCollage.critique?.winnerIndex || 1}`}
                 </span>
               </div>
 

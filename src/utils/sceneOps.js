@@ -172,3 +172,118 @@ export function clearTimelineClips(project) {
   };
 }
 
+/**
+ * Resolves the true start time and duration of a scene on the timeline,
+ * prioritizing scene track clips, then video track clips, then scene metadata.
+ * @param {object} scene Target scene object
+ * @param {object} project Current project object
+ * @param {object} specificClip Optional specific clip
+ * @returns {{ startTime: number, duration: number, sceneNumber: number, sceneId: string|null, source: string }}
+ */
+export function resolveRealSceneTimelinePosition(scene, project, specificClip = null) {
+  if (!project) {
+    const sStart = typeof scene?.startTime === 'number' ? Number(scene.startTime.toFixed(2)) : 0;
+    const sDur = typeof scene?.duration === 'number'
+      ? Number(scene.duration.toFixed(2))
+      : (typeof scene?.endTime === 'number' && scene.endTime > sStart ? Number((scene.endTime - sStart).toFixed(2)) : 4.0);
+    return {
+      startTime: sStart,
+      duration: Math.max(0.5, sDur),
+      sceneNumber: Number(scene?.sceneNumber || 1),
+      sceneId: scene?.id || null,
+      source: 'fallback'
+    };
+  }
+
+  // 1. If a specific timeline clip was passed directly
+  if (specificClip && typeof specificClip.startTime === 'number') {
+    const sDur = typeof specificClip.duration === 'number' ? Number(specificClip.duration.toFixed(2)) : 4.0;
+    return {
+      startTime: Number(specificClip.startTime.toFixed(2)),
+      duration: Math.max(0.5, sDur),
+      sceneNumber: Number(specificClip.sceneNumber || scene?.sceneNumber || 1),
+      sceneId: specificClip.sceneId || scene?.id || specificClip.id || null,
+      source: 'passed_clip'
+    };
+  }
+
+  const sNum = scene?.sceneNumber ? Number(scene.sceneNumber) : null;
+  const sId = scene?.id;
+
+  const clipMatchesScene = (c) => {
+    if (!c) return false;
+    if (sNum && Number(c.sceneNumber) === sNum) return true;
+    if (sId && (c.sceneId === sId || c.id === sId)) return true;
+    if (sNum && c.name) {
+      const m = c.name.match(/\[E\s*0*(\d+)\]/i) || c.name.match(/\bEscena\s*0*(\d+)\b/i);
+      if (m && Number(m[1]) === sNum) return true;
+    }
+    if (sNum && c.title) {
+      const m = c.title.match(/\[E\s*0*(\d+)\]/i) || c.title.match(/\bEscena\s*0*(\d+)\b/i);
+      if (m && Number(m[1]) === sNum) return true;
+    }
+    return false;
+  };
+
+  // 2. Look for the clip on the dedicated Scene Track first (track.type === 'scene')
+  // The Scene track represents the master storyboard breakdown on the timeline!
+  const sceneTrack = (project.tracks || []).find(t => t.type === 'scene');
+  if (sceneTrack && Array.isArray(sceneTrack.clips)) {
+    const sClip = sceneTrack.clips.find(c => clipMatchesScene(c));
+    if (sClip && typeof sClip.startTime === 'number') {
+      const sDur = typeof sClip.duration === 'number' ? Number(sClip.duration.toFixed(2)) : 4.0;
+      return {
+        startTime: Number(sClip.startTime.toFixed(2)),
+        duration: Math.max(0.5, sDur),
+        sceneNumber: Number(sClip.sceneNumber || sNum || 1),
+        sceneId: sClip.sceneId || sClip.id || sId || null,
+        source: 'scene_track'
+      };
+    }
+  }
+
+  // 3. Look for an existing clip on Video Tracks (e.g. V2, V1)
+  const videoTracks = (project.tracks || []).filter(t => t.type === 'video');
+  for (const vt of videoTracks) {
+    const vClip = (vt.clips || []).find(c => clipMatchesScene(c));
+    if (vClip && typeof vClip.startTime === 'number') {
+      const vDur = typeof vClip.duration === 'number' ? Number(vClip.duration.toFixed(2)) : 4.0;
+      return {
+        startTime: Number(vClip.startTime.toFixed(2)),
+        duration: Math.max(0.5, vDur),
+        sceneNumber: Number(vClip.sceneNumber || sNum || 1),
+        sceneId: vClip.sceneId || sId || null,
+        source: 'video_track'
+      };
+    }
+  }
+
+  // 4. Fallback to scene's metadata/object only if no timeline clip was found on scene/video tracks
+  if (typeof scene?.startTime === 'number' && !isNaN(scene.startTime)) {
+    const sDur = typeof scene?.duration === 'number' && scene.duration > 0
+      ? Number(scene.duration.toFixed(2))
+      : (typeof scene?.endTime === 'number' && scene.endTime > scene.startTime ? Number((scene.endTime - scene.startTime).toFixed(2)) : 4.0);
+    return {
+      startTime: Number(scene.startTime.toFixed(2)),
+      duration: Math.max(0.5, sDur),
+      sceneNumber: Number(sNum || scene?.sceneNumber || 1),
+      sceneId: sId || scene?.id || null,
+      source: 'scene_object'
+    };
+  }
+
+  // 5. Fallback to scene's metadata
+  const metaStart = typeof scene?.startTime === 'number' ? Number(scene.startTime.toFixed(2)) : 0;
+  const metaDur = typeof scene?.duration === 'number'
+    ? Number(scene.duration.toFixed(2))
+    : (typeof scene?.endTime === 'number' && scene.endTime > metaStart ? Number((scene.endTime - metaStart).toFixed(2)) : 4.0);
+
+  return {
+    startTime: metaStart,
+    duration: Math.max(0.5, metaDur),
+    sceneNumber: sNum || 1,
+    sceneId: sId || null,
+    source: 'metadata'
+  };
+}
+

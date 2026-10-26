@@ -2,7 +2,8 @@
  * Timeline Operations & Smart Track Insertion
  * Automatically separates audio from video clips and manages track lanes.
  */
-import { getCachedWaveform } from './audioWaveform';
+import { getCachedWaveform } from './audioWaveform.js';
+import { resolveRealSceneTimelinePosition } from './sceneOps.js';
 
 
 /**
@@ -28,11 +29,64 @@ export function addAssetToTimeline(project, asset, targetTrackId = null, preferr
   const isVideo = asset.type === 'video';
   const isAudio = asset.type === 'audio';
   const cachedWf = getCachedWaveform(asset.id || asset.url);
-  const effectiveAssetDuration = (cachedWf && cachedWf.duration > 0) ? cachedWf.duration : asset.duration;
-  const duration = Number((effectiveAssetDuration || (isAudio ? 10 : 5)).toFixed(2));
-  const startTime = Number(Math.max(0, preferredStartTime).toFixed(2));
+  let effectiveAssetDuration = (cachedWf && cachedWf.duration > 0) ? cachedWf.duration : asset.duration;
+  let duration = Number((effectiveAssetDuration || (isAudio ? 10 : 5)).toFixed(2));
+  let startTime = Number(Math.max(0, preferredStartTime).toFixed(2));
+
+  // If this asset was downloaded for/associated with a scene, lock it to the scene bounds!
+  if (asset.sceneId || asset.isBroll) {
+    const matchedScene = (project?.scenes?.list || []).find(s =>
+      (asset.sceneId && s.id === asset.sceneId) ||
+      (asset.sceneNumber && Number(s.sceneNumber) === Number(asset.sceneNumber))
+    );
+    if (matchedScene) {
+      const realPos = resolveRealSceneTimelinePosition(matchedScene, project);
+      startTime = realPos.startTime;
+      if (isVideo) {
+        duration = Math.min(duration, realPos.duration);
+      }
+    }
+  }
 
   let tracks = [...(project.tracks || [])];
+
+  // Smart Gap Snapping: If inserting onto or near a video track with a gap:
+  const primaryVideoTrack = (targetTrackId ? tracks.find(t => t.id === targetTrackId && t.type === 'video') : null)
+    || tracks.find(t => t.type === 'video' && (t.clips?.length || 0) > 0)
+    || tracks.find(t => t.type === 'video');
+
+  if (isVideo && primaryVideoTrack && !primaryVideoTrack.locked) {
+    const sorted = [...(primaryVideoTrack.clips || [])].sort((a, b) => a.startTime - b.startTime);
+    if (sorted.length > 0) {
+      // Gap at start of track
+      if (sorted[0].startTime > 0.08) {
+        const gapStart = 0;
+        const gapEnd = Number(sorted[0].startTime.toFixed(2));
+        if (Math.abs(gapStart - startTime) < 1.5 || (startTime >= gapStart && startTime < gapEnd)) {
+          startTime = gapStart;
+          duration = Number(Math.min(duration, gapEnd - gapStart).toFixed(2));
+          targetTrackId = primaryVideoTrack.id;
+        }
+      }
+      // Gap between clips
+      let pEnd = sorted[0].startTime + sorted[0].duration;
+      for (let i = 1; i < sorted.length; i++) {
+        const c = sorted[i];
+        if (c.startTime - pEnd > 0.08) {
+          const gapStart = Number(pEnd.toFixed(2));
+          const gapEnd = Number(c.startTime.toFixed(2));
+          const gapDur = Number((gapEnd - gapStart).toFixed(2));
+          if (Math.abs(gapStart - startTime) < 1.5 || (startTime >= gapStart - 0.1 && startTime <= gapEnd + 0.1)) {
+            startTime = gapStart;
+            duration = gapDur;
+            targetTrackId = primaryVideoTrack.id;
+            break;
+          }
+        }
+        pEnd = Math.max(pEnd, c.startTime + c.duration);
+      }
+    }
+  }
 
   if (isVideo) {
     // 1. Determine Video Track
@@ -73,6 +127,9 @@ export function addAssetToTimeline(project, asset, targetTrackId = null, preferr
       scale: 1,
       opacity: 1,
       color: '#6366f1',
+      audioSeparated: true,
+      muted: true,
+      volume: 0,
       linkedClipId: audioClipId
     };
 
@@ -316,6 +373,11 @@ export function normalizeProject(raw) {
     { id: 'track-a1', name: 'A1 (Audio Principal)', type: 'audio', visible: true, muted: false, locked: false, clips: [] }
   ];
 
+  const rawTracks = Array.isArray(p.tracks) && p.tracks.length > 0 ? p.tracks : defaultTracks;
+  const rawAssets = Array.isArray(p.assets) ? p.assets : [];
+  const assetTypeById = new Map(rawAssets.map(a => [a.id, a.type]));
+  const hasAnyAudioClips = rawTracks.some(t => t.type === 'audio' && Array.isArray(t.clips) && t.clips.length > 0);
+
   return {
     ...p,
     id: p.id || 'proj_' + Date.now(),
@@ -330,79 +392,55 @@ export function normalizeProject(raw) {
       fps: 30,
       ...(p.settings || {})
     },
-    tracks: Array.isArray(p.tracks) && p.tracks.length > 0 ? p.tracks.map(t => ({
+    tracks: rawTracks.map(t => ({
       ...t,
-      clips: Array.isArray(t.clips) ? t.clips : []
-    })) : defaultTracks,
-    assets: Array.isArray(p.assets) ? p.assets : [],
-    scenes: p.scenes && Array.isArray(p.scenes.list) ? p.scenes : { list: [], summary: null, rhythmProfile: null },
+      clips: Array.isArray(t.clips)
+        ? t.clips.map(c => {
+          if (t.type === 'video' && !c.isGraphic && assetTypeById.get(c.assetId) !== 'image') {
+            if (c.linkedClipId || c.audioSeparated || hasAnyAudioClips) {
+              return {
+                ...c,
+                audioSeparated: true,
+                muted: true,
+                volume: 0
+              };
+            }
+          }
+          return c;
+        })
+        : []
+    })),
+    assets: rawAssets.map(a => {
+      if (!a || typeof a !== 'object') return a;
+      const isValidBlob = typeof Blob !== 'undefined' && a.file instanceof Blob && a.file.size > 0;
+      if (a.file && !isValidBlob) {
+        const { file, ...rest } = a;
+        return rest;
+      }
+      return a;
+    }),
+    scenes: p.scenes && Array.isArray(p.scenes.list) ? {
+      ...p.scenes,
+      list: p.scenes.list.map(s => {
+        if (s.visualCollagePreview && typeof s.visualCollagePreview === 'string' && s.visualCollagePreview.length > 2000) {
+          const { visualCollagePreview, ...rest } = s;
+          return rest;
+        }
+        return s;
+      })
+    } : (p.scenes || { list: [], summary: null, rhythmProfile: null }),
     transcript: p.transcript || { segments: [], rawText: '' },
     updatedAt: p.updatedAt || new Date().toISOString()
   };
 }
 
 /**
- * Sanitizes project tracks by removing duplicate clips for the same scene across different video tracks.
- * Automatically keeps the clip on the highest layer track (e.g. V2 over V1).
+ * Normalizes project tracks without destroying user timeline clips.
+ * Preserves all user clips across all video and audio tracks (e.g. V1 base clips and V2 overlays).
  */
 export function sanitizeDuplicateSceneClips(project) {
   if (!project) return null;
-  const normalized = normalizeProject(project);
-  if (!normalized?.tracks) return normalized;
-
-  const videoTracks = normalized.tracks.filter(t => t.type === 'video');
-  if (videoTracks.length <= 1) return normalized;
-
-  // Sort tracks by rank descending (higher layer tracks like V2 evaluated first)
-  const rankedTracks = [...videoTracks].sort((a, b) => getTrackLayerRank(b) - getTrackLayerRank(a));
-
-  const seenScenes = new Map();
-  let hasDuplicates = false;
-
-  for (const track of rankedTracks) {
-    for (const clip of (track.clips || [])) {
-      let sceneKey = clip.sceneId;
-      if (!sceneKey && clip.name) {
-        const match = clip.name.match(/\[E(\d+)\]/);
-        if (match) sceneKey = `scene_e${match[1]}`;
-      }
-      if (sceneKey) {
-        if (seenScenes.has(sceneKey)) {
-          hasDuplicates = true;
-        } else {
-          seenScenes.set(sceneKey, { trackId: track.id, clipId: clip.id });
-        }
-      }
-    }
-  }
-
-  if (!hasDuplicates) return normalized;
-
-  const updatedTracks = normalized.tracks.map(track => {
-    if (track.type !== 'video') return track;
-    return {
-      ...track,
-      clips: (track.clips || []).filter(clip => {
-        let sceneKey = clip.sceneId;
-        if (!sceneKey && clip.name) {
-          const match = clip.name.match(/\[E(\d+)\]/);
-          if (match) sceneKey = `scene_e${match[1]}`;
-        }
-        if (sceneKey && seenScenes.has(sceneKey)) {
-          const keeper = seenScenes.get(sceneKey);
-          if (keeper.trackId !== track.id || keeper.clipId !== clip.id) {
-            return false;
-          }
-        }
-        return true;
-      })
-    };
-  });
-
-  return {
-    ...normalized,
-    tracks: updatedTracks
-  };
+  return normalizeProject(project);
 }
 
 /**
@@ -545,6 +583,15 @@ export function unlinkClips(project, clipId) {
     ...t,
     clips: t.clips.map(c => {
       if (c.id === clipId || c.linkedClipId === clipId) {
+        if (t.type === 'video') {
+          return {
+            ...c,
+            linkedClipId: null,
+            audioSeparated: true,
+            muted: true,
+            volume: 0
+          };
+        }
         return { ...c, linkedClipId: null };
       }
       return c;
@@ -553,4 +600,315 @@ export function unlinkClips(project, clipId) {
 
   return { ...project, tracks };
 }
+
+/**
+ * Detects all empty gaps between clips (and before the first clip) in a given track.
+ */
+export function getTrackGaps(track) {
+  if (!track || !track.clips || track.clips.length === 0 || track.locked || track.visible === false) {
+    return [];
+  }
+  const sorted = [...track.clips].sort((a, b) => a.startTime - b.startTime);
+  const gaps = [];
+
+  // Gap before the first clip if it starts after 0.08s
+  if (sorted[0].startTime > 0.08) {
+    gaps.push({
+      id: `gap-${track.id}-start-0`,
+      start: 0,
+      end: sorted[0].startTime,
+      duration: Number(sorted[0].startTime.toFixed(2))
+    });
+  }
+
+  let prevEnd = sorted[0].startTime + sorted[0].duration;
+  for (let i = 1; i < sorted.length; i++) {
+    const clip = sorted[i];
+    if (clip.startTime - prevEnd > 0.08) {
+      gaps.push({
+        id: `gap-${track.id}-${i}-${prevEnd.toFixed(2)}`,
+        start: Number(prevEnd.toFixed(2)),
+        end: Number(clip.startTime.toFixed(2)),
+        duration: Number((clip.startTime - prevEnd).toFixed(2))
+      });
+    }
+    prevEnd = Math.max(prevEnd, clip.startTime + clip.duration);
+  }
+
+  return gaps;
+}
+
+/**
+ * Ripple Deletes a gap in a track:
+ * Closes the empty space between clips by shifting subsequent clips leftward.
+ * If any shifted clip is grouped or linked (e.g. linkedClipId or groupId),
+ * all associated partner clips across all tracks are shifted together by the same amount.
+ * If the clips are independent (not linked/grouped), only the clips in targetTrackId are shifted.
+ */
+export function rippleDeleteGap(project, targetTrackId, gapStart, gapDuration) {
+  if (!project || !project.tracks || !targetTrackId || gapDuration <= 0.001) {
+    return project;
+  }
+
+  const tracks = project.tracks.map(t => ({
+    ...t,
+    clips: [...(t.clips || [])]
+  }));
+
+  const targetTrack = tracks.find(t => t.id === targetTrackId);
+  if (!targetTrack) return project;
+
+  // Identify clips in the target track that start at or after the gap
+  const targetShiftClips = targetTrack.clips.filter(c => c.startTime >= gapStart + gapDuration - 0.02);
+  if (targetShiftClips.length === 0) return project;
+
+  // Collect all clip IDs that must be shifted:
+  const clipIdsToShift = new Set(targetShiftClips.map(c => c.id));
+
+  // Find all linked partners and group members:
+  // If a clip being shifted has linkedClipId or groupId, add those partner clips too!
+  let addedNew = true;
+  while (addedNew) {
+    addedNew = false;
+    for (const track of tracks) {
+      for (const clip of track.clips) {
+        if (clipIdsToShift.has(clip.id)) {
+          // Check linkedClipId
+          if (clip.linkedClipId && !clipIdsToShift.has(clip.linkedClipId)) {
+            clipIdsToShift.add(clip.linkedClipId);
+            addedNew = true;
+          }
+          // Check groupId
+          if (clip.groupId) {
+            for (const otherTrack of tracks) {
+              for (const otherClip of otherTrack.clips) {
+                if (otherClip.groupId === clip.groupId && !clipIdsToShift.has(otherClip.id)) {
+                  clipIdsToShift.add(otherClip.id);
+                  addedNew = true;
+                }
+              }
+            }
+          }
+        } else {
+          // If this clip links to a clip that is being shifted, include it too
+          if (clip.linkedClipId && clipIdsToShift.has(clip.linkedClipId)) {
+            clipIdsToShift.add(clip.id);
+            addedNew = true;
+          }
+        }
+      }
+    }
+  }
+
+  // Shift all identified clips to the left by gapDuration
+  const updatedTracks = tracks.map(t => ({
+    ...t,
+    clips: t.clips.map(c => {
+      if (clipIdsToShift.has(c.id)) {
+        const nextStart = Math.max(0, Number((c.startTime - gapDuration).toFixed(2)));
+        return {
+          ...c,
+          startTime: nextStart
+        };
+      }
+      return c;
+    })
+  }));
+
+  // Recalculate max duration if needed
+  let maxEndTime = 0;
+  updatedTracks.forEach(t => {
+    t.clips.forEach(c => {
+      maxEndTime = Math.max(maxEndTime, c.startTime + c.duration);
+    });
+  });
+
+  const currentDuration = project.settings?.duration || 20;
+  const newDuration = Math.max(5, Math.max(maxEndTime, Number((currentDuration - gapDuration).toFixed(2))));
+
+  return {
+    ...project,
+    updatedAt: new Date().toISOString(),
+    settings: {
+      ...(project.settings || {}),
+      duration: newDuration
+    },
+    tracks: updatedTracks
+  };
+}
+
+/**
+ * Ripple Deletes one or more clips:
+ * Removes the specified clips and shifts subsequent clips on affected tracks leftward to close the gap.
+ */
+export function rippleDeleteClips(project, clipIds = []) {
+  if (!project || !project.tracks || !Array.isArray(clipIds) || clipIds.length === 0) {
+    return project;
+  }
+
+  const idSet = new Set(clipIds);
+  // Also include linked companions if their primary clip is being ripple-deleted
+  for (const track of project.tracks) {
+    for (const clip of (track.clips || [])) {
+      if (idSet.has(clip.id) && clip.linkedClipId) {
+        idSet.add(clip.linkedClipId);
+      }
+    }
+  }
+
+  // Record the deleted intervals per track so we can shift subsequent clips on those tracks
+  const intervalsByTrack = new Map();
+  for (const track of project.tracks) {
+    if (track.locked) continue;
+    const removed = (track.clips || []).filter(c => idSet.has(c.id));
+    if (removed.length > 0) {
+      const minStart = Math.min(...removed.map(c => c.startTime));
+      const maxEnd = Math.max(...removed.map(c => c.startTime + c.duration));
+      intervalsByTrack.set(track.id, {
+        start: minStart,
+        duration: Math.max(0, Number((maxEnd - minStart).toFixed(2)))
+      });
+    }
+  }
+
+  // 1. Remove the deleted clips
+  let currProject = {
+    ...project,
+    tracks: project.tracks.map(t => ({
+      ...t,
+      clips: (t.clips || [])
+        .filter(c => !idSet.has(c.id))
+        .map(c => (idSet.has(c.linkedClipId) ? { ...c, linkedClipId: null } : c))
+    }))
+  };
+
+  // 2. Ripple close the gap on each affected track
+  for (const [trackId, interval] of intervalsByTrack.entries()) {
+    if (interval.duration > 0.01) {
+      currProject = rippleDeleteGap(currProject, trackId, interval.start, interval.duration);
+    }
+  }
+
+  return currProject;
+}
+
+/**
+ * Splits a clip at a specific timestamp (or finds the top-most unlocked clip under splitTime if targetClipId is null).
+ * Returns { updatedProject, newClipId }.
+ */
+export function splitClipAtTime(project, targetClipId = null, splitTime = 0) {
+  if (!project || !project.tracks) return { updatedProject: project, newClipId: null };
+
+  let foundClip = null;
+  let foundTrack = null;
+
+  if (targetClipId) {
+    for (const t of project.tracks) {
+      if (t.locked) continue;
+      const c = (t.clips || []).find(x => x.id === targetClipId);
+      if (c && splitTime > c.startTime + 0.08 && splitTime < (c.startTime + c.duration - 0.08)) {
+        foundClip = c;
+        foundTrack = t;
+        break;
+      }
+    }
+  }
+
+  // Auto-detect clip under splitTime if targetClipId wasn't provided or wasn't under splitTime
+  if (!foundClip) {
+    for (const t of project.tracks) {
+      if (t.locked || t.visible === false || t.type === 'guide' || t.type === 'scene') continue;
+      const c = (t.clips || []).find(x => splitTime > x.startTime + 0.08 && splitTime < (x.startTime + x.duration - 0.08));
+      if (c) {
+        foundClip = c;
+        foundTrack = t;
+        break;
+      }
+    }
+  }
+
+  if (!foundClip || !foundTrack) {
+    return { updatedProject: project, newClipId: null };
+  }
+
+  const clipStart = foundClip.startTime;
+  const clipEnd = foundClip.startTime + foundClip.duration;
+  const firstDuration = Number((splitTime - clipStart).toFixed(2));
+  const secondDuration = Number((clipEnd - splitTime).toFixed(2));
+  const rate = Number(foundClip.playbackRate) > 0 ? Number(foundClip.playbackRate) : 1;
+  const secondSourceStart = Number(((foundClip.sourceStart || 0) + firstDuration * rate).toFixed(2));
+
+  const newSecondId = 'clip_' + Date.now() + '_' + Math.random().toString(36).substring(2, 5);
+  const updatedFirst = { ...foundClip, duration: firstDuration };
+
+  let linkedClip = null;
+  let linkedTrack = null;
+  if (foundClip.linkedClipId) {
+    for (const t of project.tracks) {
+      const lc = (t.clips || []).find(x => x.id === foundClip.linkedClipId);
+      if (lc) {
+        linkedClip = lc;
+        linkedTrack = t;
+        break;
+      }
+    }
+  }
+
+  let newLinkedSecondId = null;
+  let updatedLinkedFirst = null;
+  let newLinkedSecond = null;
+
+  if (linkedClip && linkedTrack && !linkedTrack.locked) {
+    newLinkedSecondId = 'clip_linked_' + Date.now() + '_' + Math.random().toString(36).substring(2, 5);
+    const linkedRate = Number(linkedClip.playbackRate) > 0 ? Number(linkedClip.playbackRate) : 1;
+    updatedLinkedFirst = {
+      ...linkedClip,
+      duration: firstDuration,
+      linkedClipId: foundClip.id
+    };
+    newLinkedSecond = {
+      ...linkedClip,
+      id: newLinkedSecondId,
+      startTime: Number(splitTime.toFixed(2)),
+      duration: secondDuration,
+      sourceStart: Number(((linkedClip.sourceStart || 0) + firstDuration * linkedRate).toFixed(2)),
+      name: `${linkedClip.name.replace(/\s*\(Parte \d+\)$/i, '')} (Parte 2)`,
+      linkedClipId: newSecondId
+    };
+    updatedFirst.linkedClipId = linkedClip.id;
+  }
+
+  const newSecond = {
+    ...foundClip,
+    id: newSecondId,
+    startTime: Number(splitTime.toFixed(2)),
+    duration: secondDuration,
+    sourceStart: secondSourceStart,
+    name: `${(foundClip.name || 'Clip').replace(/\s*\(Parte \d+\)$/i, '')} (Parte 2)`,
+    linkedClipId: newLinkedSecondId || undefined
+  };
+
+  const updatedTracks = project.tracks.map(t => {
+    let clips = t.clips || [];
+    if (t.id === foundTrack.id) {
+      clips = clips.map(c => c.id === foundClip.id ? updatedFirst : c).concat(newSecond);
+      clips.sort((a, b) => a.startTime - b.startTime);
+    }
+    if (linkedTrack && t.id === linkedTrack.id && t.id !== foundTrack.id) {
+      clips = clips.map(c => c.id === linkedClip.id ? updatedLinkedFirst : c).concat(newLinkedSecond);
+      clips.sort((a, b) => a.startTime - b.startTime);
+    }
+    return { ...t, clips };
+  });
+
+  return {
+    updatedProject: {
+      ...project,
+      updatedAt: new Date().toISOString(),
+      tracks: updatedTracks
+    },
+    newClipId: newSecondId
+  };
+}
+
 

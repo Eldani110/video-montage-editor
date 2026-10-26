@@ -1,25 +1,68 @@
 /**
  * Professional Web Audio API Multi-Track Mixing Engine for Montage Pro Studio
  * Provides hardware-accurate, zero-latency sample synchronization, multi-track mixing
- * (voiceover, music, sound effects, separated dialogue), track/clip gain control,
- * and unified transport control without browser media-element demuxing bottlenecks.
+ * (voiceover, music, sound effects, separated dialogue), per-track 3-band EQ & Voice Enhancer,
+ * Stereo Panning, Solo/Mute, Auto-Ducking, Clip Fade-In/Out Envelopes, and real-time Peak/RMS VU Meters.
  */
 
 import { getMediaBlob } from './storage';
 import { extractAudioTrackToWavBlob } from './audioExtractor';
 
+export const AUDIO_EQ_PRESETS = [
+  { id: 'flat', name: 'Plano (Original)', low: 0, mid: 0, high: 0 },
+  { id: 'voice_podcast', name: '🎙️ Voz Podcast / Locución', low: -3, mid: 4.5, high: 2.5 },
+  { id: 'warm_bass', name: '🔊 Graves Cálidos (Cine)', low: 5, mid: -1, high: 1 },
+  { id: 'bgm_soft', name: '🎵 Música de Fondo (Cama)', low: -2, mid: -4.5, high: -1.5 },
+  { id: 'crisp_highs', name: '✨ Claridad & Brillo Vocal', low: -4, mid: 2.5, high: 5 }
+];
+
+function resolveEqGains(presetId = 'flat', customEq = null) {
+  if (customEq && typeof customEq === 'object') {
+    return {
+      low: Number(customEq.low || 0),
+      mid: Number(customEq.mid || 0),
+      high: Number(customEq.high || 0)
+    };
+  }
+  const found = AUDIO_EQ_PRESETS.find(p => p.id === presetId) || AUDIO_EQ_PRESETS[0];
+  return { low: found.low, mid: found.mid, high: found.high };
+}
+
+function computeClipEnvelopeMultiplier(clip, currentTime) {
+  if (!clip) return 1.0;
+  const elapsed = currentTime - clip.startTime;
+  const remaining = (clip.startTime + clip.duration) - currentTime;
+  if (elapsed < 0 || remaining < 0) return 0;
+
+  let mult = 1.0;
+  const fadeIn = Number(clip.fadeIn || 0);
+  const fadeOut = Number(clip.fadeOut || 0);
+
+  if (fadeIn > 0.02 && elapsed < fadeIn) {
+    mult *= Math.max(0, Math.min(1, elapsed / fadeIn));
+  }
+  if (fadeOut > 0.02 && remaining < fadeOut) {
+    mult *= Math.max(0, Math.min(1, remaining / fadeOut));
+  }
+  return mult;
+}
+
 class AudioMixerEngine {
   constructor() {
     this.audioCtx = null;
     this.masterGain = null;
-    this.trackBuses = new Map(); // trackId -> { gainNode, isMuted, volume, trackId }
+    this.masterCompressor = null;
+    this.masterAnalyser = null;
+    this.masterDataArray = null;
+    this.trackBuses = new Map(); // trackId -> { inputNode, eqLow, eqMid, eqHigh, pannerNode, gainNode, analyserNode, dataArray, ... }
     this.bufferCache = new Map(); // assetId -> AudioBuffer
     this.loadingPromises = new Map(); // assetId -> Promise<AudioBuffer>
-    this.activeSources = new Map(); // clipId -> { sourceNode, gainNode, clipId, trackId }
+    this.activeSources = new Map(); // clipId -> { sourceNode, gainNode, pannerNode, clip, trackId }
     this.isPlaying = false;
     this.playbackTimelineStartTime = 0;
     this.audioCtxStartTime = 0;
     this.masterVolume = 1.0;
+    this.masterMuted = false;
     this.playbackSessionId = 0;
   }
 
@@ -30,9 +73,26 @@ class AudioMixerEngine {
     if (!this.audioCtx) {
       const AudioCtxClass = window.AudioContext || window.webkitAudioContext;
       this.audioCtx = new AudioCtxClass();
+
       this.masterGain = this.audioCtx.createGain();
-      this.masterGain.gain.value = this.masterVolume;
-      this.masterGain.connect(this.audioCtx.destination);
+      this.masterGain.gain.value = this.masterMuted ? 0 : this.masterVolume;
+
+      // Broadcast Limiter / Compressor to prevent harsh digital clipping when summing multiple tracks
+      this.masterCompressor = this.audioCtx.createDynamicsCompressor();
+      this.masterCompressor.threshold.value = -3.0;
+      this.masterCompressor.knee.value = 12.0;
+      this.masterCompressor.ratio.value = 6.0;
+      this.masterCompressor.attack.value = 0.005;
+      this.masterCompressor.release.value = 0.15;
+
+      this.masterAnalyser = this.audioCtx.createAnalyser();
+      this.masterAnalyser.fftSize = 256;
+      this.masterAnalyser.smoothingTimeConstant = 0.75;
+      this.masterDataArray = new Float32Array(this.masterAnalyser.fftSize);
+
+      this.masterGain.connect(this.masterCompressor);
+      this.masterCompressor.connect(this.masterAnalyser);
+      this.masterAnalyser.connect(this.audioCtx.destination);
     }
     if (this.audioCtx.state === 'suspended') {
       this.audioCtx.resume().catch(() => {});
@@ -40,23 +100,166 @@ class AudioMixerEngine {
     return this.audioCtx;
   }
 
+  setMasterVolume(vol = 1.0, muted = false) {
+    this.masterVolume = Math.max(0, Math.min(2.0, Number(vol)));
+    this.masterMuted = Boolean(muted);
+    if (this.audioCtx && this.masterGain) {
+      this.masterGain.gain.setTargetAtTime(
+        this.masterMuted ? 0 : this.masterVolume,
+        this.audioCtx.currentTime,
+        0.02
+      );
+    }
+  }
+
   /**
-   * Returns a dedicated GainNode bus for a specific audio track.
+   * Returns a dedicated DSP Bus for a specific audio track (3-band EQ -> Panner -> Gain -> Analyser -> Master).
    */
-  getTrackBus(trackId, trackVolume = 1.0, isMuted = false) {
+  getTrackBus(track, anySoloActive = false, isBeingDucked = false) {
     const ctx = this.getContext();
+    const trackId = typeof track === 'string' ? track : track.id;
+    const trackObj = typeof track === 'object' && track ? track : { id: trackId };
+
     let bus = this.trackBuses.get(trackId);
     if (!bus) {
+      const eqLow = ctx.createBiquadFilter();
+      eqLow.type = 'lowshelf';
+      eqLow.frequency.value = 120;
+
+      const eqMid = ctx.createBiquadFilter();
+      eqMid.type = 'peaking';
+      eqMid.frequency.value = 2500;
+      eqMid.Q.value = 1.0;
+
+      const eqHigh = ctx.createBiquadFilter();
+      eqHigh.type = 'highshelf';
+      eqHigh.frequency.value = 8000;
+
+      const pannerNode = typeof ctx.createStereoPanner === 'function'
+        ? ctx.createStereoPanner()
+        : null;
+
       const gainNode = ctx.createGain();
-      gainNode.connect(this.masterGain);
-      bus = { gainNode, isMuted, volume: trackVolume, trackId };
+      const analyserNode = ctx.createAnalyser();
+      analyserNode.fftSize = 256;
+      analyserNode.smoothingTimeConstant = 0.75;
+      const dataArray = new Float32Array(analyserNode.fftSize);
+
+      eqLow.connect(eqMid);
+      eqMid.connect(eqHigh);
+      if (pannerNode) {
+        eqHigh.connect(pannerNode);
+        pannerNode.connect(gainNode);
+      } else {
+        eqHigh.connect(gainNode);
+      }
+      gainNode.connect(analyserNode);
+      analyserNode.connect(this.masterGain);
+
+      bus = {
+        trackId,
+        inputNode: eqLow,
+        eqLow,
+        eqMid,
+        eqHigh,
+        pannerNode,
+        gainNode,
+        analyserNode,
+        dataArray,
+        isMuted: false,
+        volume: 1.0,
+        isDucked: false
+      };
       this.trackBuses.set(trackId, bus);
     }
-    bus.isMuted = !!isMuted;
-    bus.volume = trackVolume !== undefined ? trackVolume : 1.0;
-    const finalGain = bus.isMuted ? 0 : Math.max(0, Math.min(1, bus.volume));
-    bus.gainNode.gain.setValueAtTime(finalGain, ctx.currentTime);
+
+    const isMutedBySolo = anySoloActive && !trackObj.solo;
+    const isMuted = Boolean(trackObj.muted || isMutedBySolo);
+    const baseVolume = trackObj.volume !== undefined ? Number(trackObj.volume) : 1.0;
+    const duckFactor = isBeingDucked ? Number(trackObj.duckAmount ?? 0.22) : 1.0;
+
+    bus.isMuted = isMuted;
+    bus.volume = baseVolume;
+    bus.isDucked = isBeingDucked;
+
+    const eq = resolveEqGains(trackObj.eqPreset || 'flat', trackObj.eq);
+    bus.eqLow.gain.setTargetAtTime(eq.low, ctx.currentTime, 0.03);
+    bus.eqMid.gain.setTargetAtTime(eq.mid, ctx.currentTime, 0.03);
+    bus.eqHigh.gain.setTargetAtTime(eq.high, ctx.currentTime, 0.03);
+
+    if (bus.pannerNode) {
+      const panVal = Math.max(-1, Math.min(1, Number(trackObj.pan || 0)));
+      bus.pannerNode.pan.setTargetAtTime(panVal, ctx.currentTime, 0.03);
+    }
+
+    const finalGain = isMuted ? 0 : Math.max(0, Math.min(2.0, baseVolume * duckFactor));
+    const timeConstant = isBeingDucked ? 0.08 : 0.04;
+    bus.gainNode.gain.setTargetAtTime(finalGain, ctx.currentTime, timeConstant);
+
     return bus;
+  }
+
+  /**
+   * Computes real-time RMS and Peak level for a track bus (for VU meters in AudioMixerPanel)
+   */
+  getTrackMeter(trackId) {
+    if (!this.isPlaying || !this.audioCtx) {
+      return { rms: 0, peak: 0, db: -60, isDucked: false };
+    }
+    const bus = this.trackBuses.get(trackId);
+    if (!bus || !bus.analyserNode || bus.isMuted) {
+      return { rms: 0, peak: 0, db: -60, isDucked: Boolean(bus?.isDucked) };
+    }
+    try {
+      bus.analyserNode.getFloatTimeDomainData(bus.dataArray);
+      let sumSq = 0;
+      let peak = 0;
+      const len = bus.dataArray.length;
+      for (let i = 0; i < len; i++) {
+        const v = Math.abs(bus.dataArray[i]);
+        sumSq += v * v;
+        if (v > peak) peak = v;
+      }
+      const rms = Math.sqrt(sumSq / len);
+      const db = peak > 0.0001 ? Math.max(-60, 20 * Math.log10(peak)) : -60;
+      return {
+        rms: Math.min(1, rms * 1.8),
+        peak: Math.min(1, peak),
+        db: Math.round(db),
+        isDucked: Boolean(bus.isDucked)
+      };
+    } catch {
+      return { rms: 0, peak: 0, db: -60, isDucked: false };
+    }
+  }
+
+  /**
+   * Computes real-time RMS and Peak level for the Master Bus
+   */
+  getMasterMeter() {
+    if (!this.isPlaying || !this.audioCtx || !this.masterAnalyser || this.masterMuted) {
+      return { rms: 0, peak: 0, db: -60 };
+    }
+    try {
+      this.masterAnalyser.getFloatTimeDomainData(this.masterDataArray);
+      let sumSq = 0;
+      let peak = 0;
+      const len = this.masterDataArray.length;
+      for (let i = 0; i < len; i++) {
+        const v = Math.abs(this.masterDataArray[i]);
+        sumSq += v * v;
+        if (v > peak) peak = v;
+      }
+      const rms = Math.sqrt(sumSq / len);
+      const db = peak > 0.0001 ? Math.max(-60, 20 * Math.log10(peak)) : -60;
+      return {
+        rms: Math.min(1, rms * 1.8),
+        peak: Math.min(1, peak),
+        db: Math.round(db)
+      };
+    } catch {
+      return { rms: 0, peak: 0, db: -60 };
+    }
   }
 
   /**
@@ -76,29 +279,69 @@ class AudioMixerEngine {
         const ctx = this.getContext();
         let arrayBuffer = null;
 
-        // 1. Try fetching from URL (blob: or http:)
+        const isVideoFormat = asset.type === 'video' ||
+          asset.isVideoContainerAudio ||
+          (asset.name && /\.(mp4|webm|mov|mkv|avi|qt)$/i.test(asset.name)) ||
+          (asset.url && (asset.url.endsWith('.mp4') || asset.url.endsWith('.webm') || asset.url.endsWith('.mov')));
+
+        // Maximum safe audio payload size to decode in WebAudio on UI thread (25 MB)
+        const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
+
+        // 0. Ultra-fast backend audio extraction for video formats:
+        // Serves lightweight extracted audio (~1 MB) in ~20ms instead of 400+ MB video
+        if (isVideoFormat && (asset.diskPath || asset.name)) {
+          try {
+            const audioUrl = `/media-library/audio?path=${encodeURIComponent(asset.diskPath || asset.name)}`;
+            const res = await fetch(audioUrl);
+            if (res.ok) {
+              const audioData = await res.arrayBuffer();
+              // Guard: If response is a full video container (>25MB), reject to prevent browser lockup
+              if (audioData && audioData.byteLength > 100 && audioData.byteLength <= MAX_AUDIO_BYTES) {
+                const audioBuffer = await ctx.decodeAudioData(audioData);
+                if (audioBuffer) {
+                  this.bufferCache.set(asset.id, audioBuffer);
+                  return audioBuffer;
+                }
+              }
+            }
+          } catch (e) {
+            console.warn('[audioMixer] Fast backend audio extraction fallback:', e);
+          }
+        }
+
+        // If this is a video asset and the server could not provide an extracted audio track,
+        // DO NOT download hundreds of megabytes of raw video container into WebAudio memory!
+        if (isVideoFormat) {
+          this.bufferCache.set(asset.id, null);
+          return null;
+        }
+
+        // 1. Try fetching from URL (for pure audio assets)
         if (asset.url) {
           try {
             const res = await fetch(asset.url);
             if (res.ok) {
-              arrayBuffer = await res.arrayBuffer();
+              const buf = await res.arrayBuffer();
+              if (buf.byteLength <= MAX_AUDIO_BYTES) {
+                arrayBuffer = buf;
+              }
             }
-          } catch {
-            // URL might be expired, fallback to IndexedDB
-          }
+          } catch {}
         }
 
-        // 1.b Fallback to asset.file
+        // 1.b Fallback to asset.file (for pure audio files)
         if (!arrayBuffer && asset.file) {
           try {
-            arrayBuffer = await asset.file.arrayBuffer();
+            if (asset.file.size <= MAX_AUDIO_BYTES) {
+              arrayBuffer = await asset.file.arrayBuffer();
+            }
           } catch {}
         }
 
         // 2. Fallback to IndexedDB
         if (!arrayBuffer && asset.id) {
           const blob = await getMediaBlob(asset.id);
-          if (blob) {
+          if (blob && blob.size <= MAX_AUDIO_BYTES) {
             arrayBuffer = await blob.arrayBuffer();
           }
         }
@@ -106,52 +349,75 @@ class AudioMixerEngine {
         // 3. Fallback to source video if this is a separated audio clip
         if (!arrayBuffer && asset.sourceAssetId) {
           const sourceBlob = await getMediaBlob(asset.sourceAssetId);
-          if (sourceBlob) {
+          if (sourceBlob && sourceBlob.size <= MAX_AUDIO_BYTES) {
             arrayBuffer = await sourceBlob.arrayBuffer();
           }
         }
 
+        // 4. Fallback to absolute disk path if known (pure audio only)
+        if (!arrayBuffer && asset.diskPath) {
+          try {
+            const res = await fetch(`/media-library/abs?path=${encodeURIComponent(asset.diskPath)}`);
+            if (res.ok) {
+              const buf = await res.arrayBuffer();
+              if (buf.byteLength <= MAX_AUDIO_BYTES) {
+                arrayBuffer = buf;
+                asset.url = `/media-library/abs?path=${encodeURIComponent(asset.diskPath)}`;
+              }
+            }
+          } catch {}
+        }
+
+        // 5. Fallback to tolerant search by asset name via /media-library/
+        if (!arrayBuffer && asset.name) {
+          const namesToTry = [asset.name];
+          if (!asset.name.includes('.')) {
+            namesToTry.push(`${asset.name}.mp3`, `${asset.name}.wav`, `${asset.name}.m4a`);
+          }
+          for (const nameCandidate of namesToTry) {
+            try {
+              const res = await fetch(`/media-library/${encodeURIComponent(nameCandidate)}`);
+              if (res.ok) {
+                const buf = await res.arrayBuffer();
+                if (buf.byteLength <= MAX_AUDIO_BYTES) {
+                  arrayBuffer = buf;
+                  const resolvedDisk = res.headers.get('x-resolved-disk-path');
+                  if (resolvedDisk) {
+                    asset.diskPath = resolvedDisk;
+                    asset.url = `/media-library/abs?path=${encodeURIComponent(resolvedDisk)}`;
+                  } else {
+                    asset.url = `/media-library/${encodeURIComponent(nameCandidate)}`;
+                  }
+                  break;
+                }
+              }
+            } catch {}
+          }
+        }
+
         if (!arrayBuffer) {
+          this.bufferCache.set(asset.id, null);
           return null;
         }
 
-        // Check format hints
-        const isVideoFormat = asset.type === 'video' ||
-          asset.isVideoContainerAudio ||
-          (asset.name && /\.(mp4|webm|mov|mkv)$/i.test(asset.name)) ||
-          (asset.url && (asset.url.endsWith('.mp4') || asset.url.endsWith('.webm')));
-
         let audioBuffer = null;
 
-        if (isVideoFormat && !asset.isExtractedWav) {
-          // If video container, extract pure WAV first to avoid decoding errors
+        try {
+          const copy = arrayBuffer.slice(0);
+          audioBuffer = await ctx.decodeAudioData(copy);
+        } catch {
           try {
             const wavBlob = await extractAudioTrackToWavBlob(new Blob([arrayBuffer]));
             const wavBuf = await wavBlob.arrayBuffer();
             audioBuffer = await ctx.decodeAudioData(wavBuf);
-          } catch {
-            // Fallback to direct decode with buffer copy (decodeAudioData neuters buffer)
-            const copy = arrayBuffer.slice(0);
-            audioBuffer = await ctx.decodeAudioData(copy);
-          }
-        } else {
-          try {
-            // Slicing prevents neutering original arrayBuffer in case of fallback
-            const copy = arrayBuffer.slice(0);
-            audioBuffer = await ctx.decodeAudioData(copy);
-          } catch {
-            const wavBlob = await extractAudioTrackToWavBlob(new Blob([arrayBuffer]));
-            const wavBuf = await wavBlob.arrayBuffer();
-            audioBuffer = await ctx.decodeAudioData(wavBuf);
-          }
+          } catch {}
         }
 
-        if (audioBuffer) {
-          this.bufferCache.set(asset.id, audioBuffer);
-        }
+        this.bufferCache.set(asset.id, audioBuffer || null);
         return audioBuffer;
       } catch (err) {
         console.warn('AudioMixerEngine: Could not decode audio asset buffer:', asset?.name || asset?.id, err);
+        this.bufferCache.set(asset.id, null);
         return null;
       } finally {
         this.loadingPromises.delete(asset.id);
@@ -181,10 +447,11 @@ class AudioMixerEngine {
   }
 
   /**
-   * Returns true if audio context is active and playback is running.
+   * Returns true only when there are actual audio clips currently outputting sound through Web Audio.
+   * If there are no audio tracks playing, returns false so video hardware clock drives the timeline.
    */
   hasActiveAudio() {
-    return this.isPlaying && !!this.audioCtx && (this.activeSources.size > 0 || this.audioCtx.state === 'running');
+    return this.isPlaying && !!this.audioCtx && this.activeSources.size > 0;
   }
 
   /**
@@ -195,6 +462,18 @@ class AudioMixerEngine {
     const elapsed = this.audioCtx.currentTime - this.audioCtxStartTime;
     if (elapsed < 0) return this.playbackTimelineStartTime;
     return this.playbackTimelineStartTime + elapsed;
+  }
+
+  /**
+   * Resynchronizes the audio timeline base to match a master video clock if drift occurs.
+   */
+  syncClock(masterTimelineTime) {
+    if (!this.isPlaying || !this.audioCtx) return;
+    const cur = this.getHardwareTimelineTime();
+    if (cur !== null && Math.abs(cur - masterTimelineTime) > 0.04) {
+      this.playbackTimelineStartTime = masterTimelineTime;
+      this.audioCtxStartTime = this.audioCtx.currentTime;
+    }
   }
 
   /**
@@ -234,11 +513,12 @@ class AudioMixerEngine {
    * Stops all active audio source nodes immediately.
    */
   stopActiveSources() {
-    for (const { sourceNode, gainNode } of this.activeSources.values()) {
+    for (const { sourceNode, gainNode, pannerNode } of this.activeSources.values()) {
       try {
         sourceNode.onended = null;
         sourceNode.stop();
         sourceNode.disconnect();
+        if (pannerNode) pannerNode.disconnect();
         gainNode.disconnect();
       } catch {}
     }
@@ -259,25 +539,45 @@ class AudioMixerEngine {
   }
 
   /**
-   * Dynamically updates volume and mute for all active tracks and clips without stopping playback.
+   * Dynamically updates volume, solo, mute, EQ, pan, and auto-ducking for all active tracks and clips.
    */
-  updateVolumes(project) {
+  updateVolumes(project, currentTime = null) {
     if (!project || !project.tracks || !this.audioCtx) return;
     const ctx = this.audioCtx;
+    const nowTime = currentTime !== null ? currentTime : (this.getHardwareTimelineTime() ?? this.playbackTimelineStartTime);
 
-    for (const track of project.tracks) {
-      if (track.type === 'audio') {
-        const isTrackMuted = !!track.muted;
-        const trackVolume = track.volume !== undefined ? track.volume : 1.0;
-        const bus = this.getTrackBus(track.id, trackVolume, isTrackMuted);
+    if (project.masterAudio) {
+      this.setMasterVolume(
+        project.masterAudio.volume ?? 1.0,
+        project.masterAudio.muted ?? false
+      );
+    }
 
-        for (const clip of (track.clips || [])) {
-          const entry = this.activeSources.get(clip.id);
-          if (entry && entry.gainNode) {
-            const isMuted = !!clip.muted || isTrackMuted;
-            const clipVol = clip.volume !== undefined ? clip.volume : 1.0;
-            const finalGain = isMuted ? 0 : Math.max(0, Math.min(1, clipVol));
-            entry.gainNode.gain.setValueAtTime(finalGain, ctx.currentTime);
+    const audioTracks = project.tracks.filter(t => t.type === 'audio');
+    const anySoloActive = audioTracks.some(t => Boolean(t.solo));
+
+    // Check if any non-ducked voice/dialogue track is currently playing a clip
+    const isVoicePlayingNow = audioTracks.some(t => {
+      if (t.muted || t.autoDuck) return false;
+      if (anySoloActive && !t.solo) return false;
+      return (t.clips || []).some(c => !c.muted && nowTime >= c.startTime && nowTime < (c.startTime + c.duration));
+    });
+
+    for (const track of audioTracks) {
+      const shouldDuck = Boolean(track.autoDuck && isVoicePlayingNow);
+      const bus = this.getTrackBus(track, anySoloActive, shouldDuck);
+
+      for (const clip of (track.clips || [])) {
+        const entry = this.activeSources.get(clip.id);
+        if (entry && entry.gainNode) {
+          const isMuted = !!clip.muted || bus.isMuted;
+          const clipVol = clip.volume !== undefined ? Number(clip.volume) : 1.0;
+          const envMult = computeClipEnvelopeMultiplier(clip, nowTime);
+          const finalGain = isMuted ? 0 : Math.max(0, Math.min(2.0, clipVol * envMult));
+          entry.gainNode.gain.setTargetAtTime(finalGain, ctx.currentTime, 0.02);
+          if (entry.pannerNode) {
+            const clipPan = Math.max(-1, Math.min(1, Number(clip.pan || 0)));
+            entry.pannerNode.pan.setTargetAtTime(clipPan, ctx.currentTime, 0.02);
           }
         }
       }
@@ -286,7 +586,7 @@ class AudioMixerEngine {
 
   /**
    * Updates multi-track playback state as the timeline advances.
-   * Handles clip boundaries, transitions, and starting newly reached clips dynamically.
+   * Handles clip boundaries, transitions, fade-in/out envelopes, and auto-ducking.
    */
   update(currentTime, project) {
     if (!this.isPlaying || !project || !project.tracks) return;
@@ -294,36 +594,51 @@ class AudioMixerEngine {
     const ctx = this.getContext();
     const assetsMap = new Map((project.assets || []).map(a => [a.id, a]));
     const audioTracks = project.tracks.filter(t => t.type === 'audio');
+    const anySoloActive = audioTracks.some(t => Boolean(t.solo));
+
+    const isVoicePlayingNow = audioTracks.some(t => {
+      if (t.muted || t.autoDuck) return false;
+      if (anySoloActive && !t.solo) return false;
+      return (t.clips || []).some(c => !c.muted && currentTime >= c.startTime && currentTime < (c.startTime + c.duration));
+    });
 
     const LOOKAHEAD = 0.35; // 350ms lookahead for gapless transitions
     const validClipIds = new Set();
 
     for (const track of audioTracks) {
-      const isTrackMuted = !!track.muted;
-      const trackVolume = track.volume !== undefined ? track.volume : 1.0;
-      const trackBus = this.getTrackBus(track.id, trackVolume, isTrackMuted);
+      const shouldDuck = Boolean(track.autoDuck && isVoicePlayingNow);
+      const trackBus = this.getTrackBus(track, anySoloActive, shouldDuck);
 
       for (const clip of (track.clips || [])) {
         const start = clip.startTime;
         const end = clip.startTime + clip.duration;
 
-        // Clip is relevant if it's currently active OR starting within the lookahead window
         const isCurrentlyActive = (currentTime >= start && currentTime < end);
         const isUpcoming = (!isCurrentlyActive && start > currentTime && start <= (currentTime + LOOKAHEAD));
 
         if (isCurrentlyActive || isUpcoming) {
           validClipIds.add(clip.id);
 
-          // If not yet scheduled/playing, schedule it now
-          if (!this.activeSources.has(clip.id)) {
+          if (this.activeSources.has(clip.id)) {
+            // Update envelope fade-in / fade-out and pan in real time
+            const entry = this.activeSources.get(clip.id);
+            if (entry && entry.gainNode) {
+              const isMuted = !!clip.muted || trackBus.isMuted;
+              const clipVol = clip.volume !== undefined ? Number(clip.volume) : 1.0;
+              const envMult = isCurrentlyActive ? computeClipEnvelopeMultiplier(clip, currentTime) : 1.0;
+              const finalGain = isMuted ? 0 : Math.max(0, Math.min(2.0, clipVol * envMult));
+              entry.gainNode.gain.setTargetAtTime(finalGain, ctx.currentTime, 0.03);
+            }
+          } else {
             const asset = assetsMap.get(clip.assetId);
             if (!asset) continue;
 
-            const buffer = this.bufferCache.get(asset.id);
-            if (buffer) {
-              this.scheduleClipNode(clip, buffer, currentTime, trackBus);
+            if (this.bufferCache.has(asset.id)) {
+              const buffer = this.bufferCache.get(asset.id);
+              if (buffer) {
+                this.scheduleClipNode(clip, buffer, currentTime, trackBus);
+              }
             } else {
-              // Asynchronously decode and schedule
               const session = this.playbackSessionId;
               this.loadAssetBuffer(asset).then((decodedBuf) => {
                 if (session !== this.playbackSessionId) return;
@@ -349,6 +664,7 @@ class AudioMixerEngine {
           item.sourceNode.onended = null;
           item.sourceNode.stop();
           item.sourceNode.disconnect();
+          if (item.pannerNode) item.pannerNode.disconnect();
           item.gainNode.disconnect();
         } catch {}
         this.activeSources.delete(clipId);
@@ -366,46 +682,66 @@ class AudioMixerEngine {
     try {
       const sourceNode = ctx.createBufferSource();
       sourceNode.buffer = buffer;
+      const speed = Number(clip.playbackRate || 1.0);
+      if (speed !== 1.0) {
+        sourceNode.playbackRate.value = speed;
+      }
 
       const clipGain = ctx.createGain();
       const isMuted = !!clip.muted || !!trackBus.isMuted;
-      const clipVol = clip.volume !== undefined ? clip.volume : 1.0;
-      clipGain.gain.setValueAtTime(isMuted ? 0 : Math.max(0, Math.min(1, clipVol)), ctx.currentTime);
+      const clipVol = clip.volume !== undefined ? Number(clip.volume) : 1.0;
+      const envMult = computeClipEnvelopeMultiplier(clip, currentTime);
+      clipGain.gain.setValueAtTime(isMuted ? 0 : Math.max(0, Math.min(2.0, clipVol * envMult)), ctx.currentTime);
 
-      sourceNode.connect(clipGain);
-      clipGain.connect(trackBus.gainNode);
+      let pannerNode = null;
+      if (typeof ctx.createStereoPanner === 'function') {
+        pannerNode = ctx.createStereoPanner();
+        pannerNode.pan.value = Math.max(-1, Math.min(1, Number(clip.pan || 0)));
+        sourceNode.connect(pannerNode);
+        pannerNode.connect(clipGain);
+      } else {
+        sourceNode.connect(clipGain);
+      }
+
+      clipGain.connect(trackBus.inputNode || trackBus.gainNode);
 
       const deltaToStart = clip.startTime - this.playbackTimelineStartTime;
       const scheduledCtxTime = this.audioCtxStartTime + deltaToStart;
 
       if (scheduledCtxTime <= ctx.currentTime) {
-        // Active clip: calculate current offset
         const elapsedSinceStart = ctx.currentTime - scheduledCtxTime;
-        const targetOffset = (clip.sourceStart || 0) + elapsedSinceStart;
+        const targetOffset = (clip.sourceStart || 0) + (elapsedSinceStart * speed);
         const remainingDuration = clip.duration - elapsedSinceStart;
 
         if (remainingDuration <= 0.02 || targetOffset >= (buffer.duration - 0.02)) return;
 
         const safeOffset = Math.max(0, Math.min(buffer.duration - 0.01, targetOffset));
-        const safeDuration = Math.max(0.01, Math.min(buffer.duration - safeOffset, remainingDuration));
+        const safeDuration = Math.max(0.01, Math.min((buffer.duration - safeOffset) / speed, remainingDuration));
 
-        sourceNode.start(0, safeOffset, safeDuration);
+        sourceNode.start(0, safeOffset, safeDuration * speed);
       } else {
-        // Upcoming clip in lookahead window: schedule sample-accurately at future time
         if ((clip.sourceStart || 0) >= (buffer.duration - 0.02)) return;
         const safeOffset = Math.max(0, Math.min(buffer.duration - 0.01, clip.sourceStart || 0));
-        const safeDuration = Math.max(0.01, Math.min(buffer.duration - safeOffset, clip.duration));
+        const safeDuration = Math.max(0.01, Math.min((buffer.duration - safeOffset) / speed, clip.duration));
 
-        sourceNode.start(scheduledCtxTime, safeOffset, safeDuration);
+        sourceNode.start(scheduledCtxTime, safeOffset, safeDuration * speed);
       }
 
-      const entry = { sourceNode, gainNode: clipGain, clipId: clip.id, trackId: trackBus.trackId };
+      const entry = {
+        sourceNode,
+        gainNode: clipGain,
+        pannerNode,
+        clip,
+        clipId: clip.id,
+        trackId: trackBus.trackId
+      };
       this.activeSources.set(clip.id, entry);
 
       sourceNode.onended = () => {
         if (this.activeSources.get(clip.id)?.sourceNode === sourceNode) {
           try {
             sourceNode.disconnect();
+            if (pannerNode) pannerNode.disconnect();
             clipGain.disconnect();
           } catch {}
           this.activeSources.delete(clip.id);

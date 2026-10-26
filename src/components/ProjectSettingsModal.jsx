@@ -200,7 +200,10 @@ export function ProjectSettingsModal({ isOpen, onClose, project, onUpdateSetting
             </div>
 
             <p style={{ fontSize: '11px', color: 'var(--text-secondary)', margin: '0 0 10px 0' }}>
-              Los videos B-roll, clips descargados y medios de este proyecto se guardarán en esta carpeta local específica:
+              Los videos B-roll, clips descargados y medios de este proyecto se guardarán en{' '}
+              <strong style={{ color: '#38bdf8', fontFamily: 'monospace' }}>
+                {folderStats?.mediaDir ? `${folderStats.mediaDir.replace(/\/+$/, '')}/${effectiveFolder}/` : `projects_media/${effectiveFolder}/`}
+              </strong>:
             </p>
 
             <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
@@ -213,7 +216,12 @@ export function ProjectSettingsModal({ isOpen, onClose, project, onUpdateSetting
                 border: '1px solid var(--border-subtle)',
                 flex: 1
               }}>
-                <span style={{ fontSize: '12px', color: 'var(--text-dim)', fontFamily: 'monospace' }}>projects_media/</span>
+                <span
+                  style={{ fontSize: '12px', color: 'var(--text-dim)', fontFamily: 'monospace' }}
+                  title={`Ruta base configurada: ${folderStats?.mediaDir || 'projects_media'}`}
+                >
+                  {(folderStats?.mediaDir ? folderStats.mediaDir.split('/').filter(Boolean).pop() : 'projects_media')}/
+                </span>
                 <input
                   type="text"
                   className="input-field"

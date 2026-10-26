@@ -1,5 +1,11 @@
 import { initializeApp } from 'firebase/app';
-import { getAuth } from 'firebase/auth';
+import {
+  getAuth,
+  initializeAuth,
+  indexedDBLocalPersistence,
+  browserLocalPersistence
+} from 'firebase/auth';
+import { getFirestore } from 'firebase/firestore';
 
 // Web app's Firebase configuration with optional environment variable overrides
 const firebaseConfig = {
@@ -14,5 +20,19 @@ const firebaseConfig = {
 // Initialize Firebase
 export const app = initializeApp(firebaseConfig);
 
-// Initialize Firebase Authentication
-export const auth = getAuth(app);
+// Initialize Firebase Authentication with explicit persistent storage across app restarts
+let authInstance;
+try {
+  authInstance = initializeAuth(app, {
+    persistence: [indexedDBLocalPersistence, browserLocalPersistence]
+  });
+} catch (_) {
+  authInstance = getAuth(app);
+}
+
+export const auth = authInstance;
+
+// Initialize Cloud Firestore
+export const db = getFirestore(app);
+
+

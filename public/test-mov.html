@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head><title>Test MOV</title></head>
+<body>
+<h1>Testing MOV Playback</h1>
+<video id="v1" controls style="width:320px;height:180px;background:#000;"></video>
+<video id="v2" controls style="width:320px;height:180px;background:#000;"></video>
+<div id="log"></div>
+<script>
+const log = document.getElementById('log');
+function addLog(msg) {
+  console.log(msg);
+  log.innerHTML += '<p>' + msg + '</p>';
+}
+
+// 1. Test video/quicktime
+const v1 = document.getElementById('v1');
+v1.onloadedmetadata = () => addLog('V1 (video/quicktime) metadata loaded! dur=' + v1.duration);
+v1.onerror = () => addLog('V1 (video/quicktime) error: ' + (v1.error ? v1.error.code + ' ' + v1.error.message : 'unknown'));
+
+// 2. Test video/mp4 MIME on the exact same .mov file
+const v2 = document.getElementById('v2');
+v2.onloadedmetadata = () => addLog('V2 (video/mp4 MIME) metadata loaded! dur=' + v2.duration);
+v2.onerror = () => addLog('V2 (video/mp4 MIME) error: ' + (v2.error ? v2.error.code + ' ' + v2.error.message : 'unknown'));
+
+fetch('/media-library/abs?path=/tmp/test_h264.mov')
+  .then(r => r.arrayBuffer())
+  .then(buf => {
+    addLog('Fetched .mov file: ' + buf.byteLength + ' bytes');
+    const blobQuicktime = new Blob([buf], { type: 'video/quicktime' });
+    const blobMp4 = new Blob([buf], { type: 'video/mp4' });
+    v1.src = URL.createObjectURL(blobQuicktime);
+    v2.src = URL.createObjectURL(blobMp4);
+  })
+  .catch(err => addLog('Fetch failed: ' + err.message));
+</script>
+</body>
+</html>

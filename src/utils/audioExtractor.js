@@ -21,15 +21,25 @@ export async function extract16kMonoAudio(source, onProgress = null, includeWavB
   if (source instanceof Blob || source instanceof File) {
     arrayBuffer = await source.arrayBuffer();
   } else if (typeof source === 'string') {
-    const res = await fetch(source);
+    let fetchUrl = source;
+    // Automatically route video absolute paths to lightweight server audio extractor (~150 KB instead of 300+ MB)
+    if (fetchUrl.includes('/media-library/abs?path=') && !fetchUrl.includes('/media-library/audio')) {
+      const audioCandidate = fetchUrl.replace('/media-library/abs?', '/media-library/audio?');
+      try {
+        const headRes = await fetch(audioCandidate, { method: 'HEAD' });
+        if (headRes.ok) {
+          fetchUrl = audioCandidate;
+        }
+      } catch (_) {}
+    }
+    const res = await fetch(fetchUrl);
     arrayBuffer = await res.arrayBuffer();
   } else {
     throw new Error('Formato de recurso no compatible para extracción de audio');
   }
 
-  if (onProgress) {
-    onProgress(30);
-    await new Promise((r) => setTimeout(r, 0));
+  if (arrayBuffer && arrayBuffer.byteLength > 30 * 1024 * 1024) {
+    throw new Error('El archivo multimedia supera el límite seguro de decodificación en navegador (30 MB). Utilice la extracción acelerada de audio del servidor.');
   }
 
   // Decode audio data using browser native AudioContext
@@ -231,13 +241,25 @@ export async function extractAudioTrackToWavBlob(source) {
   if (source instanceof Blob || source instanceof File) {
     arrayBuffer = await source.arrayBuffer();
   } else if (typeof source === 'string') {
-    const res = await fetch(source);
+    let fetchUrl = source;
+    if (fetchUrl.includes('/media-library/abs?path=') && !fetchUrl.includes('/media-library/audio')) {
+      const audioCandidate = fetchUrl.replace('/media-library/abs?', '/media-library/audio?');
+      try {
+        const headRes = await fetch(audioCandidate, { method: 'HEAD' });
+        if (headRes.ok) fetchUrl = audioCandidate;
+      } catch (_) {}
+    }
+    const res = await fetch(fetchUrl);
     if (!res.ok) {
       throw new Error(`Error HTTP al obtener recurso para extracción: ${res.status}`);
     }
     arrayBuffer = await res.arrayBuffer();
   } else {
     throw new Error('Formato no compatible para extracción de audio');
+  }
+
+  if (arrayBuffer && arrayBuffer.byteLength > 30 * 1024 * 1024) {
+    throw new Error('El archivo multimedia supera el límite seguro de decodificación en memoria (30 MB).');
   }
 
   const AudioContextClass = window.AudioContext || window.webkitAudioContext;

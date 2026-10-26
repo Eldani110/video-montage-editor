@@ -120,9 +120,9 @@ async function _internalBuildVisualCandidateCollage({
 
   const count = Math.min(candidates.length, 20);
 
-  // Dynamic canvas sizing: if up to 20 candidates, use expansive 1640x1120 canvas
-  const finalWidth = width || (count > 12 ? 1640 : (count > 8 ? 1440 : 1200));
-  const finalHeight = height || (count > 12 ? 1120 : (count > 8 ? 860 : 760));
+  // Dynamic canvas sizing: optimized resolution to minimize Ollama Cloud vision patch tiles while preserving sharp detail
+  const finalWidth = width || (count > 12 ? 1440 : (count > 6 ? 1160 : 960));
+  const finalHeight = height || (count > 12 ? 960 : (count > 6 ? 680 : 580));
 
   const canvas = document.createElement('canvas');
   canvas.width = finalWidth;
@@ -365,7 +365,7 @@ async function _internalBuildVisualCandidateCollage({
     });
   }
 
-  const collageDataUrl = canvas.toDataURL('image/jpeg', 0.84);
+  const collageDataUrl = canvas.toDataURL('image/jpeg', 0.80);
   const base64Jpeg = collageDataUrl.replace(/^data:image\/jpeg;base64,/, '');
 
   return {
@@ -472,4 +472,187 @@ export async function buildVisualCandidateCollage(params) {
     console.warn('[VisualCollageBuilder] Error durante generación de collage visual:', err.message);
     return buildFallbackCandidateCollage(params);
   }
+}
+
+/**
+ * Builds a Dual-Scene Composite Visual Collage (Solution 1: Mosaico Dual):
+ * Renders up to 4 candidates for Scene A on the top half and up to 4 candidates for Scene B on the bottom half.
+ * Allows Vision AI in Ollama Cloud to evaluate TWO scenes in a single request, cutting requests by 50%.
+ *
+ * @param {object} params
+ * @param {object} params.sceneA Scene A metadata
+ * @param {Array<object>} params.candidatesA Candidates for Scene A (up to 4)
+ * @param {object} params.sceneB Scene B metadata
+ * @param {Array<object>} params.candidatesB Candidates for Scene B (up to 4)
+ * @returns {Promise<{ collageDataUrl: string, base64Jpeg: string, candidateMapA: Array, candidateMapB: Array }>}
+ */
+export async function buildDualSceneVisualCollage({
+  sceneA,
+  candidatesA = [],
+  sceneB = null,
+  candidatesB = []
+}) {
+  if (typeof document === 'undefined') {
+    throw new Error('Canvas collage building requires browser DOM environment.');
+  }
+
+  const width = 1280;
+  const height = 840;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+
+  // Background
+  const bgGrad = ctx.createLinearGradient(0, 0, width, height);
+  bgGrad.addColorStop(0, '#090d16');
+  bgGrad.addColorStop(1, '#05070c');
+  ctx.fillStyle = bgGrad;
+  ctx.fillRect(0, 0, width, height);
+
+  // Preload all candidate images in parallel (up to 12 per scene = 24 total)
+  const allCandidates = [...candidatesA.slice(0, 12), ...(candidatesB ? candidatesB.slice(0, 12) : [])];
+  const preloadPromise = Promise.all(
+    allCandidates.map(async (candidate) => {
+      const src = candidate.thumbnail || candidate.previewUrl || candidate.keyFrames?.[0];
+      return loadSafeImage(src, 3000);
+    })
+  );
+  const timeoutPreload = new Promise((resolve) => setTimeout(() => resolve([]), 4200));
+  const preloadedImages = await Promise.race([preloadPromise, timeoutPreload]);
+
+  const candidateMapA = [];
+  const candidateMapB = [];
+
+  // Helper to render one scene section with up to 12 candidates in a 2x6 grid
+  const renderSceneSection = (scene, candidates, startIdx, yOffset, themeColor, sectionLabel) => {
+    const headerHeight = 38;
+
+    // Header Background
+    ctx.fillStyle = 'rgba(15, 23, 42, 0.9)';
+    ctx.fillRect(0, yOffset, width, headerHeight);
+
+    // Accent line
+    ctx.fillStyle = themeColor;
+    ctx.fillRect(0, yOffset, width, 3);
+
+    // Header text
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 14px "Inter", sans-serif';
+    const sceneText = `[ESCENA ${sectionLabel}: #${scene.sceneNumber || 1}] ${scene.title || 'Secuencia'}`;
+    ctx.fillText(sceneText, 16, yOffset + 21);
+
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = 'italic 10px "Inter", sans-serif';
+    const scriptSnippet = (scene.scriptText || scene.visualDescription || '').substring(0, 100);
+    ctx.fillText(`Guion: "${scriptSnippet}..."`, 16, yOffset + 33);
+
+    // Section Badge
+    const badgeText = `${sectionLabel.toUpperCase()} (Elegir [${sectionLabel}1 - ${sectionLabel}${candidates.length}])`;
+    ctx.fillStyle = themeColor;
+    ctx.font = 'bold 11px monospace';
+    const badgeW = ctx.measureText(badgeText).width + 12;
+    ctx.fillRect(width - badgeW - 16, yOffset + 9, badgeW, 20);
+    ctx.fillStyle = '#090d16';
+    ctx.fillText(badgeText, width - badgeW - 10, yOffset + 23);
+
+    // Render candidate cards in a 2-row x 6-column grid (up to 12 candidates per scene)
+    const count = Math.min(candidates.length, 12);
+    const cols = 6;
+    const marginX = 14;
+    const marginY = 6;
+    const gapX = 10;
+    const gapY = 8;
+    const availableW = width - (marginX * 2) - ((cols - 1) * gapX);
+    const cellW = availableW / cols;
+    const cellH = 168;
+
+    for (let cIdx = 0; cIdx < count; cIdx++) {
+      const candidate = candidates[cIdx];
+      const img = preloadedImages[startIdx + cIdx];
+      const col = cIdx % cols;
+      const row = Math.floor(cIdx / cols);
+      const cellX = marginX + col * (cellW + gapX);
+      const cellY = yOffset + headerHeight + marginY + row * (cellH + gapY);
+
+      // Card background
+      ctx.fillStyle = 'rgba(30, 41, 59, 0.7)';
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.12)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      if (ctx.roundRect) ctx.roundRect(cellX, cellY, cellW, cellH, 6);
+      else ctx.rect(cellX, cellY, cellW, cellH);
+      ctx.fill();
+      ctx.stroke();
+
+      // Top label badge: [A1] or [B1]
+      const labelBadge = `[${sectionLabel}${cIdx + 1}]`;
+      ctx.fillStyle = themeColor;
+      ctx.fillRect(cellX + 6, cellY + 5, 42, 20);
+      ctx.fillStyle = '#090d16';
+      ctx.font = 'bold 11px monospace';
+      ctx.fillText(labelBadge, cellX + 10, cellY + 19);
+
+      // Provider / type tag
+      ctx.fillStyle = '#64748b';
+      ctx.font = '9px monospace';
+      ctx.fillText(`${(candidate.provider || 'stock').toUpperCase()} • ${(candidate.type || 'video').toUpperCase()}`, cellX + 52, cellY + 19);
+
+      // Media area (16:9 ratio preview)
+      const mediaY = cellY + 28;
+      const mediaH = cellH - 28 - 20;
+      const mediaW = cellW - 12;
+
+      if (img) {
+        drawImageCover(ctx, img, cellX + 6, mediaY, mediaW, mediaH, 4);
+      } else {
+        ctx.fillStyle = '#1e293b';
+        ctx.fillRect(cellX + 6, mediaY, mediaW, mediaH);
+        ctx.fillStyle = '#475569';
+        ctx.font = '10px sans-serif';
+        ctx.fillText('Vista previa', cellX + 14, mediaY + 24);
+      }
+
+      // Title bar at bottom
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
+      ctx.fillRect(cellX + 6, cellY + cellH - 18, mediaW, 16);
+      ctx.fillStyle = '#cbd5e1';
+      ctx.font = '9px sans-serif';
+      const cleanTitle = (candidate.title || `Recurso ${cIdx + 1}`).substring(0, 26);
+      ctx.fillText(cleanTitle, cellX + 10, cellY + cellH - 6);
+
+      const mapping = {
+        label: `${sectionLabel}${cIdx + 1}`,
+        index: cIdx + 1,
+        id: candidate.id,
+        title: candidate.title,
+        mediaItem: candidate
+      };
+
+      if (sectionLabel === 'A') candidateMapA.push(mapping);
+      else candidateMapB.push(mapping);
+    }
+  };
+
+  // Render Section A (Top, up to 12 candidates in 2x6 grid)
+  renderSceneSection(sceneA, candidatesA.slice(0, 12), 0, 0, '#06b6d4', 'A');
+
+  // Divider line
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.2)';
+  ctx.fillRect(0, 412, width, 3);
+
+  // Render Section B (Bottom, up to 12 candidates in 2x6 grid)
+  if (sceneB && candidatesB && candidatesB.length > 0) {
+    renderSceneSection(sceneB, candidatesB.slice(0, 12), candidatesA.slice(0, 12).length, 420, '#a855f7', 'B');
+  }
+
+  const collageDataUrl = canvas.toDataURL('image/jpeg', 0.80);
+  const base64Jpeg = collageDataUrl.replace(/^data:image\/jpeg;base64,/, '');
+
+  return {
+    collageDataUrl,
+    base64Jpeg,
+    candidateMapA,
+    candidateMapB
+  };
 }

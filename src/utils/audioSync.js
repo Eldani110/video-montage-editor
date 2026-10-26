@@ -1,4 +1,4 @@
-/**
+ź/**
  * Secondary Audio Synchronizer for Montage Pro Studio
  * Handles independent audio tracks (voiceover, dialogue, background music, sound effects,
  * and extracted/separated video audio) with sample-accurate timeline clock synchronization.

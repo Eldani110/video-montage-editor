@@ -18,7 +18,8 @@ import {
   Play,
   Settings,
   Unlink,
-  Database
+  Database,
+  ExternalLink
 } from 'lucide-react';
 import {
   isFileSystemAccessSupported,
@@ -26,11 +27,14 @@ import {
   scanDirectoryForProjects,
   readProjectFromFile,
   exportProjectAsDownload,
-  verifyDirectoryPermission
+  verifyDirectoryPermission,
+  deleteProjectFromDirectoryHandle,
+  saveProjectToDisk
 } from '../utils/fileSystem';
 import {
   getAllCachedProjects,
   deleteCachedProject,
+  deleteCachedProjectByFileName,
   saveProjectToCache,
   saveStoredDirectoryHandle,
   getStoredDirectoryHandle,
@@ -40,66 +44,171 @@ import {
 import { createNewProjectTemplate } from '../utils/sampleData';
 import { NewProjectModal } from './NewProjectModal';
 import { GlobalSettingsModal } from './GlobalSettingsModal';
+import { FolderPickerModal } from './FolderPickerModal';
 import { UserNav } from './UserNav';
+import { useAuth } from '../context/AuthContext';
+import { saveDeviceMediaDir } from '../services/userSettingsService';
+import { getCurrentDeviceInfo } from '../services/deviceService';
+import { getStorageConfig } from '../utils/stockMediaClient';
+import {
+  isElectronDesktop,
+  pickDesktopFolder,
+  openFolderInOS,
+  fetchDiskProjects,
+  saveDiskProject,
+  deleteDiskProject
+} from '../services/localProjectService';
 
 export function HomePage({ onOpenProject, currentDirHandle, setCurrentDirHandle, onGoToAuth }) {
+  const { user } = useAuth();
   const [folderProjects, setFolderProjects] = useState([]);
   const [cachedProjects, setCachedProjects] = useState([]);
   const [isScanning, setIsScanning] = useState(false);
-  const [directoryName, setDirectoryName] = useState(currentDirHandle?.name || getStoredDirectoryNameFallback() || null);
+  const [localFolderPath, setLocalFolderPath] = useState(null);
+  const [directoryName, setDirectoryName] = useState(currentDirHandle?.name || (user ? getStoredDirectoryNameFallback() : null) || null);
   const [needsPermission, setNeedsPermission] = useState(false);
   const [showNewModal, setShowNewModal] = useState(false);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
-  const [activeTab, setActiveTab] = useState('all'); // 'all', 'folder', 'cached'
+  const [showFolderPickerModal, setShowFolderPickerModal] = useState(false);
 
   const fileInputRef = useRef(null);
   const folderInputRef = useRef(null);
 
-  // Load cached projects and persistent directory from IndexedDB on start
+  // Load cached projects and persistent local system directory on start
   useEffect(() => {
+    document.title = 'Mis Proyectos • Montage Studio';
     loadCachedProjectsList();
 
     const initDirectory = async () => {
-      let handle = currentDirHandle;
-      if (!handle) {
-        const stored = await getStoredDirectoryHandle();
-        if (stored && stored.handle) {
-          handle = stored.handle;
-          setCurrentDirHandle(handle);
-          setDirectoryName(stored.name || handle.name);
-        } else {
-          const fallbackName = getStoredDirectoryNameFallback();
-          if (fallbackName) {
-            setDirectoryName(fallbackName);
+      setIsScanning(true);
+      try {
+        // 1. When NO user is authenticated (guest mode or before login):
+        if (!user) {
+          const savedLocalDir = (typeof localStorage !== 'undefined' ? localStorage.getItem('montage_device_local_dir') : null);
+          if (savedLocalDir && typeof savedLocalDir === 'string' && savedLocalDir.trim()) {
+            const cleanDir = savedLocalDir.trim();
+            setLocalFolderPath(cleanDir);
+            const simpleName = cleanDir.split(/[/\\]/).filter(Boolean).pop() || cleanDir;
+            setDirectoryName(simpleName);
+            setNeedsPermission(false);
+            const diskRes = await fetchDiskProjects(cleanDir);
+            if (diskRes.success) {
+              setFolderProjects(diskRes.projects);
+            }
+            setIsScanning(false);
+            return;
           }
-        }
-      }
 
-      if (handle) {
-        setDirectoryName(handle.name);
-        scanFolder(handle, false);
+          let handle = currentDirHandle;
+          if (!handle) {
+            const stored = await getStoredDirectoryHandle();
+            if (stored && stored.handle) {
+              handle = stored.handle;
+              setCurrentDirHandle(handle);
+              setDirectoryName(stored.name || handle.name);
+            }
+          }
+
+          if (handle) {
+            setDirectoryName(handle.name);
+            await scanHandleFolder(handle, false);
+          } else {
+            // Clean empty state: no folder preselected in incognito / guest mode!
+            setLocalFolderPath(null);
+            setDirectoryName(null);
+            setFolderProjects([]);
+            setNeedsPermission(false);
+          }
+          setIsScanning(false);
+          return;
+        }
+
+        // 2. When user IS authenticated: restore only this user's registered folder for this device
+        const savedUserDir = (typeof localStorage !== 'undefined' ? localStorage.getItem('montage_device_local_dir') : null);
+        if (savedUserDir && typeof savedUserDir === 'string' && savedUserDir.trim()) {
+          const cleanDir = savedUserDir.trim();
+          setLocalFolderPath(cleanDir);
+          const simpleName = cleanDir.split(/[/\\]/).filter(Boolean).pop() || cleanDir;
+          setDirectoryName(simpleName);
+          setNeedsPermission(false);
+
+          const diskRes = await fetchDiskProjects(cleanDir);
+          if (diskRes.success) {
+            setFolderProjects(diskRes.projects);
+          }
+        } else {
+          // Authenticated user with no folder registered for this device yet
+          setLocalFolderPath(null);
+          setDirectoryName(null);
+          setFolderProjects([]);
+          setNeedsPermission(false);
+        }
+      } catch (err) {
+        console.warn('Error initializing project directory:', err);
+      } finally {
+        setIsScanning(false);
       }
     };
 
     initDirectory();
-  }, [currentDirHandle]);
+
+    // Listen for device folder synchronization events (e.g. from Global Settings Modal or Login)
+    const handleDeviceFolderSynced = (e) => {
+      if (e.detail?.baseMediaDir) {
+        const newPath = e.detail.baseMediaDir;
+        setLocalFolderPath(newPath);
+        const simpleName = newPath.split(/[/\\]/).filter(Boolean).pop() || newPath;
+        setDirectoryName(simpleName);
+        setNeedsPermission(false);
+        rescanDiskFolder(newPath);
+      } else {
+        // baseMediaDir is null (e.g. on logout or user unlinking folder)
+        setLocalFolderPath(null);
+        setDirectoryName(null);
+        setFolderProjects([]);
+        setNeedsPermission(false);
+      }
+    };
+
+    window.addEventListener('montage_device_folder_synced', handleDeviceFolderSynced);
+    return () => {
+      window.removeEventListener('montage_device_folder_synced', handleDeviceFolderSynced);
+    };
+  }, [user, currentDirHandle]);
 
   const loadCachedProjectsList = async () => {
-    const list = await getAllCachedProjects();
-    setCachedProjects(list);
-    // If no projects in cache, create and cache a starter demo project so projects are always available out of the box
-    if (list.length === 0) {
-      try {
-        const demo = createNewProjectTemplate('Mi Primer Montaje');
-        await saveProjectToCache(demo, 'Demostración');
-        const refreshed = await getAllCachedProjects();
-        setCachedProjects(refreshed);
-      } catch (_) {}
+    try {
+      const list = await getAllCachedProjects();
+      setCachedProjects(list || []);
+    } catch (_) {
+      setCachedProjects([]);
     }
   };
 
-  // Scan local directory for .vproj and .json files
-  const scanFolder = async (dirHandle, userTriggered = false) => {
+  // Rescan disk projects from the local system folder
+  const rescanDiskFolder = async (targetDir = null) => {
+    setIsScanning(true);
+    try {
+      const dirToScan = targetDir || localFolderPath;
+      if (dirToScan) {
+        const diskRes = await fetchDiskProjects(dirToScan);
+        if (diskRes.success) {
+          setFolderProjects(diskRes.projects);
+          return;
+        }
+      }
+      if (currentDirHandle) {
+        await scanHandleFolder(currentDirHandle, true);
+      }
+    } catch (err) {
+      console.warn('Error rescanning local folder:', err);
+    } finally {
+      setIsScanning(false);
+    }
+  };
+
+  // Scan browser handle for .vproj and .json files
+  const scanHandleFolder = async (dirHandle, userTriggered = false) => {
     if (!dirHandle) return;
     setIsScanning(true);
     try {
@@ -113,15 +222,8 @@ export function HomePage({ onOpenProject, currentDirHandle, setCurrentDirHandle,
       const list = await scanDirectoryForProjects(dirHandle);
       setFolderProjects(list);
       setDirectoryName(dirHandle.name);
-
-      // Sincronizar en caché local de IndexedDB con la carpeta asignada
-      for (const p of list) {
-        if (p.projectData) {
-          saveProjectToCache(p.projectData, dirHandle.name);
-        }
-      }
     } catch (err) {
-      console.error('Error scanning folder:', err);
+      console.error('Error scanning folder handle:', err);
       if (err.name === 'NotAllowedError') {
         setNeedsPermission(true);
       }
@@ -130,26 +232,50 @@ export function HomePage({ onOpenProject, currentDirHandle, setCurrentDirHandle,
     }
   };
 
-  // Pick folder using File System Access API and save to IndexedDB
-  const handleSelectFolder = async () => {
+  // Pick folder: Opens in-app folder picker directly (with native OS explorer button available inside for Desktop)
+  const handleSelectFolder = () => {
+    setShowFolderPickerModal(true);
+  };
+
+  // Applies a real filesystem path to the current device and persists it
+  const applySelectedLocalPath = async (newPath) => {
+    if (!newPath) return;
+    const cleanPath = newPath.trim();
+    if (!cleanPath) return;
+    setIsScanning(true);
     try {
-      const dirHandle = await pickLocalDirectory();
-      setCurrentDirHandle(dirHandle);
-      setDirectoryName(dirHandle.name);
+      setLocalFolderPath(cleanPath);
+      const simpleName = cleanPath.split(/[/\\]/).filter(Boolean).pop() || cleanPath;
+      setDirectoryName(simpleName);
       setNeedsPermission(false);
-      // Guardar en la base de datos local (IndexedDB)
-      await saveStoredDirectoryHandle(dirHandle);
-      await scanFolder(dirHandle, true);
+
+      // Persist to local machine disk and user account in Firestore for this hardware device
+      await saveDeviceMediaDir(user, cleanPath);
+
+      // Fetch projects immediately from this folder
+      const diskRes = await fetchDiskProjects(cleanPath);
+      if (diskRes.success) {
+        setFolderProjects(diskRes.projects);
+        for (const p of diskRes.projects) {
+          if (p.projectData) {
+            saveProjectToCache(p.projectData, simpleName);
+          }
+        }
+      }
       await loadCachedProjectsList();
     } catch (err) {
-      if (err.name !== 'AbortError') {
-        console.warn('Directory picker cancelled or error:', err);
-      }
+      console.error('Error applying selected local folder path:', err);
+    } finally {
+      setIsScanning(false);
     }
   };
 
   // Reconectar acceso si el navegador requiere confirmación
   const handleConnectFolder = async () => {
+    if (localFolderPath) {
+      await rescanDiskFolder(localFolderPath);
+      return;
+    }
     let handle = currentDirHandle;
     if (!handle) {
       const stored = await getStoredDirectoryHandle();
@@ -166,7 +292,7 @@ export function HomePage({ onOpenProject, currentDirHandle, setCurrentDirHandle,
       const granted = await verifyDirectoryPermission(handle, true, false);
       if (granted) {
         setNeedsPermission(false);
-        await scanFolder(handle, true);
+        await scanHandleFolder(handle, true);
         await loadCachedProjectsList();
       } else {
         handleSelectFolder();
@@ -180,19 +306,46 @@ export function HomePage({ onOpenProject, currentDirHandle, setCurrentDirHandle,
   // Desvincular carpeta de la base de datos local
   const handleClearFolder = async () => {
     setCurrentDirHandle(null);
+    setLocalFolderPath(null);
     setDirectoryName(null);
     setFolderProjects([]);
     setNeedsPermission(false);
     await clearStoredDirectoryHandle();
+    try {
+      localStorage.removeItem('montage_device_local_dir');
+    } catch (_) {}
   };
 
-  // Create new project and associate with current directory in IndexedDB
+  // Create new project and associate with current directory on disk and in cache
   const handleCreateNewProject = async (newProj) => {
     if (directoryName) {
       newProj.directoryName = directoryName;
     }
+    // 1. Guardar en caché local
     await saveProjectToCache(newProj, directoryName);
+
+    // 2. Guardar archivo físico .vproj en la carpeta local del sistema
+    if (localFolderPath) {
+      try {
+        const diskRes = await saveDiskProject(newProj, { dir: localFolderPath });
+        if (diskRes.success) {
+          newProj.filePath = diskRes.filePath;
+          newProj.fileName = diskRes.fileName;
+        }
+      } catch (_) {}
+    } else if (currentDirHandle) {
+      try {
+        const handleRes = await saveProjectToDisk(newProj, currentDirHandle);
+        if (handleRes?.success && handleRes.fileName) {
+          newProj.fileName = handleRes.fileName;
+        }
+      } catch (_) {}
+    }
+
     await loadCachedProjectsList();
+    if (localFolderPath) {
+      await rescanDiskFolder(localFolderPath);
+    }
     onOpenProject(newProj);
   };
 
@@ -241,6 +394,8 @@ export function HomePage({ onOpenProject, currentDirHandle, setCurrentDirHandle,
 
     try {
       const project = await readProjectFromFile(file);
+      await saveProjectToCache(project, directoryName);
+      await loadCachedProjectsList();
       onOpenProject(project);
     } catch (err) {
       alert('Error al abrir el archivo de proyecto: ' + err.message);
@@ -253,12 +408,65 @@ export function HomePage({ onOpenProject, currentDirHandle, setCurrentDirHandle,
     onOpenProject(demo);
   };
 
-  // Delete cached project
-  const handleDeleteCached = async (id, e) => {
+  // Delete project from disk, browser directory handle, and local cache
+  const handleDeleteProject = async (project, e) => {
     e.stopPropagation();
-    if (confirm('¿Eliminar este proyecto del historial local?')) {
-      await deleteCachedProject(id);
-      loadCachedProjectsList();
+    const projName = project.name || project.fileName || 'este proyecto';
+    if (!window.confirm(`¿Estás seguro de que deseas eliminar permanentemente el proyecto "${projName}"?`)) {
+      return;
+    }
+
+    setIsScanning(true);
+    try {
+      const projectId = project.id;
+      const filePath = project.filePath || (localFolderPath && project.fileName ? `${localFolderPath}/${project.fileName}` : null);
+      const fileName = project.fileName || (project.filePath ? project.filePath.split(/[/\\]/).pop() : null);
+
+      // 1. Delete physical file on disk via backend
+      if (filePath || fileName) {
+        await deleteDiskProject(filePath, fileName, localFolderPath);
+      }
+
+      // 2. Delete from browser directory handle if active
+      if (currentDirHandle && fileName) {
+        await deleteProjectFromDirectoryHandle(currentDirHandle, fileName, projectId);
+      }
+
+      // 3. Delete from IndexedDB & localStorage cache
+      if (projectId) {
+        await deleteCachedProject(projectId);
+      }
+      if (fileName) {
+        await deleteCachedProjectByFileName(fileName);
+      }
+
+      // 4. Update UI immediately
+      setFolderProjects(prev => prev.filter(p => 
+        p.id !== projectId && 
+        (!fileName || p.fileName !== fileName) && 
+        (!filePath || p.filePath !== filePath)
+      ));
+      setCachedProjects(prev => prev.filter(p => 
+        p.id !== projectId && 
+        (!fileName || p.fileName !== fileName) && 
+        (!filePath || p.filePath !== filePath)
+      ));
+
+      // 5. Fresh disk rescan
+      if (localFolderPath) {
+        const diskRes = await fetchDiskProjects(localFolderPath);
+        if (diskRes.success) {
+          setFolderProjects(diskRes.projects);
+        }
+      } else if (currentDirHandle) {
+        await scanHandleFolder(currentDirHandle, true);
+      }
+      await loadCachedProjectsList();
+    } catch (err) {
+      console.error('Error deleting project:', err);
+      alert('Error al eliminar el proyecto: ' + (err.message || 'Error desconocido'));
+    } finally {
+      setIsScanning(false);
     }
   };
 
@@ -266,6 +474,45 @@ export function HomePage({ onOpenProject, currentDirHandle, setCurrentDirHandle,
     e.stopPropagation();
     exportProjectAsDownload(project.projectData || project);
   };
+
+  // Single unified list of projects for the local folder
+  const displayedProjects = React.useMemo(() => {
+    const map = new Map();
+
+    // 1. Projects found directly in the local folder / disk
+    folderProjects.forEach(p => {
+      if (p) {
+        const key = p.id || p.filePath || p.fileName;
+        if (key) map.set(key, p);
+      }
+    });
+
+    // 2. Include any cached project that belongs to this local directory if not already listed
+    cachedProjects.forEach(p => {
+      if (p) {
+        const key = p.id || p.filePath || p.fileName;
+        const matchesDir = !directoryName || p.directoryName === directoryName || (p.filePath && localFolderPath && p.filePath.startsWith(localFolderPath));
+        if (matchesDir && key && !map.has(key)) {
+          const duplicateFile = p.fileName && Array.from(map.values()).some(existing => existing.fileName === p.fileName);
+          if (!duplicateFile) {
+            map.set(key, p);
+          }
+        }
+      }
+    });
+
+    // 3. Fallback: If no folder is linked at all, show any cached projects
+    if (!directoryName && !localFolderPath && !currentDirHandle && map.size === 0) {
+      cachedProjects.forEach(p => {
+        if (p) {
+          const key = p.id || p.filePath || p.fileName;
+          if (key && !map.has(key)) map.set(key, p);
+        }
+      });
+    }
+
+    return Array.from(map.values()).sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
+  }, [folderProjects, cachedProjects, directoryName, localFolderPath, currentDirHandle]);
 
   return (
     <div className="home-container">
@@ -341,8 +588,13 @@ export function HomePage({ onOpenProject, currentDirHandle, setCurrentDirHandle,
                       {needsPermission ? <AlertCircle size={12} /> : <CheckCircle2 size={12} />}
                       {directoryName} {needsPermission ? '(Permiso en pausa)' : ''}
                     </span>
-                    <span className="badge badge-indigo" title="Guardada permanentemente en IndexedDB">
-                      <Database size={11} /> Guardada en BD Local
+                    {localFolderPath && (
+                      <span className="badge badge-indigo" title={localFolderPath} style={{ maxWidth: '320px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        <HardDrive size={11} /> {localFolderPath}
+                      </span>
+                    )}
+                    <span className="badge badge-indigo" title="Carpeta asignada y guardada en este equipo">
+                      <Database size={11} /> Vinculada a este Dispositivo
                     </span>
                   </>
                 )}
@@ -351,8 +603,8 @@ export function HomePage({ onOpenProject, currentDirHandle, setCurrentDirHandle,
                 {needsPermission
                   ? `La carpeta "${directoryName}" está guardada en tu base de datos local. Haz clic en "Reconectar Acceso" para que el navegador reactive los permisos y muestre tus proyectos.`
                   : (directoryName
-                      ? `Mostrando proyectos .vproj guardados en la carpeta "${directoryName}" (registrada en la base de datos local). Los cambios se sincronizan automáticamente.`
-                      : 'Selecciona una carpeta de tu disco duro para cargarla y guardarla en la base de datos local con persistencia automática.')}
+                      ? `Mostrando proyectos .vproj guardados en "${localFolderPath || directoryName}" (registrada para este equipo). Los proyectos y cambios se guardan permanentemente en tu disco.`
+                      : 'Selecciona una carpeta de tu disco duro para cargarla y guardarla en la base de datos con persistencia automática por dispositivo.')}
               </p>
             </div>
           </div>
@@ -369,20 +621,21 @@ export function HomePage({ onOpenProject, currentDirHandle, setCurrentDirHandle,
               </button>
             )}
 
-            {isFileSystemAccessSupported() ? (
-              <button className="btn-primary" onClick={handleSelectFolder}>
-                <FolderOpen size={16} />
-                {directoryName ? 'Cambiar Carpeta Local' : 'Seleccionar Carpeta Local'}
-              </button>
-            ) : (
+            {isElectronDesktop() && localFolderPath && (
               <button
-                className="btn-primary"
-                onClick={() => folderInputRef.current?.click()}
+                className="btn-secondary"
+                onClick={() => openFolderInOS(localFolderPath)}
+                title="Abrir carpeta en el explorador de archivos del sistema"
               >
-                <FolderOpen size={16} />
-                Cargar Carpeta de Proyectos
+                <Folder size={16} />
+                Abrir en Explorador
               </button>
             )}
+
+            <button className="btn-primary" onClick={handleSelectFolder}>
+              <FolderOpen size={16} />
+              {directoryName ? 'Cambiar Carpeta Local' : 'Seleccionar Carpeta Local'}
+            </button>
 
             <input
               type="file"
@@ -398,8 +651,8 @@ export function HomePage({ onOpenProject, currentDirHandle, setCurrentDirHandle,
               <>
                 <button
                   className="btn-secondary icon-only"
-                  onClick={() => scanFolder(currentDirHandle, true)}
-                  title="Volver a escanear carpeta"
+                  onClick={() => rescanDiskFolder()}
+                  title="Volver a escanear carpeta de proyectos"
                   disabled={isScanning}
                 >
                   <RefreshCw size={16} className={isScanning ? 'spinner' : ''} />
@@ -408,7 +661,7 @@ export function HomePage({ onOpenProject, currentDirHandle, setCurrentDirHandle,
                 <button
                   className="btn-ghost icon-only text-dim"
                   onClick={handleClearFolder}
-                  title="Desvincular carpeta de la base de datos local"
+                  title="Desvincular carpeta de este equipo"
                 >
                   <Unlink size={16} />
                 </button>
@@ -432,16 +685,16 @@ export function HomePage({ onOpenProject, currentDirHandle, setCurrentDirHandle,
           </button>
         </div>
 
-        {/* Section: Projects in Folder */}
+        {/* Unified Projects Section */}
         <div className="projects-section">
           <div className="section-header">
             <div className="section-title-group">
               <Folder size={18} className="text-indigo" />
-              <h2>Proyectos en Carpeta Local {(folderProjects.length > 0 ? folderProjects.length : cachedProjects.filter(p => !directoryName || p.directoryName === directoryName).length) > 0 ? `(${(folderProjects.length > 0 ? folderProjects.length : cachedProjects.filter(p => !directoryName || p.directoryName === directoryName).length)})` : ''}</h2>
+              <h2>Proyectos en Carpeta Local {displayedProjects.length > 0 ? `(${displayedProjects.length})` : ''}</h2>
             </div>
             {directoryName && (
               <span className="section-meta">
-                {needsPermission ? 'Copia local disponible • Requiere reconectar disco' : 'Archivos sincronizados con el sistema'}
+                {needsPermission ? 'Copia local disponible • Requiere reconectar disco' : 'Archivos .vproj sincronizados con tu carpeta local'}
               </span>
             )}
           </div>
@@ -472,13 +725,13 @@ export function HomePage({ onOpenProject, currentDirHandle, setCurrentDirHandle,
             </div>
           )}
 
-          {(folderProjects.length === 0 && cachedProjects.filter(p => !directoryName || p.directoryName === directoryName).length === 0) ? (
+          {displayedProjects.length === 0 ? (
             <div className="empty-projects-card">
               <Film size={40} className="text-dim" />
               <h4>{directoryName ? 'No se encontraron proyectos .vproj en esta carpeta' : 'No hay carpeta seleccionada'}</h4>
               <p>
                 {directoryName
-                  ? 'Crea un nuevo proyecto y guárdalo en esta carpeta, o selecciona otra ruta en tu disco.'
+                  ? 'Crea un nuevo proyecto para guardarlo en esta carpeta, o carga el montaje de demostración.'
                   : 'Haz clic en "Seleccionar Carpeta Local" arriba para cargar los archivos de tu sistema.'}
               </p>
               <div style={{ display: 'flex', gap: '8px', justifyContent: 'center' }}>
@@ -500,153 +753,102 @@ export function HomePage({ onOpenProject, currentDirHandle, setCurrentDirHandle,
             </div>
           ) : (
             <div className="projects-grid">
-              {(folderProjects.length > 0 ? folderProjects : cachedProjects.filter(p => !directoryName || p.directoryName === directoryName)).map((p) => (
-                <div
-                  key={p.id}
-                  className="project-card"
-                  onClick={() => onOpenProject(p.projectData || p)}
-                >
-                  <div className="project-thumbnail-box">
-                    <div className="project-preview-art">
-                      <FileVideo size={44} className="text-indigo" />
-                    </div>
-                    <span className="project-aspect-badge">{p.aspectRatio || p.settings?.aspectRatio || '16:9'}</span>
-                  </div>
+              {displayedProjects.map((p) => {
+                const projId = p.id || p.projectData?.id || p.fileName;
+                const projUrl = `/project/${encodeURIComponent(projId)}`;
 
-                  <div className="project-details">
-                    <h4 className="project-name" title={p.name}>{p.name}</h4>
-                    <span className="project-filename text-dim">{p.fileName || p.directoryName || 'Copia Local Guardada'}</span>
-
-                    <div className="project-meta-row">
-                      <span className="meta-item">
-                        <Clock size={12} />
-                        {p.duration || p.settings?.duration || 20}s
-                      </span>
-                      <span className="meta-item">
-                        <Layers size={12} />
-                        {p.trackCount || p.tracks?.length || 0} pistas
-                      </span>
+                return (
+                  <a
+                    key={p.id || p.filePath || p.fileName}
+                    href={projUrl}
+                    className="project-card"
+                    onClick={(e) => {
+                      if (e.button === 0 && !e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey) {
+                        e.preventDefault();
+                        onOpenProject(p.projectData || p);
+                      }
+                    }}
+                    style={{ textDecoration: 'none', color: 'inherit' }}
+                  >
+                    <div className="project-thumbnail-box">
+                      <div className="project-preview-art">
+                        <FileVideo size={44} className="text-indigo" />
+                      </div>
+                      <span className="project-aspect-badge">{p.aspectRatio || p.settings?.aspectRatio || '16:9'}</span>
                     </div>
 
-                    <div className="project-footer">
-                      <span className="project-date">
-                        {p.updatedAt ? new Date(p.updatedAt).toLocaleDateString() : 'Reciente'}
-                      </span>
-                      <div className="project-card-actions">
-                        <button
-                          className="btn-ghost icon-only btn-xs"
-                          title="Descargar copia"
-                          onClick={(e) => handleDownloadCopy(p, e)}
-                        >
-                          <Download size={13} />
-                        </button>
-                        <button
-                          className="btn-primary btn-xs"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            onOpenProject(p.projectData || p);
-                          }}
-                        >
-                          Abrir
-                        </button>
+                    <div className="project-details">
+                      <h4 className="project-name" title={p.name}>{p.name}</h4>
+                      <span className="project-filename text-dim">{p.fileName || p.directoryName || 'Archivo de Proyecto'}</span>
+
+                      <div className="project-meta-row">
+                        <span className="meta-item">
+                          <Clock size={12} />
+                          {p.duration || p.settings?.duration || 20}s
+                        </span>
+                        <span className="meta-item">
+                          <Layers size={12} />
+                          {p.trackCount || p.tracks?.length || 0} pistas
+                        </span>
+                      </div>
+
+                      <div className="project-footer">
+                        <span className="project-date">
+                          {p.updatedAt ? new Date(p.updatedAt).toLocaleDateString() : 'Reciente'}
+                        </span>
+                        <div className="project-card-actions">
+                          <button
+                            className="btn-ghost icon-only btn-xs"
+                            title="Abrir en una pestaña nueva"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              window.open(projUrl, '_blank');
+                            }}
+                          >
+                            <ExternalLink size={13} />
+                          </button>
+                          <button
+                            className="btn-ghost icon-only btn-xs btn-delete-project"
+                            title="Eliminar proyecto permanentemente"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              handleDeleteProject(p, e);
+                            }}
+                          >
+                            <Trash2 size={13} />
+                          </button>
+                          <button
+                            className="btn-ghost icon-only btn-xs"
+                            title="Descargar copia (.vproj)"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              handleDownloadCopy(p, e);
+                            }}
+                          >
+                            <Download size={13} />
+                          </button>
+                          <button
+                            className="btn-primary btn-xs"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              onOpenProject(p.projectData || p);
+                            }}
+                          >
+                            Abrir
+                          </button>
+                        </div>
                       </div>
                     </div>
-                  </div>
-                </div>
-              ))}
+                  </a>
+                );
+              })}
             </div>
           )}
         </div>
-
-        {/* Section: Cached / Recent Projects in Storage */}
-        {cachedProjects.length > 0 && (
-          <div className="projects-section">
-            <div className="section-header">
-              <div className="section-title-group">
-                <HardDrive size={18} className="text-cyan" />
-                <h2>Historial y Proyectos Recientes en Memoria ({cachedProjects.length})</h2>
-              </div>
-              <span className="section-meta">
-                Guardados automáticamente en el almacenamiento local del navegador
-              </span>
-            </div>
-
-            <div className="projects-grid">
-              {cachedProjects.map((p) => (
-                <div
-                  key={p.id}
-                  className="project-card"
-                  onClick={() => onOpenProject(p.projectData || p)}
-                >
-                  <div className="project-thumbnail-box">
-                    <div className="project-preview-art">
-                      <Film size={40} className="text-cyan" />
-                    </div>
-                    <span className="project-aspect-badge">
-                      {p.settings?.aspectRatio || '16:9'}
-                    </span>
-                  </div>
-
-                  <div className="project-details">
-                    <h4 className="project-name" title={p.name}>{p.name}</h4>
-                    <span className="project-filename text-dim" style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                      {p.directoryName ? (
-                        <>
-                          <Folder size={11} className="text-indigo" />
-                          <span>{p.directoryName}</span>
-                        </>
-                      ) : (
-                        'Copia Local Guardada'
-                      )}
-                    </span>
-
-                    <div className="project-meta-row">
-                      <span className="meta-item">
-                        <Clock size={12} />
-                        {p.settings?.duration || 20}s
-                      </span>
-                      <span className="meta-item">
-                        <Layers size={12} />
-                        {p.tracks?.length || 0} pistas
-                      </span>
-                    </div>
-
-                    <div className="project-footer">
-                      <span className="project-date">
-                        {new Date(p.updatedAt).toLocaleDateString()}
-                      </span>
-                      <div className="project-card-actions">
-                        <button
-                          className="btn-ghost icon-only btn-xs text-dim"
-                          title="Eliminar de historial"
-                          onClick={(e) => handleDeleteCached(p.id, e)}
-                        >
-                          <Trash2 size={13} />
-                        </button>
-                        <button
-                          className="btn-ghost icon-only btn-xs"
-                          title="Descargar archivo .vproj"
-                          onClick={(e) => handleDownloadCopy(p, e)}
-                        >
-                          <Download size={13} />
-                        </button>
-                        <button
-                          className="btn-secondary btn-xs"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            onOpenProject(p.projectData || p);
-                          }}
-                        >
-                          Abrir
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
       </main>
 
       {/* New Project Modal */}
@@ -660,6 +862,17 @@ export function HomePage({ onOpenProject, currentDirHandle, setCurrentDirHandle,
       <GlobalSettingsModal
         isOpen={showSettingsModal}
         onClose={() => setShowSettingsModal(false)}
+      />
+
+      {/* Host System Folder Browser Modal */}
+      <FolderPickerModal
+        isOpen={showFolderPickerModal}
+        onClose={() => setShowFolderPickerModal(false)}
+        initialPath={localFolderPath || null}
+        title="Seleccionar Carpeta de Proyectos del Sistema Local"
+        onSelect={(selectedPath) => {
+          applySelectedLocalPath(selectedPath);
+        }}
       />
     </div>
   );

@@ -34,14 +34,36 @@ import {
   TrendingUp,
   Type,
   CheckSquare,
+  ArrowLeftRight,
+  Download,
+  MousePointer2,
+  Sliders,
+  SlidersHorizontal,
+  Subtitles,
   X
 } from 'lucide-react';
 import { formatTimecode } from '../utils/timeFormat';
-import { addAssetToTimeline } from '../utils/timelineOps';
+import { addAssetToTimeline, getTrackGaps, rippleDeleteGap, rippleDeleteClips, splitClipAtTime } from '../utils/timelineOps';
 import { createGraphicClip } from '../utils/graphicEngine';
 import { AudioClipWaveform } from './AudioClipWaveform';
+import {
+  generateSubtitlesTrackFromTranscript,
+  toggleSubtitlesTrackVisibility,
+  applyGlobalSubtitleStyle,
+  getDefaultSubtitleSettings,
+  isSubtitleClip,
+  SUBTITLE_TRACK_ID
+} from '../utils/transcriptOps';
 import { getCachedWaveform } from '../utils/audioWaveform';
 import { saveMediaBlob } from '../utils/storage';
+import { audioMixer } from '../utils/audioMixerEngine';
+import {
+  detectMediaType,
+  normalizeMediaFile,
+  extractVideoMetadata,
+  uploadMediaAsset
+} from '../utils/mediaTypeUtils';
+import { MediaAdaptModal } from './MediaAdaptModal';
 
 export const MIN_TIMELINE_ZOOM = 0.5; // pixels per second (enables viewing >1 hour of timeline on screen)
 export const MAX_TIMELINE_ZOOM = 1000; // pixels per second (sub-frame micro precision)
@@ -109,6 +131,7 @@ export const Timeline = React.memo(function Timeline({
   onOpenTranscribeModal,
   onOpenSceneDirector,
   onOpenGraphicDirector,
+  onOpenAutoCutModal = null,
   onUndo,
   onRedo,
   canUndo,
@@ -120,15 +143,31 @@ export const Timeline = React.memo(function Timeline({
   onUnlinkClip,
   isTimelineExpanded,
   onToggleMaximizeTimeline,
-  onAddAsset
+  onAddAsset,
+  onUpdateAsset = null,
+  onOpenGraphicForScene,
+  onOpenSceneBroll = null,
+  selectedSceneId = null,
+  onSelectScene = null
 }) {
   const [zoomLevel, setZoomLevel] = useState(60); // pixels per second
   const [snapping, setSnapping] = useState(true);
+  const [activeTool, setActiveTool] = useState('select'); // 'select' (V) | 'razor' (C) | 'rolling' (N) | 'slip' (Y)
+  const [razorHoverTime, setRazorHoverTime] = useState(null); // number | null
   const [activeSnapGuide, setActiveSnapGuide] = useState(null); // { time: number, label: string }
   const [localIsScrubbing, setLocalIsScrubbing] = useState(false);
   const isScrubbing = propIsScrubbing !== undefined ? propIsScrubbing : localIsScrubbing;
   const setIsScrubbing = propSetIsScrubbing || setLocalIsScrubbing;
   const isScrubbingRef = useRef(isScrubbing);
+  const [adaptModal, setAdaptModal] = useState({
+    isOpen: false,
+    currentFile: '',
+    currentIndex: 1,
+    totalFiles: 1,
+    percent: 0,
+    statusText: '',
+    isFinished: false
+  });
   const projectRef = useRef(project);
   projectRef.current = project;
   const [followPlayhead, setFollowPlayhead] = useState(true);
@@ -138,6 +177,7 @@ export const Timeline = React.memo(function Timeline({
   const [showQuickTitleMenu, setShowQuickTitleMenu] = useState(false);
   const [marqueeState, setMarqueeState] = useState(null); // { active, hasMoved, startX, startY, currentX, currentY, startClientX, startClientY, isModifier, initialSelection }
   const dragStateRef = useRef(dragState);
+  const initialDragProjectSnapshotRef = useRef(null);
   const marqueeStateRef = useRef(marqueeState);
   const isMarqueeDraggingRef = useRef(false);
   const lastMarqueeEndTimeRef = useRef(0);
@@ -478,6 +518,45 @@ export const Timeline = React.memo(function Timeline({
         return;
       }
 
+      // Premiere Pro Tool Shortcuts: V (Select), C (Razor), N (Rolling), Y (Slip)
+      if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+        if (e.key === 'v' || e.key === 'V') {
+          setActiveTool('select');
+          setRazorHoverTime(null);
+          return;
+        }
+        if (e.key === 'c' || e.key === 'C') {
+          setActiveTool(prev => prev === 'razor' ? 'select' : 'razor');
+          return;
+        }
+        if (e.key === 'n' || e.key === 'N') {
+          setActiveTool(prev => prev === 'rolling' ? 'select' : 'rolling');
+          setRazorHoverTime(null);
+          return;
+        }
+        if (e.key === 'y' || e.key === 'Y') {
+          setActiveTool(prev => prev === 'slip' ? 'select' : 'slip');
+          setRazorHoverTime(null);
+          return;
+        }
+      }
+
+      // Shift + Delete / Shift + Backspace -> Ripple Delete (Elimina clip y cierra hueco)
+      if (e.shiftKey && (e.key === 'Delete' || e.key === 'Backspace')) {
+        e.preventDefault();
+        e.stopPropagation();
+        const ids = selectedClipIds && selectedClipIds.length > 0
+          ? selectedClipIds
+          : (selectedClipId ? [selectedClipId] : []);
+        if (ids.length > 0) {
+          const updated = rippleDeleteClips(projectRef.current || project, ids);
+          projectRef.current = updated;
+          onUpdateProject(updated, true, true);
+          setMultiSelection([]);
+        }
+        return;
+      }
+
       // Plus / Equal -> Zoom In
       if (e.key === '+' || e.key === '=') {
         if (!e.ctrlKey && !e.metaKey) {
@@ -517,7 +596,10 @@ export const Timeline = React.memo(function Timeline({
   };
 
   const selectedClipData = selectedClipId ? findClipAndTrack(selectedClipId) : null;
-  const canSeparateAudio = selectedClipData?.track?.type === 'video' && !selectedClipData?.clip?.audioSeparated;
+  const canSeparateAudio =
+    selectedClipData?.track?.type === 'video' &&
+    selectedClipData?.clip?.audioSeparated === false &&
+    !selectedClipData?.clip?.linkedClipId;
   const canUnlinkClip = Boolean(selectedClipData?.clip?.linkedClipId);
 
   // Close context menu on global click or scroll
@@ -728,6 +810,7 @@ export const Timeline = React.memo(function Timeline({
     let targetNewStart = initialStartTime;
     let targetNewDuration = initialDuration;
     let targetNewSourceStart = initialSourceStart || 0;
+    let appliedDelta = 0;
 
     if (type === 'move') {
       const rawDeltaTime = deltaX / zoomLevel;
@@ -1002,10 +1085,75 @@ export const Timeline = React.memo(function Timeline({
       }
 
       setActiveSnapGuide(guide);
-      const appliedDelta = candidateStart - initialStartTime;
+      appliedDelta = candidateStart - initialStartTime;
       targetNewStart = Number(candidateStart.toFixed(2));
       targetNewDuration = Number(Math.max(0.3, initialDuration - appliedDelta).toFixed(2));
       targetNewSourceStart = Number(Math.max(0, initialSrcStart + appliedDelta).toFixed(2));
+    } else if (type === 'slip') {
+      // Premiere Pro Slip Edit (Y): shift sourceStart without moving clip on timeline
+      const rawDeltaTime = deltaX / zoomLevel;
+      const initialSrcStart = initialSourceStart || 0;
+      const maxSrcStart = (effectiveAssetDuration && effectiveAssetDuration > initialDuration)
+        ? Math.max(0, effectiveAssetDuration - initialDuration)
+        : 3600;
+      const nextSrc = Math.max(0, Math.min(maxSrcStart, initialSrcStart - rawDeltaTime));
+      appliedDelta = nextSrc - initialSrcStart;
+      targetNewSourceStart = Number(nextSrc.toFixed(2));
+      setActiveSnapGuide({
+        time: initialStartTime,
+        label: `Slip In: ${formatTimecode(targetNewSourceStart)} → Out: ${formatTimecode(targetNewSourceStart + initialDuration)}`
+      });
+    } else if (type === 'rolling' && ds.leftClip && ds.rightClip) {
+      // Premiere Pro Rolling Edit (N): move cut point between two adjacent clips simultaneously
+      const rawDeltaTime = deltaX / zoomLevel;
+      const { leftClip, rightClip } = ds;
+      const initialCut = rightClip.initialStartTime;
+      let minCut = leftClip.initialStartTime + 0.3;
+      if (rightClip.initialSourceStart !== undefined) {
+        minCut = Math.max(minCut, rightClip.initialStartTime - (rightClip.initialSourceStart || 0));
+      }
+      let maxCut = rightClip.initialStartTime + rightClip.initialDuration - 0.3;
+      if (leftClip.assetDuration && leftClip.assetDuration > 0) {
+        const maxLeftDur = Math.max(0.3, leftClip.assetDuration - (leftClip.initialSourceStart || 0));
+        maxCut = Math.min(maxCut, leftClip.initialStartTime + maxLeftDur);
+      }
+
+      const candidateCut = Math.max(minCut, Math.min(maxCut, initialCut + rawDeltaTime));
+      const cutDelta = candidateCut - initialCut;
+      const newLeftDur = Number(Math.max(0.3, leftClip.initialDuration + cutDelta).toFixed(2));
+      const newRightStart = Number(candidateCut.toFixed(2));
+      const newRightDur = Number(Math.max(0.3, rightClip.initialDuration - cutDelta).toFixed(2));
+      const newRightSrcStart = Number(Math.max(0, (rightClip.initialSourceStart || 0) + cutDelta).toFixed(2));
+
+      setActiveSnapGuide({
+        time: newRightStart,
+        label: `Rolling Cut: ${formatTimecode(newRightStart)} (${cutDelta >= 0 ? '+' : ''}${cutDelta.toFixed(2)}s)`
+      });
+
+      const updatedRollingTracks = (currentProject.tracks || []).map(track => ({
+        ...track,
+        clips: track.clips.map(clip => {
+          if (clip.id === leftClip.id || (leftClip.linkedId && clip.id === leftClip.linkedId)) {
+            return { ...clip, duration: newLeftDur };
+          }
+          if (clip.id === rightClip.id || (rightClip.linkedId && clip.id === rightClip.linkedId)) {
+            return {
+              ...clip,
+              startTime: newRightStart,
+              duration: newRightDur,
+              sourceStart: clip.id === rightClip.id
+                ? newRightSrcStart
+                : Number(Math.max(0, (clip.sourceStart || 0) + cutDelta).toFixed(2))
+            };
+          }
+          return clip;
+        })
+      }));
+
+      const nextRollingProject = { ...currentProject, tracks: updatedRollingTracks };
+      projectRef.current = nextRollingProject;
+      onUpdateProject(nextRollingProject, false, false);
+      return;
     }
 
     const updatedTracks = (currentProject.tracks || []).map(track => ({
@@ -1022,6 +1170,14 @@ export const Timeline = React.memo(function Timeline({
               ...clip,
               startTime: targetNewStart,
               duration: targetNewDuration,
+              sourceStart: companionSrcStart
+            };
+          } else if (type === 'slip') {
+            const companionSrcStart = clip.id === clipId
+              ? targetNewSourceStart
+              : Number(Math.max(0, (clip.sourceStart || 0) + appliedDelta).toFixed(2));
+            return {
+              ...clip,
               sourceStart: companionSrcStart
             };
           }
@@ -1043,6 +1199,14 @@ export const Timeline = React.memo(function Timeline({
   useEffect(() => {
     // Event listener dedicated to clip dragging
     if (!isClipDragging) return;
+
+    if (!initialDragProjectSnapshotRef.current) {
+      try {
+        initialDragProjectSnapshotRef.current = JSON.parse(JSON.stringify(projectRef.current || project));
+      } catch (e) {
+        console.warn('Failed to snapshot timeline project before drag', e);
+      }
+    }
 
     const originalUserSelect = document.body.style.userSelect;
     const originalCursor = document.body.style.cursor;
@@ -1073,8 +1237,12 @@ export const Timeline = React.memo(function Timeline({
         if (!ds.hasMoved && ds.startedWithMulti) {
           setMultiSelection([ds.clipId]);
         }
-        if (ds.hasMoved) {
-          onUpdateProject(projectRef.current || project, true, true);
+        if (ds.hasMoved && initialDragProjectSnapshotRef.current) {
+          const snapshot = initialDragProjectSnapshotRef.current;
+          initialDragProjectSnapshotRef.current = null;
+          onUpdateProject(projectRef.current || project, true, true, snapshot);
+        } else {
+          initialDragProjectSnapshotRef.current = null;
         }
         setDragState(null);
         dragStateRef.current = null;
@@ -1285,84 +1453,17 @@ export const Timeline = React.memo(function Timeline({
     onUpdateProject(nextProject, true, true);
   };
 
-  // Razor / Split Tool
-  const handleSplitClip = () => {
-    if (!selectedClipId) return;
-    const found = findClipAndTrack(selectedClipId);
-    if (!found) return;
-
-    const { clip, track } = found;
-    const clipStart = clip.startTime;
-    const clipEnd = clip.startTime + clip.duration;
-
-    // Check if playhead is strictly inside the clip
-    if (currentTime > clipStart + 0.1 && currentTime < clipEnd - 0.1) {
-      const firstDuration = Number((currentTime - clipStart).toFixed(2));
-      const secondDuration = Number((clipEnd - currentTime).toFixed(2));
-      const secondSourceStart = Number(((clip.sourceStart || 0) + firstDuration).toFixed(2));
-
-      const newSecondId = 'clip_' + Date.now();
-      const updatedFirst = { ...clip, duration: firstDuration };
-
-      // Also check if there's a linked companion clip (e.g. audio linked to this video)
-      let linkedClip = null;
-      let linkedTrack = null;
-      if (clip.linkedClipId) {
-        const lf = findClipAndTrack(clip.linkedClipId);
-        if (lf) {
-          linkedClip = lf.clip;
-          linkedTrack = lf.track;
-        }
-      }
-
-      let newLinkedSecondId = null;
-      let updatedLinkedFirst = null;
-      let newLinkedSecond = null;
-
-      if (linkedClip && linkedTrack) {
-        newLinkedSecondId = 'clip_linked_' + Date.now();
-        updatedLinkedFirst = {
-          ...linkedClip,
-          duration: firstDuration,
-          linkedClipId: clip.id
-        };
-        newLinkedSecond = {
-          ...linkedClip,
-          id: newLinkedSecondId,
-          startTime: Number(currentTime.toFixed(2)),
-          duration: secondDuration,
-          sourceStart: Number(((linkedClip.sourceStart || 0) + firstDuration).toFixed(2)),
-          name: `${linkedClip.name} (Parte 2)`,
-          linkedClipId: newSecondId
-        };
-        updatedFirst.linkedClipId = linkedClip.id;
-      }
-
-      const newSecond = {
-        ...clip,
-        id: newSecondId,
-        startTime: Number(currentTime.toFixed(2)),
-        duration: secondDuration,
-        sourceStart: secondSourceStart,
-        name: `${clip.name} (Parte 2)`,
-        linkedClipId: newLinkedSecondId || undefined
-      };
-
-      const updatedTracks = project.tracks.map(t => {
-        let clips = t.clips;
-        if (t.id === track.id) {
-          clips = clips.map(c => c.id === clip.id ? updatedFirst : c).concat(newSecond);
-        }
-        if (linkedTrack && t.id === linkedTrack.id && t.id !== track.id) {
-          clips = clips.map(c => c.id === linkedClip.id ? updatedLinkedFirst : c).concat(newLinkedSecond);
-        }
-        return { ...t, clips };
-      });
-
-      onUpdateProject({ ...project, tracks: updatedTracks });
-      setMultiSelection([newSecond.id]);
+  // Razor / Split Tool (splits selected clip or clip under playhead/click)
+  const handleSplitClip = useCallback((customClipId = null, customTime = null) => {
+    const targetId = typeof customClipId === 'string' ? customClipId : selectedClipId;
+    const splitTime = typeof customTime === 'number' ? customTime : currentTime;
+    const { updatedProject, newClipId } = splitClipAtTime(projectRef.current || project, targetId, splitTime);
+    if (newClipId) {
+      projectRef.current = updatedProject;
+      onUpdateProject(updatedProject, true, true);
+      setMultiSelection([newClipId]);
     }
-  };
+  }, [selectedClipId, currentTime, project, onUpdateProject]);
 
   // Delete Selected Clip(s)
   const handleDeleteClip = () => {
@@ -1385,6 +1486,27 @@ export const Timeline = React.memo(function Timeline({
     onUpdateProject({ ...project, tracks: updatedTracks });
     setMultiSelection([]);
   };
+
+  // Ripple Delete Selected Clip(s) (Shift + Delete: removes clip and closes gap automatically)
+  const handleRippleDeleteClip = useCallback(() => {
+    const ids = selectedClipIds && selectedClipIds.length > 0
+      ? selectedClipIds
+      : (selectedClipId ? [selectedClipId] : []);
+    if (ids.length === 0) return;
+    const updated = rippleDeleteClips(projectRef.current || project, ids);
+    projectRef.current = updated;
+    onUpdateProject(updated, true, true);
+    setMultiSelection([]);
+  }, [selectedClipIds, selectedClipId, project, onUpdateProject]);
+
+  // Delete Gap (Ripple close empty space between clips)
+  const handleDeleteGap = useCallback((trackId, gapStart, gapDuration) => {
+    if (!project) return;
+    const updated = rippleDeleteGap(project, trackId, gapStart, gapDuration);
+    if (onUpdateProject) {
+      onUpdateProject(updated, true, true);
+    }
+  }, [project, onUpdateProject]);
 
   // Duplicate Selected Clip(s)
   const handleDuplicateClip = () => {
@@ -1428,7 +1550,7 @@ export const Timeline = React.memo(function Timeline({
     setMultiSelection(newCreatedIds);
   };
 
-  // Toggle Mute on Selected Clip(s)
+  // Toggle Mute on Selected Audio Clip(s) (Video clips with separated audio remain strictly silent)
   const handleBatchToggleMute = () => {
     const ids = selectedClipIds && selectedClipIds.length > 0
       ? selectedClipIds
@@ -1438,6 +1560,7 @@ export const Timeline = React.memo(function Timeline({
 
     let anyAudible = false;
     project.tracks.forEach(t => {
+      if (t.type !== 'audio') return;
       t.clips.forEach(c => {
         if (idSet.has(c.id) && (c.muted === false || c.muted === undefined)) {
           anyAudible = true;
@@ -1451,6 +1574,9 @@ export const Timeline = React.memo(function Timeline({
       ...t,
       clips: t.clips.map(c => {
         if (idSet.has(c.id)) {
+          if (t.type === 'video' && c.audioSeparated !== false) {
+            return { ...c, muted: true, volume: 0 };
+          }
           return { ...c, muted: targetMute };
         }
         return c;
@@ -1465,10 +1591,125 @@ export const Timeline = React.memo(function Timeline({
     // Selection toggle is fully handled in handleClipMouseDown to prevent double-toggle bugs
   };
 
+  const handleTrimHandleMouseDown = (side, clip, track, effectiveDuration, e) => {
+    e.stopPropagation();
+    setMultiSelection([clip.id]);
+
+    // Check if Rolling Edit (N tool or Alt+Drag on trim handle) is applicable with an adjacent clip
+    if (activeTool === 'rolling' || e.altKey) {
+      const sortedClips = [...(track.clips || [])].sort((a, b) => a.startTime - b.startTime);
+      const idx = sortedClips.findIndex(c => c.id === clip.id);
+      let leftC = null;
+      let rightC = null;
+      if (side === 'right' && idx >= 0 && idx < sortedClips.length - 1) {
+        const nextC = sortedClips[idx + 1];
+        if (Math.abs((clip.startTime + clip.duration) - nextC.startTime) <= 0.15) {
+          leftC = clip;
+          rightC = nextC;
+        }
+      } else if (side === 'left' && idx > 0) {
+        const prevC = sortedClips[idx - 1];
+        if (Math.abs((prevC.startTime + prevC.duration) - clip.startTime) <= 0.15) {
+          leftC = prevC;
+          rightC = clip;
+        }
+      }
+
+      if (leftC && rightC) {
+        const leftAsset = (project.assets || []).find(a => a.id === leftC.assetId);
+        const rightAsset = (project.assets || []).find(a => a.id === rightC.assetId);
+        const leftDur = (leftAsset?.type !== 'image' && leftAsset?.duration > 0)
+          ? leftAsset.duration
+          : (getCachedWaveform(leftC.assetId)?.duration || null);
+        const rightDur = (rightAsset?.type !== 'image' && rightAsset?.duration > 0)
+          ? rightAsset.duration
+          : (getCachedWaveform(rightC.assetId)?.duration || null);
+
+        const newDrag = {
+          type: 'rolling',
+          clipId: clip.id,
+          initialX: e.clientX,
+          initialY: e.clientY,
+          initialStartTime: clip.startTime,
+          initialDuration: clip.duration,
+          initialSourceStart: clip.sourceStart || 0,
+          trackId: track.id,
+          currentTrackId: track.id,
+          leftClip: {
+            id: leftC.id,
+            linkedId: leftC.linkedClipId,
+            initialStartTime: leftC.startTime,
+            initialDuration: leftC.duration,
+            initialSourceStart: leftC.sourceStart || 0,
+            assetDuration: leftDur
+          },
+          rightClip: {
+            id: rightC.id,
+            linkedId: rightC.linkedClipId,
+            initialStartTime: rightC.startTime,
+            initialDuration: rightC.duration,
+            initialSourceStart: rightC.sourceStart || 0,
+            assetDuration: rightDur
+          }
+        };
+        dragStateRef.current = newDrag;
+        setDragState(newDrag);
+        return;
+      }
+    }
+
+    const newDrag = {
+      type: side === 'left' ? 'trim-left' : 'trim-right',
+      clipId: clip.id,
+      initialX: e.clientX,
+      initialY: e.clientY,
+      initialStartTime: clip.startTime,
+      initialDuration: clip.duration,
+      initialSourceStart: clip.sourceStart || 0,
+      assetDuration: effectiveDuration,
+      trackId: track.id,
+      currentTrackId: track.id
+    };
+    dragStateRef.current = newDrag;
+    setDragState(newDrag);
+  };
+
   const handleClipMouseDown = (clip, track, e) => {
     if (track.locked) return;
     if (e.button !== 0) return;
     e.stopPropagation();
+
+    // If Razor Tool ('C') is active, clicking on the clip splits it at the exact mouse timestamp!
+    if (activeTool === 'razor') {
+      const cutTime = clientXToSeconds(e.clientX);
+      handleSplitClip(clip.id, cutTime);
+      return;
+    }
+
+    // If Slip Tool ('Y') is active (or Alt+Drag on a video/audio clip), initiate Slip Edit!
+    if ((activeTool === 'slip' || e.altKey) && (track.type === 'video' || track.type === 'audio') && !clip.isGraphic) {
+      setMultiSelection([clip.id]);
+      const asset = (project.assets || []).find(a => a.id === clip.assetId);
+      const isImageAsset = asset?.type === 'image';
+      const effectiveDuration = (!isImageAsset && asset?.duration && asset.duration > 0)
+        ? asset.duration
+        : (isImageAsset ? null : (getCachedWaveform(clip.assetId)?.duration || null));
+      const newDrag = {
+        type: 'slip',
+        clipId: clip.id,
+        initialX: e.clientX,
+        initialY: e.clientY,
+        initialStartTime: clip.startTime,
+        initialDuration: clip.duration,
+        initialSourceStart: clip.sourceStart || 0,
+        assetDuration: effectiveDuration,
+        trackId: track.id,
+        currentTrackId: track.id
+      };
+      dragStateRef.current = newDrag;
+      setDragState(newDrag);
+      return;
+    }
 
     const isModifier = e.shiftKey || e.ctrlKey || e.metaKey;
     const currentSelection = [...(selectedClipIds || [])];
@@ -1488,6 +1729,10 @@ export const Timeline = React.memo(function Timeline({
         nextSelection = [clip.id];
         setMultiSelection(nextSelection);
       }
+    }
+
+    if (track.type === 'scene' && onSelectScene) {
+      onSelectScene(clip);
     }
 
     const activeProject = projectRef.current || project;
@@ -1799,6 +2044,18 @@ export const Timeline = React.memo(function Timeline({
     return new Map((project.assets || []).map(a => [a.id, a]));
   }, [project.assets]);
 
+  // Compute empty gaps per track (only recomputed when project.tracks change)
+  const trackGapsMap = useMemo(() => {
+    const map = new Map();
+    if (!project?.tracks) return map;
+    for (const track of project.tracks) {
+      if (!track.locked && track.visible !== false && track.clips?.length > 0) {
+        map.set(track.id, getTrackGaps(track));
+      }
+    }
+    return map;
+  }, [project?.tracks]);
+
   // Resolve target track intelligently based on requested track ID and asset type
   const resolveTargetTrack = useCallback((targetTrackId, assetType) => {
     const isAudio = assetType === 'audio';
@@ -1847,16 +2104,39 @@ export const Timeline = React.memo(function Timeline({
     let currentDropTime = rawDropTime;
     let currProject = project;
 
-    for (const file of Array.from(files)) {
-      const isImage = file.type.startsWith('image/');
-      const isAudio = file.type.startsWith('audio/');
-      const isVideo = file.type.startsWith('video/');
-      if (!isImage && !isAudio && !isVideo) continue;
+    const rawFiles = Array.from(files);
+    const movFiles = rawFiles.filter(f => {
+      const info = detectMediaType(f);
+      return info?.type === 'video' && (/\.(mov|qt)$/i.test(f.name) || f.type === 'video/quicktime');
+    });
+
+    const isAdapting = movFiles.length > 0;
+    if (isAdapting) {
+      setAdaptModal({
+        isOpen: true,
+        currentFile: movFiles[0].name,
+        currentIndex: 1,
+        totalFiles: movFiles.length,
+        percent: 5,
+        statusText: 'Iniciando adaptación de video iPhone...',
+        isFinished: false
+      });
+    }
+
+    let movIndex = 0;
+    for (const rawFile of rawFiles) {
+      const mediaInfo = detectMediaType(rawFile);
+      if (!mediaInfo) continue;
+
+      const file = normalizeMediaFile(rawFile);
+      const isImage = mediaInfo.type === 'image';
+      const isAudio = mediaInfo.type === 'audio';
+      const isVideo = mediaInfo.type === 'video';
 
       const assetId = 'asset-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6);
       const objectUrl = URL.createObjectURL(file);
       try {
-        saveMediaBlob(assetId, file, { name: file.name, type: file.type });
+        saveMediaBlob(assetId, file, { name: file.name, type: mediaInfo.mime });
       } catch (err) {
         console.warn('Could not save media blob:', err);
       }
@@ -1864,7 +2144,7 @@ export const Timeline = React.memo(function Timeline({
       const newAsset = {
         id: assetId,
         name: file.name,
-        type: isImage ? 'image' : (isAudio ? 'audio' : 'video'),
+        type: mediaInfo.type,
         url: objectUrl,
         file: file,
         duration: isAudio ? 10 : 5,
@@ -1874,9 +2154,82 @@ export const Timeline = React.memo(function Timeline({
 
       if (isImage) {
         newAsset.thumbnail = objectUrl;
+      } else if (isVideo) {
+        const isMov = /\.(mov|qt)$/i.test(file.name) || file.type === 'video/quicktime';
+        if (isMov) {
+          movIndex++;
+          setAdaptModal(prev => ({
+            ...prev,
+            currentFile: file.name,
+            currentIndex: movIndex,
+            percent: Math.round(((movIndex - 0.7) / movFiles.length) * 100),
+            statusText: `Adaptando video ${movIndex} de ${movFiles.length} a H.264 compatible...`
+          }));
+
+          const upRes = await uploadMediaAsset(file, null, (p, text) => {
+            const baseP = ((movIndex - 1) / movFiles.length) * 100;
+            const filePortion = (p / 100) * (100 / movFiles.length);
+            setAdaptModal(prev => ({
+              ...prev,
+              percent: Math.min(95, Math.round(baseP + filePortion)),
+              statusText: text
+            }));
+          });
+
+          if (upRes && !upRes.success && upRes.error) {
+            alert(`No se pudo colocar "${file.name}" en la línea de tiempo:\n\n${upRes.error}`);
+            continue;
+          }
+
+          if (upRes && upRes.success) {
+            newAsset.name = upRes.name;
+            newAsset.diskPath = upRes.diskPath;
+            newAsset.url = upRes.url;
+            newAsset.previewUrl = upRes.previewUrl;
+            if (upRes.thumbnailUrl) newAsset.thumbnail = upRes.thumbnailUrl;
+            if (upRes.duration) newAsset.duration = upRes.duration;
+            if (upRes.width) newAsset.width = upRes.width;
+            if (upRes.height) newAsset.height = upRes.height;
+            if (upRes.rotation) newAsset.rotation = upRes.rotation;
+            newAsset.isAdapted = true;
+            newAsset.originalName = upRes.originalName;
+            newAsset.originalDiskPath = upRes.originalDiskPath;
+          } else {
+            try {
+              const meta = await extractVideoMetadata(file, objectUrl);
+              newAsset.duration = meta.duration || 5;
+              newAsset.width = meta.width || 1280;
+              newAsset.height = meta.height || 720;
+              newAsset.thumbnail = meta.thumbnail;
+            } catch (_) {}
+          }
+        } else {
+          try {
+            const meta = await extractVideoMetadata(file, objectUrl);
+            newAsset.duration = meta.duration || 5;
+            newAsset.width = meta.width || 1280;
+            newAsset.height = meta.height || 720;
+            newAsset.thumbnail = meta.thumbnail;
+            if (meta.previewUrl) newAsset.previewUrl = meta.previewUrl;
+            if (meta.diskPath) newAsset.diskPath = meta.diskPath;
+          } catch (_) {}
+
+          uploadMediaAsset(file).then((upRes) => {
+            if (upRes && upRes.success && onUpdateAsset) {
+              newAsset.diskPath = upRes.diskPath;
+              newAsset.previewUrl = upRes.previewUrl;
+              if (upRes.thumbnailUrl) newAsset.thumbnail = upRes.thumbnailUrl;
+              onUpdateAsset(newAsset);
+            }
+          }).catch(() => {});
+        }
       }
 
-      const updatedAssets = [...(currProject.assets || []), newAsset];
+      const assetAlreadyInList = (currProject.assets || []).some(a => a.id === newAsset.id);
+      const updatedAssets = assetAlreadyInList
+        ? (currProject.assets || []).map(a => a.id === newAsset.id ? { ...a, ...newAsset } : a)
+        : [...(currProject.assets || []), newAsset];
+
       const target = resolveTargetTrack(targetTrackId, newAsset.type);
       const { updatedProject } = addAssetToTimeline(
         { ...currProject, assets: updatedAssets },
@@ -1887,61 +2240,263 @@ export const Timeline = React.memo(function Timeline({
 
       currProject = updatedProject;
       currentDropTime += newAsset.duration;
-      if (onAddAsset) {
-        onAddAsset(newAsset);
-      }
+    }
+
+    if (isAdapting) {
+      setAdaptModal(prev => ({
+        ...prev,
+        percent: 100,
+        statusText: '¡Videos adaptados y colocados en la línea de tiempo!',
+        isFinished: true
+      }));
+      setTimeout(() => {
+        setAdaptModal(prev => ({ ...prev, isOpen: false }));
+      }, 800);
     }
 
     onUpdateProject(currProject);
-  }, [clientXToSeconds, project, resolveTargetTrack, onAddAsset, onUpdateProject]);
+  }, [clientXToSeconds, project, resolveTargetTrack, onUpdateAsset, onUpdateProject]);
+
+  // Real-time stereo meter DOM refs for zero-React-overhead animation on the right dock
+  const meterLeftRef = useRef(null);
+  const meterRightRef = useRef(null);
+
+  useEffect(() => {
+    let rafId = null;
+    const updateMeters = () => {
+      if (isPlayingRef.current) {
+        const m = audioMixer.getMasterMeter ? audioMixer.getMasterMeter() : { rms: 0.25, peak: 0.35 };
+        const basePct = Math.min(98, Math.max(4, Math.round((m.peak || 0) * 105)));
+        const lPct = Math.min(98, Math.max(0, basePct + Math.round(Math.sin(performance.now() * 0.015) * 4)));
+        const rPct = Math.min(98, Math.max(0, basePct + Math.round(Math.cos(performance.now() * 0.017) * 4)));
+        if (meterLeftRef.current) meterLeftRef.current.style.height = `${lPct}%`;
+        if (meterRightRef.current) meterRightRef.current.style.height = `${rPct}%`;
+      } else {
+        if (meterLeftRef.current) meterLeftRef.current.style.height = '0%';
+        if (meterRightRef.current) meterRightRef.current.style.height = '0%';
+      }
+      rafId = requestAnimationFrame(updateMeters);
+    };
+    rafId = requestAnimationFrame(updateMeters);
+    return () => {
+      if (rafId) cancelAnimationFrame(rafId);
+    };
+  }, []);
 
   return (
-    <div className="timeline-container" ref={timelineContainerRef}>
-      {/* Timeline Control Bar */}
-      <div className="timeline-toolbar">
-        <div className="timeline-toolbar-left">
-          <div className="timeline-badge-timecode timecode" ref={timecodeBadgeRef}>
-            {formatTimecode(currentTime)}
-          </div>
+    <div className="premiere-timeline-shell">
+      {/* 1. Far-Left Vertical Adobe Premiere Pro Tool Strip */}
+      <div className="premiere-tool-strip">
+        <button
+          type="button"
+          className={`premiere-tool-btn ${activeTool === 'select' ? 'active' : ''}`}
+          title="Herramienta Selección (V)"
+          onClick={() => { setActiveTool('select'); setRazorHoverTime(null); }}
+        >
+          <MousePointer2 size={15} />
+        </button>
+
+        <button
+          type="button"
+          className={`premiere-tool-btn ${activeTool === 'rolling' ? 'active' : ''}`}
+          title="Herramienta Edición Rizo / Rolling Edit (N)"
+          onClick={() => { setActiveTool(prev => prev === 'rolling' ? 'select' : 'rolling'); setRazorHoverTime(null); }}
+        >
+          <ArrowLeftRight size={15} />
+        </button>
+
+        <button
+          type="button"
+          className={`premiere-tool-btn ${activeTool === 'razor' ? 'active' : ''}`}
+          title="Herramienta Cuchilla / Razor Tool (C)"
+          onClick={() => setActiveTool(prev => prev === 'razor' ? 'select' : 'razor')}
+        >
+          <Scissors size={15} />
+        </button>
+
+        <button
+          type="button"
+          className={`premiere-tool-btn ${activeTool === 'slip' ? 'active' : ''}`}
+          title="Herramienta Desplazar / Slip Tool (Y)"
+          onClick={() => { setActiveTool(prev => prev === 'slip' ? 'select' : 'slip'); setRazorHoverTime(null); }}
+        >
+          <SlidersHorizontal size={15} />
+        </button>
+
+        <button
+          type="button"
+          className="premiere-tool-btn"
+          title="Seleccionar todos los clips de la secuencia (Ctrl+A)"
+          onClick={() => {
+            const allIds = (project.tracks || []).flatMap(t => t.clips.map(c => c.id));
+            setMultiSelection(allIds);
+          }}
+        >
+          <CheckSquare size={14} />
+        </button>
+
+        <button
+          type="button"
+          className="premiere-tool-btn"
+          title="Ajustar zoom de toda la secuencia a la ventana (Shift+Z)"
+          onClick={handleZoomToFit}
+        >
+          <Expand size={14} />
+        </button>
+
+        <button
+          type="button"
+          className={`premiere-tool-btn ${showQuickTitleMenu ? 'active' : ''}`}
+          title="Herramienta Texto / Añadir Título Documental (T)"
+          onClick={() => handleAddQuickTitle('doc_chapter')}
+        >
+          <Type size={15} />
+        </button>
+      </div>
+
+      {/* 2. Center Adobe Premiere Pro Sequence Timeline Panel */}
+      <div className="timeline-container premiere-sequence-panel" ref={timelineContainerRef}>
+        {/* Timeline Control Bar with Sequence Tab */}
+        <div className="timeline-toolbar" style={{ background: '#181818', borderBottom: '1px solid #0e0e0e', height: '32px', padding: '0 8px' }}>
+          <div className="timeline-toolbar-left" style={{ gap: '6px' }}>
+            {/* Premiere Pro Active Sequence Tab */}
+            <div
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '6px',
+                padding: '4px 10px',
+                background: '#222222',
+                borderBottom: '2px solid #2b7de9',
+                color: '#ffffff',
+                fontSize: '11.5px',
+                fontWeight: 600,
+                height: '32px'
+              }}
+            >
+              <span style={{ width: '8px', height: '8px', borderRadius: '1px', background: '#22c55e', display: 'inline-block' }} />
+              <span>{project?.name || 'Secuencia 01'}</span>
+              <span style={{ color: '#787878', marginLeft: '2px' }}>≡</span>
+            </div>
+
+            <div className="toolbar-divider"></div>
+
+            {/* Undo / Redo */}
+            {onUndo && (
+              <button
+                className="btn-ghost icon-only"
+                title="Deshacer (Ctrl+Z)"
+                onClick={onUndo}
+                disabled={!canUndo}
+                style={{ opacity: canUndo ? 1 : 0.35 }}
+              >
+                <Undo2 size={15} />
+              </button>
+            )}
+
+            {onRedo && (
+              <button
+                className="btn-ghost icon-only"
+                title="Rehacer (Ctrl+Y o Ctrl+Shift+Z)"
+                onClick={onRedo}
+                disabled={!canRedo}
+                style={{ opacity: canRedo ? 1 : 0.35 }}
+              >
+                <Redo2 size={15} />
+              </button>
+            )}
+
+            <div className="toolbar-divider"></div>
+
+            {/* Premiere Pro Editing Tool Palette (V / C / N / Y) */}
+            <div style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '2px',
+              background: '#141414',
+              border: '1px solid #2b2b2b',
+              borderRadius: '4px',
+              padding: '1px'
+            }}>
+              <button
+                type="button"
+                className={`btn-ghost icon-only ${activeTool === 'select' ? 'active' : 'text-dim'}`}
+                title="Herramienta Selección / Mover (Tecla V)"
+                onClick={() => { setActiveTool('select'); setRazorHoverTime(null); }}
+                style={{
+                  width: '24px',
+                  height: '22px',
+                  background: activeTool === 'select' ? 'rgba(43, 125, 233, 0.22)' : 'transparent',
+                  color: activeTool === 'select' ? '#3898ff' : undefined
+                }}
+              >
+                <MousePointer2 size={13} />
+              </button>
+              <button
+                type="button"
+                className={`btn-ghost icon-only ${activeTool === 'razor' ? 'active text-rose' : 'text-dim'}`}
+                title="Herramienta Cuchilla: Haz clic sobre cualquier clip para cortarlo al instante (Tecla C)"
+                onClick={() => setActiveTool(prev => prev === 'razor' ? 'select' : 'razor')}
+                style={{
+                  width: '24px',
+                  height: '22px',
+                  background: activeTool === 'razor' ? 'rgba(244, 63, 94, 0.25)' : 'transparent',
+                  color: activeTool === 'razor' ? '#fb7185' : undefined
+                }}
+              >
+                <Scissors size={13} />
+              </button>
+              <button
+                type="button"
+                className={`btn-ghost icon-only ${activeTool === 'rolling' ? 'active' : 'text-dim'}`}
+                title="Herramienta Rolling Edit: Arrastra el borde entre dos clips contiguos para rodar el punto de corte (Tecla N o Alt+Borde)"
+                onClick={() => { setActiveTool(prev => prev === 'rolling' ? 'select' : 'rolling'); setRazorHoverTime(null); }}
+                style={{
+                  width: '24px',
+                  height: '22px',
+                  background: activeTool === 'rolling' ? 'rgba(43, 125, 233, 0.22)' : 'transparent',
+                  color: activeTool === 'rolling' ? '#3898ff' : undefined
+                }}
+              >
+                <ArrowLeftRight size={13} />
+              </button>
+              <button
+                type="button"
+                className={`btn-ghost icon-only ${activeTool === 'slip' ? 'active text-amber' : 'text-dim'}`}
+                title="Herramienta Slip Edit: Arrastra dentro de un clip para deslizar su tiempo interno sin moverlo en la línea de tiempo (Tecla Y o Alt+Clip)"
+                onClick={() => { setActiveTool(prev => prev === 'slip' ? 'select' : 'slip'); setRazorHoverTime(null); }}
+                style={{
+                  width: '24px',
+                  height: '22px',
+                  background: activeTool === 'slip' ? 'rgba(245, 158, 11, 0.25)' : 'transparent',
+                  color: activeTool === 'slip' ? '#fbbf24' : undefined
+                }}
+              >
+                <SlidersHorizontal size={13} />
+              </button>
+            </div>
 
           <div className="toolbar-divider"></div>
 
-          {/* Undo / Redo */}
-          {onUndo && (
-            <button
-              className="btn-ghost icon-only"
-              title="Deshacer (Ctrl+Z)"
-              onClick={onUndo}
-              disabled={!canUndo}
-              style={{ opacity: canUndo ? 1 : 0.35 }}
-            >
-              <Undo2 size={16} />
-            </button>
-          )}
-
-          {onRedo && (
-            <button
-              className="btn-ghost icon-only"
-              title="Rehacer (Ctrl+Y o Ctrl+Shift+Z)"
-              onClick={onRedo}
-              disabled={!canRedo}
-              style={{ opacity: canRedo ? 1 : 0.35 }}
-            >
-              <Redo2 size={16} />
-            </button>
-          )}
-
-          <div className="toolbar-divider"></div>
-
-          {/* Tools */}
+          {/* Action Buttons */}
           <button
             className="btn-ghost icon-only"
-            title="Dividir clip en el cabezal (Cuchilla ✂️)"
-            onClick={handleSplitClip}
-            disabled={!selectedClipId}
+            title="Dividir clip en la posición del cabezal (✂️)"
+            onClick={() => handleSplitClip()}
           >
-            <Scissors size={16} className={selectedClipId ? 'text-rose' : 'text-dim'} />
+            <Scissors size={16} className="text-rose" />
           </button>
+
+          {onOpenAutoCutModal && (
+            <button
+              className="btn-ghost icon-only"
+              title="Recortes Automáticos IA (Elimina silencios y errores en los clips seleccionados)"
+              onClick={onOpenAutoCutModal}
+              style={{ color: '#06b6d4' }}
+            >
+              <Sparkles size={16} />
+            </button>
+          )}
 
           {onSeparateAudio && (
             <button
@@ -1992,6 +2547,18 @@ export const Timeline = React.memo(function Timeline({
             disabled={!selectedClipId && selectedClipIds.length === 0}
           >
             <Trash2 size={16} className={(selectedClipId || selectedClipIds.length > 0) ? 'text-rose' : 'text-dim'} />
+          </button>
+
+          <button
+            className="btn-ghost icon-only"
+            title="Eliminación Rizo (Ripple Delete): Elimina el clip seleccionado y cierra el hueco automáticamente (Shift+Supr)"
+            onClick={handleRippleDeleteClip}
+            disabled={!selectedClipId && selectedClipIds.length === 0}
+            style={{
+              color: (selectedClipId || selectedClipIds.length > 0) ? '#f59e0b' : undefined
+            }}
+          >
+            <ArrowLeftRight size={15} />
           </button>
 
           {onClearTimeline && (
@@ -2076,6 +2643,23 @@ export const Timeline = React.memo(function Timeline({
             <Sparkles size={13} />
             Guion IA
           </button>
+
+          {onOpenAutoCutModal && (
+            <button
+              className="btn-secondary btn-xs"
+              onClick={onOpenAutoCutModal}
+              style={{
+                background: 'linear-gradient(135deg, rgba(244, 63, 94, 0.22), rgba(6, 182, 212, 0.22))',
+                borderColor: 'rgba(244, 63, 94, 0.45)',
+                color: '#ffffff',
+                fontWeight: 600
+              }}
+              title="Recortes Automáticos IA: Detecta y elimina silencios, respiraciones y tomas repetidas en los clips seleccionados"
+            >
+              <Scissors size={13} style={{ color: '#f43f5e' }} />
+              Recortes IA
+            </button>
+          )}
 
           {/* Quick Insert Documentary Titles */}
           <div style={{ position: 'relative' }}>
@@ -2365,10 +2949,128 @@ export const Timeline = React.memo(function Timeline({
           className="timeline-scroll-content"
           style={{ width: `calc(var(--timeline-header-width) + ${timelineWidth}px)` }}
         >
-          {/* Top Sticky Row (Corner Header + Ruler + Playhead Head) */}
+          {/* Top Sticky Row (Corner Header with Premiere Blue LED Timecode + Ruler + Playhead Head) */}
           <div className="timeline-top-row">
-            <div className="timeline-headers-corner">
-              <span className="corner-label">PISTAS</span>
+            <div className="timeline-headers-corner" style={{ justifyContent: 'space-between', padding: '0 8px', background: '#1b1b1b' }}>
+              <span
+                className="premiere-led-timecode timecode"
+                ref={timecodeBadgeRef}
+                style={{ fontSize: '13.5px' }}
+              >
+                {formatTimecode(currentTime)}
+              </span>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                <button
+                  type="button"
+                  className={`premiere-bin-icon-btn ${snapping ? 'active' : ''}`}
+                  title="Ajuste magnético en la línea de tiempo (Snap)"
+                  onClick={() => setSnapping(!snapping)}
+                  style={{ width: '20px', height: '20px' }}
+                >
+                  <Magnet size={12} />
+                </button>
+                {(() => {
+                  const subTrack = (project.tracks || []).find(t => t.id === SUBTITLE_TRACK_ID || t.isSubtitleTrack);
+                  const hasSubTrack = Boolean(subTrack && (subTrack.clips || []).length > 0);
+                  const isSubActive = Boolean(hasSubTrack && subTrack.visible !== false);
+                  const hasGuide = Boolean((project.tracks || []).some(t => t.type === 'guide' && (t.clips || []).length > 0) || (project.transcript?.segments || []).length > 0);
+                  return (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (onUpdateProject) {
+                            const updated = toggleSubtitlesTrackVisibility(project);
+                            onUpdateProject(updated);
+                          }
+                        }}
+                        style={{
+                          fontSize: '9px',
+                          fontWeight: 800,
+                          padding: '1px 5px',
+                          borderRadius: '2px',
+                          background: isSubActive ? '#eab308' : '#2a2a2a',
+                          color: isSubActive ? '#000000' : '#bcbcbc',
+                          border: isSubActive ? '1px solid #ca8a04' : '1px solid #3c3c3c',
+                          cursor: 'pointer',
+                          lineHeight: '1.4'
+                        }}
+                        title={isSubActive ? 'Subtítulos Activos en Pantalla (Clic para ocultar)' : 'Subtítulos Inactivos (Clic para activar/generar)'}
+                      >
+                        CC
+                      </button>
+
+                      {(hasSubTrack || hasGuide) && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (onUpdateProject) {
+                              const updated = generateSubtitlesTrackFromTranscript(project, { enabled: true });
+                              onUpdateProject(updated);
+                            }
+                          }}
+                          style={{
+                            fontSize: '9px',
+                            fontWeight: 700,
+                            padding: '1px 5px',
+                            borderRadius: '2px',
+                            background: '#242b3b',
+                            color: '#fef08a',
+                            border: '1px solid rgba(234, 179, 8, 0.45)',
+                            cursor: 'pointer',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '2px',
+                            lineHeight: '1.4'
+                          }}
+                          title="Volver a subtitular: Regenerar todos los subtítulos de la pista S1 desde el guion actual"
+                        >
+                          <RotateCcw size={8} />
+                          <span>RE-SUB</span>
+                        </button>
+                      )}
+
+                      {isSubActive && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const currentApply = project.subtitleSettings?.applyToAll !== false;
+                            if (onUpdateProject) {
+                              onUpdateProject({
+                                ...project,
+                                subtitleSettings: {
+                                  ...getDefaultSubtitleSettings(project),
+                                  ...(project.subtitleSettings || {}),
+                                  applyToAll: !currentApply
+                                }
+                              });
+                            }
+                          }}
+                          style={{
+                            fontSize: '9px',
+                            fontWeight: 700,
+                            padding: '1px 4px',
+                            borderRadius: '2px',
+                            background: project.subtitleSettings?.applyToAll !== false ? 'rgba(234, 179, 8, 0.25)' : '#242b3b',
+                            color: project.subtitleSettings?.applyToAll !== false ? '#fef08a' : '#94a3b8',
+                            border: project.subtitleSettings?.applyToAll !== false ? '1px solid #eab308' : '1px solid #3c3c3c',
+                            cursor: 'pointer',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '2px',
+                            lineHeight: '1.4'
+                          }}
+                          title={project.subtitleSettings?.applyToAll !== false ? 'Sincronizar cambios a todos los subtítulos (CapCut: ACTIVO)' : 'Edición individual de subtítulos (CapCut: DESACTIVADO)'}
+                        >
+                          <Sparkles size={8} />
+                          <span>{project.subtitleSettings?.applyToAll !== false ? 'TODOS' : 'INDIV'}</span>
+                        </button>
+                      )}
+                    </>
+                  );
+                })()}
+              </div>
             </div>
 
             <div
@@ -2411,6 +3113,14 @@ export const Timeline = React.memo(function Timeline({
               const idxInType = !isFixed ? sameTypeTracks.findIndex(t => t.id === track.id) : -1;
               const canMoveUp = idxInType > 0;
               const canMoveDown = idxInType >= 0 && idxInType < sameTypeTracks.length - 1;
+              const isSubTrack = track.isSubtitleTrack || track.id === 'track-subtitles-1';
+              const patchLabel = isSubTrack
+                ? 'C1'
+                : (track.type === 'graphics'
+                    ? `G${idxInType + 1}`
+                    : (track.type === 'video'
+                        ? `V${idxInType + 1}`
+                        : (track.type === 'audio' ? `A${idxInType + 1}` : null)));
 
               return (
                 <div
@@ -2435,20 +3145,22 @@ export const Timeline = React.memo(function Timeline({
                     }`}
                   >
                     <div className="track-header-left">
-                      {track.type === 'graphics' && (
-                        <Sparkles size={14} className="track-type-icon" style={{ color: '#38bdf8' }} />
-                      )}
-                      {track.type === 'video' && (
-                        <Video size={14} className="track-type-icon text-indigo" />
-                      )}
-                      {track.type === 'audio' && (
-                        <Music size={14} className="track-type-icon text-cyan" />
-                      )}
-                      {track.type === 'guide' && (
-                        <FileText size={14} className="track-type-icon" style={{ color: '#a855f7' }} />
-                      )}
-                      {track.type === 'scene' && (
-                        <Film size={14} className="track-type-icon" style={{ color: '#06b6d4' }} />
+                      {patchLabel ? (
+                        <span
+                          className={`premiere-patch-badge ${isSubTrack ? 'is-subtitle' : ''}`}
+                          title={`Parche de origen ${patchLabel}`}
+                        >
+                          {patchLabel}
+                        </span>
+                      ) : (
+                        <>
+                          {track.type === 'guide' && (
+                            <FileText size={14} className="track-type-icon" style={{ color: '#a855f7' }} />
+                          )}
+                          {track.type === 'scene' && (
+                            <Film size={14} className="track-type-icon" style={{ color: '#3898ff' }} />
+                          )}
+                        </>
                       )}
                       <span
                         className="track-title"
@@ -2463,7 +3175,7 @@ export const Timeline = React.memo(function Timeline({
                           }
                         }}
                       >
-                        {track.name}
+                        {isSubTrack ? 'Subtitle' : track.name}
                       </span>
                       {isFixed && (
                         <span className="badge-fixed-track" title="Pista de referencia fija">
@@ -2498,23 +3210,41 @@ export const Timeline = React.memo(function Timeline({
                       )}
 
                       {track.type !== 'audio' ? (
-                      <button
-                        className="btn-ghost icon-only btn-xs"
-                        title={track.visible === false ? 'Mostrar pista de video (actualmente oculta, audio activo)' : 'Ocultar pista de video (el audio continúa activo)'}
-                        onClick={() => toggleTrackVisibility(track.id)}
-                      >
-                        {track.visible === false ? (
-                          <EyeOff size={13} className="text-dim" />
-                        ) : (
-                          <Eye size={13} className="text-secondary" />
-                        )}
-                      </button>
-                    ) : (
+                        <>
+                          {isSubTrack && (
+                            <button
+                              type="button"
+                              className="btn-ghost icon-only btn-xs"
+                              title="Volver a subtitular: Regenerar subtítulos de la pista S1 desde el guion"
+                              onClick={() => {
+                                if (onUpdateProject) {
+                                  const updated = generateSubtitlesTrackFromTranscript(project, { enabled: true });
+                                  onUpdateProject(updated);
+                                }
+                              }}
+                              style={{ color: '#facc15' }}
+                            >
+                              <RotateCcw size={12} />
+                            </button>
+                          )}
+                          <button
+                            className="btn-ghost icon-only btn-xs"
+                            title={track.visible === false ? 'Mostrar pista de video (actualmente oculta, audio activo)' : 'Ocultar pista de video (el audio continúa activo)'}
+                            onClick={() => toggleTrackVisibility(track.id)}
+                          >
+                            {track.visible === false ? (
+                              <EyeOff size={13} className="text-dim" />
+                            ) : (
+                              <Eye size={13} className="text-secondary" />
+                            )}
+                          </button>
+                        </>
+                      ) : (
                       <>
                         <button
                           type="button"
                           className="btn-ghost icon-only btn-xs"
-                          title={track.muted ? 'Activar sonido' : 'Silenciar pista'}
+                          title={track.muted ? 'Activar sonido (M)' : 'Silenciar pista (M)'}
                           onClick={(e) => {
                             e.currentTarget.blur();
                             toggleTrackMute(track.id);
@@ -2525,6 +3255,50 @@ export const Timeline = React.memo(function Timeline({
                           ) : (
                             <Volume2 size={13} className="text-secondary" />
                           )}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-ghost icon-only btn-xs"
+                          title={track.solo ? 'Desactivar Solo (S)' : 'Solo (S): escuchar únicamente esta pista'}
+                          onClick={(e) => {
+                            e.currentTarget.blur();
+                            const updatedTracks = project.tracks.map(t =>
+                              t.id === track.id ? { ...t, solo: !t.solo } : t
+                            );
+                            onUpdateProject({ ...project, tracks: updatedTracks });
+                          }}
+                          style={{
+                            fontSize: '9px',
+                            fontWeight: 800,
+                            padding: '0 4px',
+                            borderRadius: '3px',
+                            background: track.solo ? 'rgba(250, 204, 21, 0.22)' : 'transparent',
+                            color: track.solo ? '#facc15' : '#64748b',
+                            border: track.solo ? '1px solid rgba(250, 204, 21, 0.45)' : '1px solid transparent'
+                          }}
+                        >
+                          S
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-ghost icon-only btn-xs"
+                          title={track.autoDuck ? 'Auto-Ducking activo: atenúa música al hablar la voz principal' : 'Activar Auto-Ducking en esta pista de música'}
+                          onClick={(e) => {
+                            e.currentTarget.blur();
+                            const updatedTracks = project.tracks.map(t =>
+                              t.id === track.id ? { ...t, autoDuck: !t.autoDuck } : t
+                            );
+                            onUpdateProject({ ...project, tracks: updatedTracks });
+                          }}
+                          style={{
+                            fontSize: '10px',
+                            padding: '0 3px',
+                            borderRadius: '3px',
+                            background: track.autoDuck ? 'rgba(56, 189, 248, 0.22)' : 'transparent',
+                            opacity: track.autoDuck ? 1 : 0.45
+                          }}
+                        >
+                          🦆
                         </button>
                         {track.type === 'audio' && (
                           <div className="track-volume-control" title={`Volumen de pista: ${Math.round((track.muted ? 0 : (track.volume ?? 1)) * 100)}%`}>
@@ -2688,22 +3462,50 @@ export const Timeline = React.memo(function Timeline({
 
                     if (track.type === 'scene') {
                       const isCurrent = currentTime >= clip.startTime && currentTime <= (clip.startTime + clip.duration);
+                      const isSceneSelected = isSelected || Boolean(
+                        selectedSceneId && (
+                          clip.sceneId === selectedSceneId ||
+                          clip.id === selectedSceneId ||
+                          (clip.sceneNumber && String(clip.sceneNumber) === String(selectedSceneId))
+                        )
+                      );
                       return (
                         <div
                           key={clip.id}
                           data-clip-id={clip.id}
-                          className={`timeline-clip clip-scene ${isSelected ? 'selected' : ''} ${
+                          className={`timeline-clip clip-scene ${isSceneSelected ? 'selected' : ''} ${
                             isCurrent ? 'is-active-scene' : ''
                           }`}
                           style={{
                             left: `${left}px`,
                             width: `${width}px`,
                             backgroundColor: isCurrent ? `${clip.color || '#06b6d4'}45` : `${clip.color || '#06b6d4'}22`,
-                            borderColor: isSelected ? '#38bdf8' : (isCurrent ? '#ffffff' : (clip.color || '#06b6d4'))
+                            borderColor: isSceneSelected ? '#38bdf8' : (isCurrent ? '#ffffff' : (clip.color || '#06b6d4'))
                           }}
-                          onClick={(e) => handleClipClick(clip.id, e)}
+                          onClick={(e) => {
+                            handleClipClick(clip.id, e);
+                            if (onSelectScene) {
+                              onSelectScene(clip);
+                            }
+                          }}
+                          onDoubleClick={(e) => {
+                            e.stopPropagation();
+                            if (onOpenSceneBroll) {
+                              onOpenSceneBroll({
+                                ...clip,
+                                startTime: Number(clip.startTime.toFixed(2)),
+                                duration: Number(clip.duration.toFixed(2)),
+                                endTime: Number((clip.startTime + clip.duration).toFixed(2))
+                              });
+                            }
+                          }}
                           onContextMenu={(e) => handleClipContextMenu(clip, track, e)}
-                          onMouseDown={(e) => handleClipMouseDown(clip, track, e)}
+                          onMouseDown={(e) => {
+                            handleClipMouseDown(clip, track, e);
+                            if (onSelectScene) {
+                              onSelectScene(clip);
+                            }
+                          }}
                           title={`[${formatTimecode(clip.startTime)} - ${formatTimecode(clip.startTime + clip.duration)}] ${clip.name} | ${clip.visualType === 'video' ? 'VIDEO' : 'IMAGEN'}: ${clip.visualDescription || ''}`}
                         >
                           {!track.locked && width >= 14 && (
@@ -2771,75 +3573,55 @@ export const Timeline = React.memo(function Timeline({
                     }
 
                     if (clip.isGraphic || track.type === 'graphics') {
+                      const isSubCaption = clip.graphicType === 'subtitle_caption' || track.isSubtitleTrack || track.id === 'track-subtitles-1';
                       return (
                         <div
                           key={clip.id}
                           data-clip-id={clip.id}
-                          className={`timeline-clip clip-graphic ${isSelected ? 'selected' : ''}`}
-                          style={{
-                            left: `${left}px`,
-                            width: `${width}px`,
-                            backgroundColor: clip.color ? `${clip.color}35` : 'rgba(6, 182, 212, 0.25)',
-                            borderColor: isSelected ? '#38bdf8' : (clip.color || '#06b6d4')
-                          }}
+                          className={`timeline-clip clip-graphic ${isSubCaption ? 'clip-subtitle-amber' : ''} ${isSelected ? 'selected' : ''}`}
                           onClick={(e) => handleClipClick(clip.id, e)}
                           onContextMenu={(e) => handleClipContextMenu(clip, track, e)}
                           onMouseDown={(e) => handleClipMouseDown(clip, track, e)}
+                          onMouseMove={(e) => {
+                            if (activeTool === 'razor') {
+                              setRazorHoverTime(clientXToSeconds(e.clientX));
+                            }
+                          }}
+                          onMouseLeave={() => {
+                            if (activeTool === 'razor') setRazorHoverTime(null);
+                          }}
+                          style={{
+                            left: `${left}px`,
+                            width: `${width}px`,
+                            backgroundColor: isSubCaption ? undefined : (clip.color ? `${clip.color}35` : 'rgba(168, 139, 250, 0.35)'),
+                            borderColor: isSelected ? '#ffffff' : (isSubCaption ? '#fde68a' : (clip.color || '#a78bfa')),
+                            cursor: activeTool === 'razor' ? 'crosshair' : undefined
+                          }}
                           title={`[${formatTimecode(clip.startTime)}] ${clip.name} | ${clip.title || ''}`}
                         >
                           {!track.locked && width >= 14 && (
                             <div
                               className="clip-handle clip-handle-left"
-                              onMouseDown={(e) => {
-                                e.stopPropagation();
-                                setMultiSelection([clip.id]);
-                                const newDrag = {
-                                  type: 'trim-left',
-                                  clipId: clip.id,
-                                  initialX: e.clientX,
-                                  initialY: e.clientY,
-                                  initialStartTime: clip.startTime,
-                                  initialDuration: clip.duration,
-                                  initialSourceStart: clip.sourceStart || 0,
-                                  assetDuration: null,
-                                  trackId: track.id,
-                                  currentTrackId: track.id
-                                };
-                                dragStateRef.current = newDrag;
-                                setDragState(newDrag);
-                              }}
+                              onMouseDown={(e) => handleTrimHandleMouseDown('left', clip, track, null, e)}
                             />
                           )}
 
-                          <div className="clip-content-body clip-graphic-body" style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '0 8px' }}>
+                          <div className="clip-content-body clip-graphic-body" style={{ display: 'flex', alignItems: 'center', gap: '5px', padding: '0 6px' }}>
+                            {!isSubCaption && (
+                              <span className="clip-fx-badge">fx</span>
+                            )}
                             <span
-                              className="badge"
+                              className="clip-name"
                               style={{
-                                fontSize: '9px',
-                                padding: '1px 5px',
-                                background: clip.color || '#06b6d4',
-                                color: '#000000',
-                                fontWeight: '700',
-                                flexShrink: 0
+                                fontWeight: isSubCaption ? '700' : '600',
+                                color: isSubCaption ? '#111111' : '#ffffff',
+                                fontSize: '11px'
                               }}
                             >
-                              {clip.graphicType === 'doc_chapter'
-                                ? 'CAPÍTULO'
-                                : (clip.graphicType === 'doc_stat'
-                                  ? 'CIFRA'
-                                  : (clip.graphicType === 'doc_date'
-                                    ? 'FECHA'
-                                    : (clip.graphicType === 'doc_timeline'
-                                      ? 'LÍNEA TIEMPO'
-                                      : (clip.graphicType === 'chart_bar' || clip.graphicType === 'chart_line' || clip.graphicType === 'chart_donut'
-                                        ? 'CHART'
-                                        : (clip.graphicType === 'kpi_metric' ? 'KPI' : 'TITULAR')))))}
-                            </span>
-                            <span className="clip-name" style={{ fontWeight: '600', color: '#ffffff' }}>
                               {clip.title || clip.name}
                             </span>
-                            {clip.animation?.inType && (
-                              <span style={{ fontSize: '10px', color: '#a5b4fc', marginLeft: 'auto', flexShrink: 0 }}>
+                            {clip.animation?.inType && !isSubCaption && (
+                              <span style={{ fontSize: '9.5px', color: '#dcdcdc', marginLeft: 'auto', flexShrink: 0, opacity: 0.75 }}>
                                 {clip.animation.inType}
                               </span>
                             )}
@@ -2848,24 +3630,7 @@ export const Timeline = React.memo(function Timeline({
                           {!track.locked && width >= 14 && (
                             <div
                               className="clip-handle clip-handle-right"
-                              onMouseDown={(e) => {
-                                e.stopPropagation();
-                                setMultiSelection([clip.id]);
-                                const newDrag = {
-                                  type: 'trim-right',
-                                  clipId: clip.id,
-                                  initialX: e.clientX,
-                                  initialY: e.clientY,
-                                  initialStartTime: clip.startTime,
-                                  initialDuration: clip.duration,
-                                  initialSourceStart: clip.sourceStart || 0,
-                                  assetDuration: null,
-                                  trackId: track.id,
-                                  currentTrackId: track.id
-                                };
-                                dragStateRef.current = newDrag;
-                                setDragState(newDrag);
-                              }}
+                              onMouseDown={(e) => handleTrimHandleMouseDown('right', clip, track, null, e)}
                             />
                           )}
                         </div>
@@ -2883,37 +3648,67 @@ export const Timeline = React.memo(function Timeline({
                           left: `${left}px`,
                           width: `${width}px`,
                           backgroundColor: clip.color ? `${clip.color}28` : undefined,
-                          borderColor: isSelected ? '#38bdf8' : (clip.color || '#6366f1')
+                          borderColor: isSelected ? '#38bdf8' : (clip.color || '#6366f1'),
+                          cursor: activeTool === 'razor'
+                            ? 'crosshair'
+                            : (activeTool === 'slip' ? 'ew-resize' : undefined)
                         }}
                         onClick={(e) => handleClipClick(clip.id, e)}
                         onContextMenu={(e) => handleClipContextMenu(clip, track, e)}
                         onMouseDown={(e) => handleClipMouseDown(clip, track, e)}
+                        onMouseMove={(e) => {
+                          if (activeTool === 'razor') {
+                            setRazorHoverTime(clientXToSeconds(e.clientX));
+                          }
+                        }}
+                        onMouseLeave={() => {
+                          if (activeTool === 'razor') setRazorHoverTime(null);
+                        }}
                       >
+                        {/* Fade-In / Fade-Out Visual Triangles */}
+                        {clip.fadeIn > 0 && (
+                          <div
+                            title={`Fade In: ${Number(clip.fadeIn).toFixed(1)}s`}
+                            style={{
+                              position: 'absolute',
+                              top: 0,
+                              left: 0,
+                              width: `${Math.min(width * 0.5, clip.fadeIn * zoomLevel)}px`,
+                              height: '100%',
+                              background: 'linear-gradient(to top right, transparent 48%, rgba(56, 189, 248, 0.35) 50%)',
+                              borderTop: '2px solid #38bdf8',
+                              pointerEvents: 'none',
+                              zIndex: 3
+                            }}
+                          />
+                        )}
+                        {clip.fadeOut > 0 && (
+                          <div
+                            title={`Fade Out: ${Number(clip.fadeOut).toFixed(1)}s`}
+                            style={{
+                              position: 'absolute',
+                              top: 0,
+                              right: 0,
+                              width: `${Math.min(width * 0.5, clip.fadeOut * zoomLevel)}px`,
+                              height: '100%',
+                              background: 'linear-gradient(to top left, transparent 48%, rgba(56, 189, 248, 0.35) 50%)',
+                              borderTop: '2px solid #38bdf8',
+                              pointerEvents: 'none',
+                              zIndex: 3
+                            }}
+                          />
+                        )}
+
                         {/* Trim Left Handle */}
                         {!track.locked && width >= 14 && (
                           <div
                             className="clip-handle clip-handle-left"
                             onMouseDown={(e) => {
-                              e.stopPropagation();
-                              setMultiSelection([clip.id]);
                               const isImageAsset = asset?.type === 'image';
                               const effectiveDuration = (!isImageAsset && asset?.duration && asset.duration > 0)
                                 ? asset.duration
                                 : (isImageAsset ? null : (getCachedWaveform(clip.assetId)?.duration || null));
-                              const newDrag = {
-                                type: 'trim-left',
-                                clipId: clip.id,
-                                initialX: e.clientX,
-                                initialY: e.clientY,
-                                initialStartTime: clip.startTime,
-                                initialDuration: clip.duration,
-                                initialSourceStart: clip.sourceStart || 0,
-                                assetDuration: effectiveDuration,
-                                trackId: track.id,
-                                currentTrackId: track.id
-                              };
-                              dragStateRef.current = newDrag;
-                              setDragState(newDrag);
+                              handleTrimHandleMouseDown('left', clip, track, effectiveDuration, e);
                             }}
                           ></div>
                         )}
@@ -2953,12 +3748,39 @@ export const Timeline = React.memo(function Timeline({
                             )
                           )}
 
+                          <span
+                            className={`clip-fx-badge ${
+                              (clip.scale && clip.scale !== 1) ||
+                              (clip.brightness && clip.brightness !== 1) ||
+                              (clip.contrast && clip.contrast !== 1) ||
+                              clip.temperature ||
+                              clip.tint ||
+                              (clip.volume !== undefined && clip.volume !== 1)
+                                ? 'is-customized'
+                                : ''
+                            }`}
+                          >
+                            fx
+                          </span>
+
                           <div className="clip-labels">
                             <span className="clip-title-text" title={clip.name}>
                               {clip.name}
                             </span>
-                            <span className="clip-duration-text timecode">
+                            <span className="clip-duration-text timecode" style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
                               {clip.duration.toFixed(1)}s
+                              {clip.playbackRate && Number(clip.playbackRate) !== 1 && (
+                                <span style={{
+                                  fontSize: '9px',
+                                  padding: '0 4px',
+                                  borderRadius: '3px',
+                                  background: 'rgba(245, 158, 11, 0.25)',
+                                  color: '#fbbf24',
+                                  fontWeight: 700
+                                }}>
+                                  {clip.playbackRate}x
+                                </span>
+                              )}
                             </span>
                           </div>
                         </div>
@@ -2968,28 +3790,111 @@ export const Timeline = React.memo(function Timeline({
                           <div
                             className="clip-handle clip-handle-right"
                             onMouseDown={(e) => {
-                              e.stopPropagation();
-                              setMultiSelection([clip.id]);
                               const isImageAsset = asset?.type === 'image';
                               const effectiveDuration = (!isImageAsset && asset?.duration && asset.duration > 0)
                                 ? asset.duration
                                 : (isImageAsset ? null : (getCachedWaveform(clip.assetId)?.duration || null));
-                              const newDrag = {
-                                type: 'trim-right',
-                                clipId: clip.id,
-                                initialX: e.clientX,
-                                initialY: e.clientY,
-                                initialStartTime: clip.startTime,
-                                initialDuration: clip.duration,
-                                initialSourceStart: clip.sourceStart || 0,
-                                assetDuration: effectiveDuration,
-                                trackId: track.id,
-                                currentTrackId: track.id
-                              };
-                              dragStateRef.current = newDrag;
-                              setDragState(newDrag);
+                              handleTrimHandleMouseDown('right', clip, track, effectiveDuration, e);
                             }}
                           ></div>
+                        )}
+                      </div>
+                    );
+                  })}
+
+                  {/* Empty Gap Closer Badges (Eliminar Vacío / Unir Partes) */}
+                  {!track.locked && (trackGapsMap.get(track.id) || []).map((gap) => {
+                    const gapLeft = gap.start * zoomLevel;
+                    const gapWidth = Math.max(2, gap.duration * zoomLevel);
+                    const isCompact = gapWidth < 54;
+                    const isTiny = gapWidth < 22;
+
+                    return (
+                      <div
+                        key={gap.id}
+                        className={`timeline-track-gap ${isCompact ? 'is-compact' : ''} ${isTiny ? 'is-tiny' : ''} ${dragState ? 'is-dragging-mode' : ''}`}
+                        style={{
+                          left: `${gapLeft}px`,
+                          width: `${gapWidth}px`,
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          gap: '4px'
+                        }}
+                        title={`Espacio vacío (${gap.duration.toFixed(2)}s)`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                        }}
+                      >
+                        <button
+                          type="button"
+                          className="gap-delete-btn"
+                          title={`Eliminar vacío (${gap.duration.toFixed(2)}s) y unir pistas`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleDeleteGap(track.id, gap.start, gap.duration);
+                          }}
+                        >
+                          <ArrowLeftRight size={11} className="gap-btn-icon" />
+                          {!isCompact && (
+                            <span className="gap-btn-label">Unir</span>
+                          )}
+                        </button>
+
+                        {track.type === 'video' && onOpenSceneBroll && !isTiny && (
+                          <button
+                            type="button"
+                            className="gap-broll-btn"
+                            title={`Llenar espacio vacío (${gap.duration.toFixed(2)}s) con B-Roll`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              const sceneTrack = (project.tracks || []).find(t => t.type === 'scene');
+                              const matchedSc = sceneTrack?.clips?.find(sc => {
+                                const overlaps = Math.max(0, Math.min(gap.start + gap.duration, sc.startTime + sc.duration) - Math.max(gap.start, sc.startTime));
+                                return Math.abs(sc.startTime - gap.start) < 0.6 || overlaps > 0.1;
+                              });
+                              let fullScene = null;
+                              if (matchedSc) {
+                                const sNum = matchedSc.sceneNumber ? Number(matchedSc.sceneNumber) : null;
+                                const nameMatch = matchedSc.name?.match(/\[E\s*0*(\d+)\]/i) || matchedSc.title?.match(/\[E\s*0*(\d+)\]/i);
+                                const extractedNum = nameMatch ? Number(nameMatch[1]) : null;
+                                const targetNum = sNum || extractedNum;
+                                fullScene = (project.scenes?.list || []).find(s =>
+                                  (targetNum && Number(s.sceneNumber) === targetNum) ||
+                                  (matchedSc.sceneId && s.id === matchedSc.sceneId) ||
+                                  (matchedSc.id && s.id === matchedSc.id)
+                                );
+                              }
+                              onOpenSceneBroll({
+                                ...(fullScene || {}),
+                                ...(matchedSc || {}),
+                                id: matchedSc?.sceneId || fullScene?.id || matchedSc?.id,
+                                sceneNumber: matchedSc?.sceneNumber || fullScene?.sceneNumber || 1,
+                                searchKeywords: fullScene?.searchKeywords || matchedSc?.searchKeywords || [],
+                                visualDescription: fullScene?.visualDescription || matchedSc?.visualDescription || '',
+                                title: matchedSc?.title || fullScene?.title || matchedSc?.name || 'Escena',
+                                startTime: Number(gap.start.toFixed(2)),
+                                duration: Number(gap.duration.toFixed(2)),
+                                endTime: Number((gap.start + gap.duration).toFixed(2))
+                              });
+                            }}
+                            style={{
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: '3px',
+                              padding: '2px 5px',
+                              fontSize: '10px',
+                              fontWeight: 600,
+                              background: 'rgba(6, 182, 212, 0.25)',
+                              color: '#38bdf8',
+                              border: '1px solid rgba(56, 189, 248, 0.4)',
+                              borderRadius: '4px',
+                              cursor: 'pointer'
+                            }}
+                          >
+                            <Download size={10} />
+                            {!isCompact && <span>+ B-Roll</span>}
+                          </button>
                         )}
                       </div>
                     );
@@ -3038,6 +3943,38 @@ export const Timeline = React.memo(function Timeline({
             </div>
           </div>
         )}
+
+        {/* Razor Tool (C) Live Cut Preview Line */}
+        {activeTool === 'razor' && razorHoverTime !== null && (
+          <div
+            style={{
+              position: 'absolute',
+              top: '36px',
+              bottom: 0,
+              left: `calc(var(--timeline-header-width) + ${razorHoverTime * zoomLevel}px)`,
+              width: '2px',
+              borderLeft: '2px dashed #f43f5e',
+              pointerEvents: 'none',
+              zIndex: 95
+            }}
+          >
+            <div style={{
+              position: 'absolute',
+              top: '4px',
+              left: '6px',
+              background: 'rgba(244, 63, 94, 0.92)',
+              color: '#ffffff',
+              fontSize: '10px',
+              fontWeight: 800,
+              padding: '2px 6px',
+              borderRadius: '4px',
+              whiteSpace: 'nowrap',
+              boxShadow: '0 4px 12px rgba(0,0,0,0.5)'
+            }}>
+              ✂️ Cortar {formatTimecode(razorHoverTime)}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Floating Multi-Selection Action Bar */}
@@ -3070,6 +4007,16 @@ export const Timeline = React.memo(function Timeline({
             >
               <Volume2 size={13} />
               <span>Audio</span>
+            </button>
+            <button
+              type="button"
+              className="btn-multiselect"
+              onClick={handleRippleDeleteClip}
+              title="Eliminar y cerrar hueco (Shift+Supr)"
+              style={{ color: '#fbbf24' }}
+            >
+              <ArrowLeftRight size={13} />
+              <span>Rizo</span>
             </button>
             <button
               type="button"
@@ -3124,6 +4071,197 @@ export const Timeline = React.memo(function Timeline({
             )}
           </div>
 
+          {!contextMenu.isMulti && isSubtitleClip(contextMenu.clip, contextMenu.track) && (
+            <>
+              <button
+                type="button"
+                className="context-menu-item"
+                style={{ color: '#eab308', fontWeight: '600' }}
+                onClick={() => {
+                  const currentApply = project.subtitleSettings?.applyToAll !== false;
+                  if (onUpdateProject) {
+                    onUpdateProject({
+                      ...project,
+                      subtitleSettings: {
+                        ...getDefaultSubtitleSettings(project),
+                        ...(project.subtitleSettings || {}),
+                        applyToAll: !currentApply
+                      }
+                    });
+                  }
+                  setContextMenu(null);
+                }}
+              >
+                <Sparkles size={14} style={{ color: '#eab308' }} />
+                <span>
+                  {project.subtitleSettings?.applyToAll !== false
+                    ? '✓ Aplicar a todos los subtítulos (CapCut: Activo)'
+                    : '○ Activar "Aplicar a todos" (CapCut)'}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                className="context-menu-item"
+                style={{ color: '#fef08a' }}
+                onClick={() => {
+                  if (onUpdateProject) {
+                    const c = contextMenu.clip;
+                    const updated = applyGlobalSubtitleStyle(project, {
+                      styleId: c.subtitleStyle || 'hormozi_active',
+                      fontFamily: c.fontFamily,
+                      fontSize: c.fontSize,
+                      textColor: c.textColor,
+                      accentColor: c.accentColor,
+                      bgColor: c.bgColor,
+                      strokeColor: c.strokeColor,
+                      strokeWidth: c.strokeWidth,
+                      textTransform: c.textTransform,
+                      backdropGlass: c.backdropGlass,
+                      highlightWordMode: c.highlightWordMode,
+                      letterSpacing: c.letterSpacing,
+                      textShadowBlur: c.textShadowBlur,
+                      textShadowOffsetY: c.textShadowOffsetY,
+                      textShadowColor: c.textShadowColor,
+                      animationIn: c.animationIn,
+                      animationInDuration: c.animationInDuration,
+                      animationLoop: c.animationLoop,
+                      animationOut: c.animationOut,
+                      animationOutDuration: c.animationOutDuration,
+                      posX: c.position?.x ?? c.positionX,
+                      posY: c.position?.y ?? c.positionY,
+                      scale: c.position?.scale ?? c.scale,
+                      opacity: c.opacity
+                    });
+                    onUpdateProject(updated);
+                  }
+                  setContextMenu(null);
+                }}
+              >
+                <Copy size={14} />
+                <span>Aplicar estilo de este subtítulo a todos</span>
+              </button>
+            </>
+          )}
+
+          {!contextMenu.isMulti && contextMenu.track.type === 'scene' && (
+            <button
+              type="button"
+              className="context-menu-item"
+              style={{ color: '#06b6d4', fontWeight: '600' }}
+              onClick={() => {
+                if (onSelectScene) onSelectScene(contextMenu.clip);
+                setContextMenu(null);
+              }}
+            >
+              <Sliders size={14} className="text-cyan" />
+              <span>⚙️ Ver Propiedades en Escenas IA</span>
+            </button>
+          )}
+
+          {!contextMenu.isMulti && contextMenu.track.type === 'scene' && onOpenSceneBroll && (
+            <button
+              type="button"
+              className="context-menu-item"
+              style={{ color: '#38bdf8', fontWeight: '600' }}
+              onClick={() => {
+                const sClip = contextMenu.clip;
+                const sNum = sClip.sceneNumber ? Number(sClip.sceneNumber) : null;
+                const nameMatch = sClip.name?.match(/\[E\s*0*(\d+)\]/i) || sClip.title?.match(/\[E\s*0*(\d+)\]/i);
+                const extractedNum = nameMatch ? Number(nameMatch[1]) : null;
+                const targetNum = sNum || extractedNum;
+                const fullScene = (project.scenes?.list || []).find(s =>
+                  (targetNum && Number(s.sceneNumber) === targetNum) ||
+                  (sClip.sceneId && s.id === sClip.sceneId) ||
+                  (sClip.id && s.id === sClip.id)
+                );
+                onOpenSceneBroll({
+                  ...(fullScene || {}),
+                  ...sClip,
+                  id: sClip.sceneId || fullScene?.id || sClip.id,
+                  sceneNumber: targetNum || fullScene?.sceneNumber || 1,
+                  searchKeywords: fullScene?.searchKeywords || sClip.searchKeywords || [],
+                  visualDescription: fullScene?.visualDescription || sClip.visualDescription || '',
+                  title: sClip.title || fullScene?.title || sClip.name || `Escena ${targetNum || 1}`,
+                  startTime: Number(sClip.startTime.toFixed(2)),
+                  duration: Number(sClip.duration.toFixed(2)),
+                  endTime: Number((sClip.startTime + sClip.duration).toFixed(2))
+                });
+                setContextMenu(null);
+              }}
+            >
+              <Download size={14} className="text-cyan" />
+              <span>🎬 Buscar / Asignar B-Roll para esta Escena</span>
+            </button>
+          )}
+
+          {!contextMenu.isMulti && contextMenu.track.type === 'scene' && onOpenGraphicForScene && (
+            <button
+              type="button"
+              className="context-menu-item"
+              style={{ color: '#06b6d4', fontWeight: '600' }}
+              onClick={() => {
+                onOpenGraphicForScene({
+                  ...contextMenu.clip,
+                  startTime: Number(contextMenu.clip.startTime.toFixed(2)),
+                  duration: Number(contextMenu.clip.duration.toFixed(2)),
+                  isTimelineClip: true
+                });
+                setContextMenu(null);
+              }}
+            >
+              <Sparkles size={14} className="text-cyan" />
+              <span>✨ Generar Efecto Visual IA para esta Escena</span>
+            </button>
+          )}
+
+          {!contextMenu.isMulti && contextMenu.track.type !== 'scene' && !contextMenu.clip.isGraphic && contextMenu.track.type !== 'audio' && onOpenGraphicForScene && (() => {
+            const sNumFromClip = contextMenu.clip.sceneNumber ? Number(contextMenu.clip.sceneNumber) : null;
+            const nameMatch = contextMenu.clip.name?.match(/\[E\s*0*(\d+)\]/i) || contextMenu.clip.name?.match(/\bEscena\s*0*(\d+)\b/i);
+            const extractedNum = nameMatch ? Number(nameMatch[1]) : null;
+
+            const matchedScene = (project.scenes?.list || []).find(s =>
+              (sNumFromClip && Number(s.sceneNumber) === sNumFromClip) ||
+              (extractedNum && Number(s.sceneNumber) === extractedNum) ||
+              (contextMenu.clip.sceneId && s.id === contextMenu.clip.sceneId) ||
+              (contextMenu.clip.startTime >= s.startTime && contextMenu.clip.startTime < (s.endTime || s.startTime + s.duration))
+            );
+
+            const targetSceneData = {
+              ...(matchedScene || {}),
+              ...contextMenu.clip,
+              id: contextMenu.clip.id,
+              sceneId: contextMenu.clip.sceneId || matchedScene?.id,
+              sceneNumber: sNumFromClip || extractedNum || matchedScene?.sceneNumber || 1,
+              title: contextMenu.clip.title || matchedScene?.title || contextMenu.clip.name || 'Escena',
+              scriptText: contextMenu.clip.text || matchedScene?.scriptText || contextMenu.clip.name || '',
+              visualDescription: contextMenu.clip.visualDescription || matchedScene?.visualDescription || '',
+              visualType: contextMenu.clip.visualType || 'video',
+              startTime: Number(contextMenu.clip.startTime.toFixed(2)),
+              duration: Number(contextMenu.clip.duration.toFixed(2)),
+              isTimelineClip: true
+            };
+
+            return (
+              <button
+                type="button"
+                className="context-menu-item"
+                style={{ color: '#06b6d4', fontWeight: '600' }}
+                onClick={() => {
+                  onOpenGraphicForScene(targetSceneData);
+                  setContextMenu(null);
+                }}
+              >
+                <Sparkles size={14} className="text-cyan" />
+                <span>
+                  {matchedScene
+                    ? `✨ Generar Efecto Visual IA (Escena #${targetSceneData.sceneNumber})`
+                    : '✨ Generar Efecto Visual IA para este Clip'}
+                </span>
+              </button>
+            );
+          })()}
+
           {!contextMenu.isMulti && (
             <button
               type="button"
@@ -3138,7 +4276,7 @@ export const Timeline = React.memo(function Timeline({
             </button>
           )}
 
-          {!contextMenu.isMulti && contextMenu.track.type === 'video' && !contextMenu.clip.audioSeparated && onSeparateAudio && (
+          {!contextMenu.isMulti && contextMenu.track.type === 'video' && contextMenu.clip.audioSeparated === false && !contextMenu.clip.linkedClipId && onSeparateAudio && (
             <button
               type="button"
               className="context-menu-item"
@@ -3235,6 +4373,19 @@ export const Timeline = React.memo(function Timeline({
 
           <button
             type="button"
+            className="context-menu-item"
+            style={{ color: '#fbbf24' }}
+            onClick={() => {
+              handleRippleDeleteClip();
+              setContextMenu(null);
+            }}
+          >
+            <ArrowLeftRight size={14} />
+            <span>{contextMenu.isMulti ? `Eliminar y Cerrar Hueco (${contextMenu.count})` : 'Eliminar y Cerrar Hueco (Shift+Supr)'}</span>
+          </button>
+
+          <button
+            type="button"
             className="context-menu-item text-danger"
             onClick={() => {
               handleDeleteClip();
@@ -3246,8 +4397,43 @@ export const Timeline = React.memo(function Timeline({
           </button>
         </div>
       )}
+        </div>
+      </div>
+
+      {/* 3. Far-Right Vertical Stereo Audio Meter Dock (0 to -54 dB) */}
+      <div className="premiere-meter-dock" title="Medidor Maestro de Nivel de Audio Estéreo (L / R dB)">
+        <div className="premiere-meter-body">
+          <div className="premiere-meter-bars">
+            <div className="premiere-meter-channel">
+              <div ref={meterLeftRef} className="premiere-meter-fill" style={{ height: '0%' }} />
+            </div>
+            <div className="premiere-meter-channel">
+              <div ref={meterRightRef} className="premiere-meter-fill" style={{ height: '0%' }} />
+            </div>
+          </div>
+
+          <div className="premiere-meter-scale">
+            <span>0</span>
+            <span>-6</span>
+            <span>-12</span>
+            <span>-18</span>
+            <span>-24</span>
+            <span>-30</span>
+            <span>-36</span>
+            <span>-42</span>
+            <span>-48</span>
+            <span>-54</span>
+            <span>dB</span>
+          </div>
+        </div>
+
+        <div className="premiere-meter-footer">
+          <span className={`premiere-meter-solo-tag ${(project.tracks || []).some(t => t.solo) ? 'active' : ''}`}>S</span>
+          <span className={`premiere-meter-solo-tag ${(project.tracks || []).some(t => t.solo) ? 'active' : ''}`}>S</span>
+        </div>
+      </div>
+      <MediaAdaptModal {...adaptModal} />
     </div>
-  </div>
   );
 }, (prev, next) => {
   // 1. Continuous Playback Fast-Path:

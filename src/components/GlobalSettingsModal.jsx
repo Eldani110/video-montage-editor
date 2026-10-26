@@ -18,9 +18,21 @@ import {
   Film,
   Download,
   Search,
-  ShieldCheck
+  ShieldCheck,
+  FolderSearch,
+  Cloud,
+  Laptop,
+  Monitor,
+  Check,
+  DownloadCloud,
+  ArrowUpCircle
 } from 'lucide-react';
+import { useAuth } from '../context/AuthContext';
+import { getCurrentDeviceInfo } from '../services/deviceService';
+import { saveUserGeneralSettings, saveDeviceMediaDir, getUserDevices, loadUserSettings, STORAGE_KEY_GEMINI } from '../services/userSettingsService';
+import { isElectronDesktop, pickDesktopFolder } from '../services/localProjectService';
 import { getAutosaveConfig, saveAutosaveConfig } from '../utils/autosaveConfig';
+import { FolderPickerModal } from './FolderPickerModal';
 import {
   getSavedAiConfig,
   saveAiConfig,
@@ -38,53 +50,200 @@ import {
 } from '../utils/stockMediaClient';
 
 export function GlobalSettingsModal({ isOpen, onClose }) {
+  const { user } = useAuth();
   const [config, setConfig] = useState(getSavedAiConfig());
   const [stockConfig, setStockConfig] = useState(getSavedStockConfig());
   const [autosaveConfig, setAutosaveConfig] = useState(getAutosaveConfig);
+  const [geminiApiKey, setGeminiApiKey] = useState(() => {
+    return typeof localStorage !== 'undefined' ? (localStorage.getItem(STORAGE_KEY_GEMINI) || '') : '';
+  });
+  const [currentDevice, setCurrentDevice] = useState(null);
+  const [userDevices, setUserDevices] = useState([]);
+  const [isSaving, setIsSaving] = useState(false);
   const [diskInfo, setDiskInfo] = useState(null);
   const [diskFolders, setDiskFolders] = useState([]);
   const [baseDirInput, setBaseDirInput] = useState('');
   const [isUpdatingBaseDir, setIsUpdatingBaseDir] = useState(false);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
+  const [showFolderPicker, setShowFolderPicker] = useState(false);
   const [isTesting, setIsTesting] = useState(false);
   const [isTestingStock, setIsTestingStock] = useState(false);
   const [stockTestResult, setStockTestResult] = useState(null);
   const [testResult, setTestResult] = useState(null);
   const [errorMessage, setErrorMessage] = useState(null);
   const [successMessage, setSuccessMessage] = useState(null);
-  const [activeTab, setActiveTab] = useState('ai'); // 'ai' | 'stock' | 'storage'
+  const [activeTab, setActiveTab] = useState('ai'); // 'ai' | 'stock' | 'storage' | 'updates'
   const [isManualModel, setIsManualModel] = useState(false);
+  const [appVersion, setAppVersion] = useState('1.0.0');
+  const [checkingUpdates, setCheckingUpdates] = useState(false);
+  const [updateCheckResult, setUpdateCheckResult] = useState(null);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined' && window.electronAPI?.getAppVersion) {
+      window.electronAPI.getAppVersion().then(v => {
+        if (v) setAppVersion(v);
+      }).catch(() => {});
+    }
+  }, []);
+
+  const handleCheckUpdatesManually = async () => {
+    if (!window.electronAPI?.checkForUpdates) {
+      setUpdateCheckResult({
+        type: 'info',
+        message: 'Las actualizaciones automáticas en segundo plano están activas en las versiones empaquetadas de escritorio (Windows, Linux, macOS).'
+      });
+      return;
+    }
+    setCheckingUpdates(true);
+    setUpdateCheckResult(null);
+    try {
+      const res = await window.electronAPI.checkForUpdates();
+      if (res?.status === 'dev-mode') {
+        setUpdateCheckResult({
+          type: 'info',
+          message: 'Modo desarrollo activo: En producción empaquetada, la app consulta directamente GitHub Releases y descarga la actualización automáticamente.'
+        });
+      } else if (res?.success) {
+        setUpdateCheckResult({
+          type: 'success',
+          message: 'Petición enviada. Si existe una versión más reciente, comenzará a descargarse en segundo plano.'
+        });
+      } else {
+        setUpdateCheckResult({
+          type: 'info',
+          message: res?.error || 'Tu aplicación está en la versión más reciente.'
+        });
+      }
+    } catch (err) {
+      setUpdateCheckResult({
+        type: 'error',
+        message: err.message || 'Error al conectar con GitHub Releases'
+      });
+    } finally {
+      setCheckingUpdates(false);
+    }
+  };
+
 
   useEffect(() => {
     if (isOpen) {
       setConfig(getSavedAiConfig());
       setStockConfig(getSavedStockConfig());
       setAutosaveConfig(getAutosaveConfig());
+      if (typeof localStorage !== 'undefined') {
+        setGeminiApiKey(localStorage.getItem(STORAGE_KEY_GEMINI) || '');
+      }
       setTestResult(null);
       setStockTestResult(null);
       setErrorMessage(null);
+
+      // Refresh from Cloud Firestore and local disk backup
+      loadUserSettings(user).then(loaded => {
+        if (loaded) {
+          setConfig(getSavedAiConfig());
+          setStockConfig(getSavedStockConfig());
+          setAutosaveConfig(getAutosaveConfig());
+          if (typeof localStorage !== 'undefined') {
+            setGeminiApiKey(localStorage.getItem(STORAGE_KEY_GEMINI) || '');
+          }
+        }
+      }).catch(err => {
+        console.warn('[GlobalSettingsModal] Error loading cloud settings:', err);
+      });
+
+      getCurrentDeviceInfo().then(dev => setCurrentDevice(dev));
+      if (user) {
+        getUserDevices(user).then(devs => setUserDevices(devs));
+      }
       getStorageDiskInfo().then(info => {
         setDiskInfo(info);
-        if (info?.mediaDir) setBaseDirInput(info.mediaDir);
+        const userSavedDir = typeof localStorage !== 'undefined' ? localStorage.getItem('montage_device_local_dir') : null;
+        if (user && userSavedDir) {
+          setBaseDirInput(userSavedDir);
+        } else if (!user) {
+          setBaseDirInput('');
+        } else if (info?.mediaDir) {
+          setBaseDirInput(info.mediaDir);
+        }
       });
       getDiskMediaFolders().then(folders => setDiskFolders(folders));
       setSuccessMessage(null);
     }
-  }, [isOpen]);
+
+    const handleSettingsSynced = () => {
+      setConfig(getSavedAiConfig());
+      setStockConfig(getSavedStockConfig());
+      setAutosaveConfig(getAutosaveConfig());
+      if (typeof localStorage !== 'undefined') {
+        setGeminiApiKey(localStorage.getItem(STORAGE_KEY_GEMINI) || '');
+      }
+    };
+    window.addEventListener('montage_user_settings_synced', handleSettingsSynced);
+    return () => {
+      window.removeEventListener('montage_user_settings_synced', handleSettingsSynced);
+    };
+  }, [isOpen, user]);
 
   if (!isOpen) return null;
 
   const currentPreset = PROVIDER_PRESETS.find(p => p.id === config.provider) || PROVIDER_PRESETS[0];
 
-  const handleProviderChange = (providerId) => {
-    const preset = PROVIDER_PRESETS.find(p => p.id === providerId) || PROVIDER_PRESETS[0];
+  const updateActiveProviderConfig = (updates) => {
+    setConfig(prev => {
+      const activeProvider = prev.provider || 'ollama_cloud';
+      const currentConfigs = prev.providerConfigs || {};
+      const activeProviderData = {
+        ...(currentConfigs[activeProvider] || {}),
+        apiKey: updates.apiKey !== undefined ? updates.apiKey : prev.apiKey,
+        baseUrl: updates.baseUrl !== undefined ? updates.baseUrl : prev.baseUrl,
+        selectedModel: updates.selectedModel !== undefined ? updates.selectedModel : prev.selectedModel,
+        availableModels: updates.availableModels !== undefined ? updates.availableModels : prev.availableModels
+      };
+      return {
+        ...prev,
+        ...updates,
+        providerConfigs: {
+          ...currentConfigs,
+          [activeProvider]: activeProviderData
+        }
+      };
+    });
+  };
+
+  const handleProviderChange = (newProviderId) => {
+    const preset = PROVIDER_PRESETS.find(p => p.id === newProviderId) || PROVIDER_PRESETS[0];
+
+    // 1. Snapshot current provider's settings into providerConfigs
+    const activeProviderId = config.provider || 'ollama_cloud';
+    const updatedProviderConfigs = {
+      ...(config.providerConfigs || {}),
+      [activeProviderId]: {
+        baseUrl: config.baseUrl,
+        apiKey: config.apiKey,
+        selectedModel: config.selectedModel,
+        availableModels: config.availableModels
+      }
+    };
+
+    // 2. Load settings for the new target provider
+    const targetData = updatedProviderConfigs[newProviderId] || {};
+    const targetBaseUrl = targetData.baseUrl || preset.defaultUrl;
+    const targetApiKey = targetData.apiKey !== undefined ? targetData.apiKey : '';
+    const targetAvailableModels = (Array.isArray(targetData.availableModels) && targetData.availableModels.length > 0)
+      ? targetData.availableModels
+      : (preset.defaultModels.length > 0 ? preset.defaultModels : []);
+    const targetSelectedModel = targetData.selectedModel || (targetAvailableModels[0] || '');
+
     const newConfig = {
       ...config,
-      provider: providerId,
-      baseUrl: preset.defaultUrl,
-      selectedModel: preset.defaultModels[0] || config.selectedModel,
-      availableModels: preset.defaultModels.length > 0 ? preset.defaultModels : config.availableModels
+      provider: newProviderId,
+      baseUrl: targetBaseUrl,
+      apiKey: targetApiKey,
+      selectedModel: targetSelectedModel,
+      availableModels: targetAvailableModels,
+      providerConfigs: updatedProviderConfigs
     };
+
     setConfig(newConfig);
     setErrorMessage(null);
     setSuccessMessage(null);
@@ -97,11 +256,11 @@ export function GlobalSettingsModal({ isOpen, onClose }) {
     setSuccessMessage(null);
     try {
       const models = await fetchAvailableModels(config.baseUrl, config.apiKey);
-      setConfig(prev => ({
-        ...prev,
+      const selected = models.includes(config.selectedModel) ? config.selectedModel : models[0];
+      updateActiveProviderConfig({
         availableModels: models,
-        selectedModel: models.includes(prev.selectedModel) ? prev.selectedModel : models[0]
-      }));
+        selectedModel: selected
+      });
       setSuccessMessage(`¡Conexión exitosa! Se encontraron ${models.length} modelos disponibles en tu API.`);
     } catch (err) {
       console.error('Error fetching models:', err);
@@ -170,18 +329,27 @@ export function GlobalSettingsModal({ isOpen, onClose }) {
     }
   };
 
-  const handleSaveBaseDir = async (e) => {
+  const handleSaveBaseDir = async (e, explicitDir = null) => {
     e?.preventDefault();
-    if (!baseDirInput.trim()) return;
+    const targetDir = (explicitDir || baseDirInput).trim();
+    if (!targetDir) return;
     setIsUpdatingBaseDir(true);
     setErrorMessage(null);
     try {
-      const res = await updateBaseMediaDir(baseDirInput.trim());
-      setSuccessMessage(`Ruta base de medios actualizada a: ${res.baseMediaDir}`);
+      const res = await saveDeviceMediaDir(user, targetDir);
+      const activePath = res?.baseMediaDir || targetDir;
+      setSuccessMessage(
+        user
+          ? `Ruta guardada y vinculada a este equipo (${currentDevice?.deviceName || 'Local'}) en tu cuenta: ${activePath}`
+          : `Ruta base de medios actualizada a: ${activePath}`
+      );
       const info = await getStorageDiskInfo();
       setDiskInfo(info);
       const folders = await getDiskMediaFolders();
       setDiskFolders(folders);
+      if (user) {
+        getUserDevices(user).then(devs => setUserDevices(devs));
+      }
     } catch (err) {
       setErrorMessage(`Error al actualizar ruta: ${err.message}`);
     } finally {
@@ -189,13 +357,42 @@ export function GlobalSettingsModal({ isOpen, onClose }) {
     }
   };
 
-  const handleSave = () => {
-    saveAiConfig(config);
-    saveStockConfig(stockConfig);
-    setSuccessMessage('Configuración de IA y Stock Media guardada exitosamente.');
-    setTimeout(() => {
-      onClose();
-    }, 400);
+  const handleSave = async () => {
+    setIsSaving(true);
+    try {
+      const activeProvider = config.provider || 'ollama_cloud';
+      const finalConfig = {
+        ...config,
+        providerConfigs: {
+          ...(config.providerConfigs || {}),
+          [activeProvider]: {
+            apiKey: config.apiKey || '',
+            baseUrl: config.baseUrl || '',
+            selectedModel: config.selectedModel || '',
+            availableModels: Array.isArray(config.availableModels) ? config.availableModels : []
+          }
+        }
+      };
+
+      await saveUserGeneralSettings(user, {
+        aiConfig: finalConfig,
+        stockConfig,
+        autosaveConfig,
+        geminiApiKey
+      });
+      setSuccessMessage(
+        user
+          ? 'Configuración guardada y sincronizada en tu cuenta en la nube para todos tus dispositivos.'
+          : 'Configuración guardada localmente.'
+      );
+      setTimeout(() => {
+        onClose();
+      }, 500);
+    } catch (err) {
+      setErrorMessage(`Error al guardar configuración: ${err.message}`);
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   return (
@@ -207,8 +404,19 @@ export function GlobalSettingsModal({ isOpen, onClose }) {
               <Settings size={20} style={{ color: '#6366f1' }} />
             </div>
             <div>
-              <h3>Configuración General del Editor</h3>
-              <p>Gestiona la IA Agéntica Editora (DeepSeek, Ollama) y Stock Media (Pexels, Pixabay)</p>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                <h3 style={{ margin: 0 }}>Configuración General del Editor</h3>
+                {user ? (
+                  <span className="badge badge-emerald" style={{ fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                    <Cloud size={11} /> Conectado ({user.email})
+                  </span>
+                ) : (
+                  <span className="badge" style={{ fontSize: '11px', background: 'rgba(255,255,255,0.08)', color: 'var(--text-muted)' }}>
+                    Modo Local (Inicia sesión para guardar en la nube)
+                  </span>
+                )}
+              </div>
+              <p style={{ margin: '2px 0 0 0' }}>Gestiona la IA Agéntica Editora (DeepSeek, Ollama), Stock Media y almacenamiento por dispositivo</p>
             </div>
           </div>
           <button className="btn-ghost icon-only" onClick={onClose}>
@@ -283,6 +491,28 @@ export function GlobalSettingsModal({ isOpen, onClose }) {
             <HardDrive size={15} style={{ color: '#10b981' }} />
             Almacenamiento Local & Privacidad
           </button>
+
+          <button
+            type="button"
+            className={`tab-btn ${activeTab === 'updates' ? 'active' : ''}`}
+            onClick={() => setActiveTab('updates')}
+            style={{
+              padding: '10px 16px',
+              background: 'none',
+              border: 'none',
+              borderBottom: activeTab === 'updates' ? '2px solid #8b5cf6' : '2px solid transparent',
+              color: activeTab === 'updates' ? 'var(--text-primary)' : 'var(--text-muted)',
+              fontWeight: 500,
+              fontSize: '13px',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              cursor: 'pointer'
+            }}
+          >
+            <DownloadCloud size={15} style={{ color: '#8b5cf6' }} />
+            Actualizaciones & Sistema
+          </button>
         </div>
 
         <div className="modal-form" style={{ maxHeight: 'calc(80vh - 150px)', overflowY: 'auto' }}>
@@ -334,7 +564,7 @@ export function GlobalSettingsModal({ isOpen, onClose }) {
                     className="input-field"
                     placeholder="https://api.deepseek.com o https://ollama.com"
                     value={config.baseUrl}
-                    onChange={(e) => setConfig({ ...config, baseUrl: e.target.value })}
+                    onChange={(e) => updateActiveProviderConfig({ baseUrl: e.target.value })}
                   />
                   <span style={{ fontSize: '11px', color: 'var(--text-dim)', marginTop: '3px' }}>
                     {currentPreset.description}
@@ -362,7 +592,7 @@ export function GlobalSettingsModal({ isOpen, onClose }) {
                     className="input-field"
                     placeholder={currentPreset.keyPlaceholder}
                     value={config.apiKey}
-                    onChange={(e) => setConfig({ ...config, apiKey: e.target.value })}
+                    onChange={(e) => updateActiveProviderConfig({ apiKey: e.target.value })}
                     style={{ marginTop: '6px' }}
                   />
                   <span style={{ fontSize: '11px', color: 'var(--text-dim)', marginTop: '3px' }}>
@@ -406,7 +636,7 @@ export function GlobalSettingsModal({ isOpen, onClose }) {
                   <select
                     className="input-field"
                     value={config.selectedModel}
-                    onChange={(e) => setConfig({ ...config, selectedModel: e.target.value })}
+                    onChange={(e) => updateActiveProviderConfig({ selectedModel: e.target.value })}
                     style={{ width: '100%', fontWeight: 500 }}
                   >
                     {(config.availableModels || []).map((m) => (
@@ -421,7 +651,7 @@ export function GlobalSettingsModal({ isOpen, onClose }) {
                     className="input-field"
                     placeholder="Escribe el nombre del modelo (ej. deepseek-v4-pro:0813, gemma4:31b)..."
                     value={config.selectedModel}
-                    onChange={(e) => setConfig({ ...config, selectedModel: e.target.value })}
+                    onChange={(e) => updateActiveProviderConfig({ selectedModel: e.target.value })}
                   />
                 )}
 
@@ -541,6 +771,34 @@ export function GlobalSettingsModal({ isOpen, onClose }) {
                   </pre>
                 </div>
               )}
+
+              {/* Google Gemini API Key (Multimodal Audio Transcription & Subtitles) */}
+              <div className="form-group" style={{ background: 'rgba(99, 102, 241, 0.05)', padding: '14px', borderRadius: 'var(--radius-sm)', border: '1px solid rgba(99, 102, 241, 0.25)', marginTop: '14px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <label style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <Sparkles size={14} style={{ color: '#818cf8' }} /> Clave API de Google Gemini (Transcripción & Subtítulos)
+                  </label>
+                  <a
+                    href="https://aistudio.google.com/app/apikey"
+                    target="_blank"
+                    rel="noreferrer"
+                    style={{ fontSize: '11px', color: '#818cf8', display: 'flex', alignItems: 'center', gap: '3px', textDecoration: 'none' }}
+                  >
+                    Obtener clave en Google AI Studio <ExternalLink size={10} />
+                  </a>
+                </div>
+                <input
+                  type="password"
+                  className="input-field"
+                  placeholder="AIzaSy..."
+                  value={geminiApiKey}
+                  onChange={(e) => setGeminiApiKey(e.target.value)}
+                  style={{ marginTop: '8px' }}
+                />
+                <span style={{ fontSize: '11px', color: 'var(--text-dim)', marginTop: '4px' }}>
+                  Sincronizada con tu cuenta en la nube. Se utiliza para generar transcripciones de audio y subtítulos automáticos en la línea de tiempo.
+                </span>
+              </div>
             </>
           )}
 
@@ -556,14 +814,21 @@ export function GlobalSettingsModal({ isOpen, onClose }) {
                 flexDirection: 'column',
                 gap: '12px'
               }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '6px' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#06b6d4', fontWeight: 600, fontSize: '13px' }}>
                     <HardDrive size={15} />
-                    <span>Ruta Base de Almacenamiento Multimedia:</span>
+                    <span>Ruta Base en Disco ({currentDevice?.deviceName || 'Este Dispositivo'}):</span>
                   </div>
-                  <span className="badge badge-emerald" style={{ fontSize: '10px' }}>
-                    ✓ Subcarpetas por Proyecto
-                  </span>
+                  <div style={{ display: 'flex', gap: '6px' }}>
+                    {user && (
+                      <span className="badge badge-indigo" style={{ fontSize: '10px' }}>
+                        ✓ Guardada por dispositivo
+                      </span>
+                    )}
+                    <span className="badge badge-emerald" style={{ fontSize: '10px' }}>
+                      ✓ Subcarpetas por Proyecto
+                    </span>
+                  </div>
                 </div>
 
                 <div style={{ display: 'flex', gap: '8px' }}>
@@ -579,8 +844,26 @@ export function GlobalSettingsModal({ isOpen, onClose }) {
                     }}
                     value={baseDirInput}
                     onChange={(e) => setBaseDirInput(e.target.value)}
-                    placeholder="/ruta/hacia/projects_media"
+                    placeholder="/ruta/hacia/carpeta_de_medios"
                   />
+                  <button
+                    type="button"
+                    className="btn-secondary btn-sm"
+                    onClick={async () => {
+                      if (isElectronDesktop()) {
+                        const nativeDir = await pickDesktopFolder();
+                        if (nativeDir) {
+                          setBaseDirInput(nativeDir);
+                          handleSaveBaseDir(null, nativeDir);
+                          return;
+                        }
+                      }
+                      setShowFolderPicker(true);
+                    }}
+                    title="Explorar carpetas del disco"
+                  >
+                    <FolderSearch size={13} /> Elegir...
+                  </button>
                   <button
                     type="button"
                     className="btn-primary btn-sm"
@@ -894,6 +1177,68 @@ export function GlobalSettingsModal({ isOpen, onClose }) {
                 )}
               </div>
 
+              {/* Multi-Device Identification & Cloud Sync Card */}
+              <div className="form-group" style={{ background: 'var(--bg-input)', padding: '14px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-subtle)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
+                  <h4 style={{ margin: 0, fontSize: '13px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <Laptop size={16} className="text-indigo" />
+                    Identificación de Dispositivo & Sincronización en la Nube
+                  </h4>
+                  {currentDevice && (
+                    <span className="badge badge-indigo" style={{ fontSize: '10px' }}>
+                      {currentDevice.platformName}
+                    </span>
+                  )}
+                </div>
+                <p style={{ fontSize: '12px', color: 'var(--text-secondary)', margin: '0 0 10px 0', lineHeight: 1.5 }}>
+                  Tu configuración de IA, modelos y preferencias persiste en la nube para tu cuenta. La carpeta de proyectos en disco se guarda de forma independiente para cada dispositivo para que cada máquina (Mac, Windows, Linux) conserve su ruta local óptima.
+                </p>
+                <div style={{ background: 'rgba(0,0,0,0.3)', padding: '10px 12px', borderRadius: '6px', fontSize: '12px', border: '1px solid var(--border-subtle)' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+                    <span style={{ color: 'var(--text-muted)' }}>Dispositivo Actual:</span>
+                    <strong style={{ color: '#38bdf8' }}>{currentDevice?.deviceName || 'Detectando...'}</strong>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+                    <span style={{ color: 'var(--text-muted)' }}>ID de Dispositivo:</span>
+                    <span style={{ fontFamily: 'monospace', fontSize: '11px', color: 'var(--text-secondary)' }}>{currentDevice?.deviceId || '—'}</span>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span style={{ color: 'var(--text-muted)' }}>Carpeta Vinculada a este Equipo:</span>
+                    <span style={{ fontFamily: 'monospace', fontSize: '11px', color: '#10b981' }}>
+                      {user
+                        ? (typeof localStorage !== 'undefined' && localStorage.getItem('montage_device_local_dir')
+                            ? localStorage.getItem('montage_device_local_dir')
+                            : 'Sin vincular')
+                        : 'Sin vincular (modo invitado)'}
+                    </span>
+                  </div>
+                </div>
+
+                {user && userDevices.length > 0 && (
+                  <div style={{ marginTop: '10px', paddingTop: '10px', borderTop: '1px solid rgba(255,255,255,0.06)' }}>
+                    <span style={{ fontSize: '11px', color: 'var(--text-muted)', display: 'block', marginBottom: '6px', fontWeight: 600 }}>
+                      Dispositivos guardados en tu cuenta ({userDevices.length}):
+                    </span>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                      {userDevices.map(d => (
+                        <div key={d.deviceId} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(255,255,255,0.03)', padding: '6px 10px', borderRadius: '4px', fontSize: '11px' }}>
+                          <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                            <Monitor size={12} style={{ color: d.deviceId === currentDevice?.deviceId ? '#10b981' : '#818cf8' }} />
+                            <span>{d.deviceName || d.deviceId}</span>
+                            {d.deviceId === currentDevice?.deviceId && (
+                              <span className="badge badge-emerald" style={{ fontSize: '9px', padding: '1px 4px' }}>Este equipo</span>
+                            )}
+                          </span>
+                          <span style={{ fontFamily: 'monospace', color: 'var(--text-secondary)' }}>
+                            {d.baseMediaDir || 'projects_media'}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+
               <div className="form-group" style={{ background: 'var(--bg-input)', padding: '14px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-subtle)' }}>
                 <h4 style={{ margin: '0 0 6px 0', fontSize: '13px' }}>Arquitectura 100% Local (Estilo Clipchamp)</h4>
                 <p style={{ fontSize: '12px', color: 'var(--text-secondary)', margin: '0 0 10px 0', lineHeight: 1.5 }}>
@@ -913,6 +1258,101 @@ export function GlobalSettingsModal({ isOpen, onClose }) {
               </div>
             </div>
           )}
+
+          {activeTab === 'updates' && (
+            <div className="tab-pane" style={{ display: 'flex', flexDirection: 'column', gap: '18px' }}>
+              <div className="form-group" style={{ background: 'var(--bg-input)', padding: '18px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-subtle)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '16px', flexWrap: 'wrap' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
+                    <div style={{
+                      width: '44px',
+                      height: '44px',
+                      borderRadius: '10px',
+                      background: 'rgba(99, 102, 241, 0.15)',
+                      border: '1px solid rgba(99, 102, 241, 0.35)',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      color: '#818cf8'
+                    }}>
+                      <ArrowUpCircle size={24} />
+                    </div>
+                    <div>
+                      <h4 style={{ margin: '0 0 4px 0', fontSize: '15px', color: 'var(--text-primary)' }}>
+                        Montage Studio Desktop
+                      </h4>
+                      <p style={{ margin: 0, fontSize: '12px', color: 'var(--text-secondary)' }}>
+                        Versión instalada: <strong style={{ color: '#a5b4fc' }}>v{appVersion}</strong>
+                      </p>
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    className="btn-primary"
+                    onClick={handleCheckUpdatesManually}
+                    disabled={checkingUpdates}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '8px',
+                      padding: '8px 16px',
+                      fontSize: '12.5px',
+                      fontWeight: 600
+                    }}
+                  >
+                    <RefreshCw size={14} className={checkingUpdates ? 'spin' : ''} />
+                    {checkingUpdates ? 'Buscando...' : 'Buscar Actualizaciones'}
+                  </button>
+                </div>
+
+                {updateCheckResult && (
+                  <div style={{
+                    marginTop: '14px',
+                    padding: '10px 14px',
+                    borderRadius: '6px',
+                    fontSize: '12px',
+                    lineHeight: 1.5,
+                    background: updateCheckResult.type === 'error' ? 'rgba(239, 68, 68, 0.12)' : 'rgba(99, 102, 241, 0.12)',
+                    border: `1px solid ${updateCheckResult.type === 'error' ? 'rgba(239, 68, 68, 0.3)' : 'rgba(99, 102, 241, 0.3)'}`,
+                    color: updateCheckResult.type === 'error' ? '#fca5a5' : '#c7d2fe'
+                  }}>
+                    {updateCheckResult.message}
+                  </div>
+                )}
+              </div>
+
+              <div className="form-group" style={{ background: 'var(--bg-input)', padding: '16px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-subtle)' }}>
+                <h4 style={{ margin: '0 0 8px 0', fontSize: '13px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <Globe size={14} style={{ color: '#06b6d4' }} />
+                  Canal de Distribución Oficial
+                </h4>
+                <p style={{ fontSize: '12px', color: 'var(--text-secondary)', margin: '0 0 12px 0', lineHeight: 1.5 }}>
+                  Las nuevas versiones se publican de forma automática a través de GitHub Releases con integración continua de GitHub Actions para Linux, Windows y macOS.
+                </p>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                  <a
+                    href="https://github.com/Eldani110/video-montage-editor/releases"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="btn-secondary"
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '6px',
+                      padding: '6px 12px',
+                      fontSize: '12px',
+                      textDecoration: 'none',
+                      color: 'var(--text-primary)'
+                    }}
+                  >
+                    <ExternalLink size={13} />
+                    Ver Historial de Versiones en GitHub
+                  </a>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="modal-footer">
@@ -924,6 +1364,17 @@ export function GlobalSettingsModal({ isOpen, onClose }) {
           </button>
         </div>
       </div>
+
+      <FolderPickerModal
+        isOpen={showFolderPicker}
+        onClose={() => setShowFolderPicker(false)}
+        initialPath={baseDirInput || diskInfo?.mediaDir || null}
+        title="Elegir carpeta base de proyectos y recursos"
+        onSelect={(selected) => {
+          setBaseDirInput(selected);
+          handleSaveBaseDir(null, selected);
+        }}
+      />
     </div>
   );
 }

@@ -16,6 +16,79 @@ export const FONT_OPTIONS = [
   { id: 'JetBrains Mono', name: 'JetBrains Mono (Código & Métricas)', family: "'JetBrains Mono', monospace" }
 ];
 
+export const SUBTITLE_STYLE_PRESETS = [
+  {
+    id: 'hormozi_active',
+    name: 'Hormozi (Impacto Amarillo & Borde)',
+    fontFamily: 'Montserrat',
+    fontSize: 42,
+    textColor: '#ffffff',
+    accentColor: '#facc15',
+    bgColor: 'rgba(0, 0, 0, 0.75)',
+    strokeColor: '#000000',
+    strokeWidth: 6,
+    textTransform: 'uppercase',
+    backdropGlass: false,
+    highlightWordMode: true
+  },
+  {
+    id: 'mrbeast_punch',
+    name: 'MrBeast (Neón Verde & Borde Alto)',
+    fontFamily: 'Outfit',
+    fontSize: 44,
+    textColor: '#ffffff',
+    accentColor: '#22c55e',
+    bgColor: 'rgba(0, 0, 0, 0.8)',
+    strokeColor: '#000000',
+    strokeWidth: 6,
+    textTransform: 'uppercase',
+    backdropGlass: false,
+    highlightWordMode: true
+  },
+  {
+    id: 'doc_clean',
+    name: 'Documental Minimalista (Inter)',
+    fontFamily: 'Inter',
+    fontSize: 34,
+    textColor: '#ffffff',
+    accentColor: '#38bdf8',
+    bgColor: 'rgba(15, 23, 42, 0.85)',
+    strokeColor: 'rgba(0, 0, 0, 0.6)',
+    strokeWidth: 2,
+    textTransform: 'none',
+    backdropGlass: true,
+    highlightWordMode: false
+  },
+  {
+    id: 'cinematic_gold',
+    name: 'Cinemático Oro (Playfair)',
+    fontFamily: 'Playfair Display',
+    fontSize: 36,
+    textColor: '#f8fafc',
+    accentColor: '#fbbf24',
+    bgColor: 'rgba(10, 10, 15, 0.8)',
+    strokeColor: '#000000',
+    strokeWidth: 3,
+    textTransform: 'none',
+    backdropGlass: false,
+    highlightWordMode: false
+  },
+  {
+    id: 'cyber_cyan',
+    name: 'Cyber Tech (Mono Cyan)',
+    fontFamily: 'JetBrains Mono',
+    fontSize: 34,
+    textColor: '#e0f2fe',
+    accentColor: '#06b6d4',
+    bgColor: 'rgba(8, 12, 22, 0.88)',
+    strokeColor: '#000000',
+    strokeWidth: 4,
+    textTransform: 'uppercase',
+    backdropGlass: true,
+    highlightWordMode: true
+  }
+];
+
 export const ANIMATION_IN_TYPES = [
   { id: 'fade', name: 'Fundido Suave (Fade In)', icon: 'Sparkles', desc: 'Opacidad progresiva elegante' },
   { id: 'slide-up', name: 'Deslizar desde Abajo (Slide Up)', icon: 'ArrowUp', desc: 'Sube con suavizado dinámico' },
@@ -382,10 +455,10 @@ export function computeGraphicAnimationState(clip, currentTime) {
   const outType = clip.animation?.outType || 'fade';
 
   let currentOpacity = clip.opacity !== undefined ? clip.opacity : 1.0;
-  let offsetX = clip.position?.x || 0;
-  let offsetY = clip.position?.y || 0;
-  let scale = clip.position?.scale || 1.0;
-  let rotate = 0;
+  let offsetX = clip.positionX ?? clip.position?.x ?? 0;
+  let offsetY = clip.positionY ?? clip.position?.y ?? 0;
+  let scale = clip.scale ?? clip.position?.scale ?? 1.0;
+  let rotate = clip.rotation ?? clip.position?.rotation ?? 0;
   let typewriterRatio = 1.0;
   let isGlitching = false;
 
@@ -1084,6 +1157,69 @@ export function drawGraphicCanvas(ctx, clip, currentTime, canvasWidth, canvasHei
         ctx.fillStyle = accentColor;
         ctx.fillText(`— ${clip.quoteAuthor || clip.subtitle}`, qW / 2 - 28, qH / 2 - 22);
       }
+      break;
+    }
+
+    case 'subtitle_caption': {
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.font = `800 ${fontSize}px ${fontFam}, sans-serif`;
+
+      const strokeW = Number(clip.strokeWidth !== undefined ? clip.strokeWidth : 5);
+      const isVerticalCanvas = (ctx.canvas?.height || 720) > (ctx.canvas?.width || 1280);
+      const defaultWrapW = isVerticalCanvas ? 605 : 960;
+      const maxWrapW = Number(clip.boxWidth || defaultWrapW);
+
+      const words = (titleText || '').trim().split(/\s+/).filter(Boolean);
+      const lines = [];
+      let currentLine = '';
+
+      for (let i = 0; i < words.length; i++) {
+        const testLine = currentLine ? `${currentLine} ${words[i]}` : words[i];
+        const testW = ctx.measureText(testLine).width;
+        if (testW > maxWrapW && currentLine) {
+          lines.push(currentLine);
+          currentLine = words[i];
+        } else {
+          currentLine = testLine;
+        }
+      }
+      if (currentLine) lines.push(currentLine);
+      if (lines.length === 0) lines.push(titleText);
+
+      const lineHeight = fontSize * 1.25;
+      const totalH = lines.length * lineHeight;
+      const startY = -(totalH / 2) + (lineHeight / 2);
+
+      let maxLineW = 0;
+      lines.forEach(line => {
+        const lw = ctx.measureText(line).width;
+        if (lw > maxLineW) maxLineW = lw;
+      });
+
+      if (clip.backdropGlass) {
+        const cardW = Math.min(1080, Math.max(260, maxLineW + 48));
+        const cardH = totalH + 24;
+        drawRoundedBox(ctx, -cardW / 2, -cardH / 2, cardW, cardH, 12, clip.bgColor || 'rgba(0, 0, 0, 0.75)', clip.strokeColor || 'rgba(255, 255, 255, 0.15)');
+      }
+
+      lines.forEach((line, lineIdx) => {
+        const lineY = startY + (lineIdx * lineHeight);
+        if (strokeW > 0) {
+          ctx.strokeStyle = clip.strokeColor || '#000000';
+          ctx.lineWidth = strokeW * 2;
+          ctx.lineJoin = 'round';
+          ctx.miterLimit = 2;
+          ctx.shadowColor = 'transparent';
+          ctx.strokeText(line, 0, lineY);
+        }
+
+        ctx.fillStyle = textColor;
+        ctx.shadowColor = shadowColor;
+        ctx.shadowBlur = shadowBlur;
+        ctx.shadowOffsetY = shadowOffsetY;
+        ctx.fillText(line, 0, lineY);
+      });
       break;
     }
 

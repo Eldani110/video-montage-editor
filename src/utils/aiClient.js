@@ -8,7 +8,7 @@ export const STORAGE_KEY_AI_CONFIG = 'montage_pro_ai_config';
 export const DEFAULT_AI_CONFIG = {
   provider: 'ollama_cloud', // 'ollama_cloud' | 'deepseek' | 'openrouter' | 'groq' | 'custom'
   baseUrl: 'https://ollama.com',
-  apiKey: 'e956a93ec4314b20ae3f22b32d2c0268.bd5dV_bYXSVAskXufh1x4kpl',
+  apiKey: '',
   selectedModel: 'deepseek-v4.1-flash',
   enableThinking: true,
   thinkingMode: 'normal', // 'none' | 'normal' | 'deep'
@@ -21,7 +21,8 @@ export const DEFAULT_AI_CONFIG = {
     'nemotron-3-super',
     'gemma4:31b',
     'mistral-large-3:675b'
-  ]
+  ],
+  providerConfigs: {}
 };
 
 export const PROVIDER_PRESETS = [
@@ -89,15 +90,19 @@ export function getSavedAiConfig() {
     const raw = localStorage.getItem(STORAGE_KEY_AI_CONFIG);
     if (!raw) return DEFAULT_AI_CONFIG;
     const parsed = JSON.parse(raw);
-
-    // Auto-heal truncated or legacy Ollama key from previous sessions
-    if (parsed.apiKey && (parsed.apiKey.includes('f25af7d60a3470cb75ca28538bab58d') || parsed.apiKey.length === 56)) {
-      parsed.apiKey = 'e956a93ec4314b20ae3f22b32d2c0268.bd5dV_bYXSVAskXufh1x4kpl';
-      if (!parsed.selectedModel) parsed.selectedModel = 'deepseek-v4.1-flash';
-      saveAiConfig(parsed);
+    const merged = { ...DEFAULT_AI_CONFIG, ...parsed };
+    merged.providerConfigs = merged.providerConfigs || {};
+    
+    // Ensure active provider has its values saved in providerConfigs
+    if (merged.provider && !merged.providerConfigs[merged.provider]) {
+      merged.providerConfigs[merged.provider] = {
+        apiKey: merged.apiKey || '',
+        baseUrl: merged.baseUrl || '',
+        selectedModel: merged.selectedModel || '',
+        availableModels: Array.isArray(merged.availableModels) ? merged.availableModels : []
+      };
     }
-
-    return { ...DEFAULT_AI_CONFIG, ...parsed };
+    return merged;
   } catch {
     return DEFAULT_AI_CONFIG;
   }
@@ -108,7 +113,18 @@ export function getSavedAiConfig() {
  */
 export function saveAiConfig(config) {
   try {
-    localStorage.setItem(STORAGE_KEY_AI_CONFIG, JSON.stringify(config));
+    if (!config) return;
+    const toSave = { ...config };
+    toSave.providerConfigs = toSave.providerConfigs || {};
+    if (toSave.provider) {
+      toSave.providerConfigs[toSave.provider] = {
+        apiKey: toSave.apiKey || '',
+        baseUrl: toSave.baseUrl || '',
+        selectedModel: toSave.selectedModel || '',
+        availableModels: Array.isArray(toSave.availableModels) ? toSave.availableModels : []
+      };
+    }
+    localStorage.setItem(STORAGE_KEY_AI_CONFIG, JSON.stringify(toSave));
   } catch (err) {
     console.error('Failed to save AI config to localStorage:', err);
   }
@@ -369,7 +385,7 @@ export async function sendAiChatCompletion({
     }
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => {
+    let timeoutId = setTimeout(() => {
       controller.abort(new Error(`Timeout de la API de IA (${timeoutMs / 1000}s). El servidor tardó demasiado en responder.`));
     }, timeoutMs);
 
@@ -437,7 +453,11 @@ export async function sendAiChatCompletion({
           if (res.ok) {
             response = res;
             usedEndpoint = endpoint;
-            clearTimeout(timeoutId); // Connected and streaming! Clear initial connection timeout
+            // Clear initial connection timeout and enforce overall generation ceiling
+            clearTimeout(timeoutId);
+            timeoutId = setTimeout(() => {
+              controller.abort(new Error(`Timeout de la API de IA (${Math.round(timeoutMs / 1000)}s excedidos en la generación total).`));
+            }, timeoutMs);
             break;
           }
 
@@ -486,8 +506,8 @@ export async function sendAiChatCompletion({
         const resetActivityTimer = () => {
           if (activityTimeout) clearTimeout(activityTimeout);
           activityTimeout = setTimeout(() => {
-            controller.abort(new Error('Inactividad en el flujo de tokens de IA (45s sin nuevos datos recibidos).'));
-          }, 45000);
+            controller.abort(new Error('Inactividad en el flujo de tokens de IA (20s sin nuevos datos recibidos).'));
+          }, 20000);
         };
         resetActivityTimer();
 

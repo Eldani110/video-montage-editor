@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { X, Film, Sparkles } from 'lucide-react';
 import { createNewProjectTemplate } from '../utils/sampleData';
+import { getStorageConfig, getBaseFolderName } from '../utils/stockMediaClient';
 
 export function NewProjectModal({ isOpen, onClose, onCreateProject }) {
   const [name, setName] = useState('Mi Montaje Pro');
@@ -8,6 +9,15 @@ export function NewProjectModal({ isOpen, onClose, onCreateProject }) {
   const [duration, setDuration] = useState(20);
   const [includeSamples, setIncludeSamples] = useState(true);
   const [mediaFolder, setMediaFolder] = useState('');
+  const [baseMediaDir, setBaseMediaDir] = useState('');
+
+  useEffect(() => {
+    if (isOpen) {
+      getStorageConfig().then(cfg => {
+        if (cfg?.baseMediaDir) setBaseMediaDir(cfg.baseMediaDir);
+      });
+    }
+  }, [isOpen]);
 
   if (!isOpen) return null;
 
@@ -89,7 +99,12 @@ export function NewProjectModal({ isOpen, onClose, onCreateProject }) {
               border: '1px solid var(--border-subtle)',
               marginTop: '4px'
             }}>
-              <span style={{ fontSize: '12px', color: 'var(--text-dim)', fontFamily: 'monospace' }}>projects_media/</span>
+              <span
+                style={{ fontSize: '12px', color: 'var(--text-dim)', fontFamily: 'monospace' }}
+                title={`Ruta base configurada: ${baseMediaDir || 'projects_media'}`}
+              >
+                {getBaseFolderName(baseMediaDir)}/
+              </span>
               <input
                 type="text"
                 className="input-field"

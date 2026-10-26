@@ -4,10 +4,21 @@ node_modules/
 # Production build output
 dist/
 dist-ssr/
+release/
+*.AppImage
+*.deb
+*.exe
+*.dmg
 
 # Local media storage & cache (contains downloaded B-roll & video assets)
 projects_media/*
 !projects_media/.gitkeep
+
+# User media configuration (chosen base folder) — machine-specific
+.media-config.json
+.media-config.json.migrated
+.video-montage-editor/
+.cache/
 scratch/
 
 # Environment files

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useCallback, useMemo } from 'react';
 import {
   Film,
   Sparkles,
@@ -23,17 +23,21 @@ import { formatTimecode } from '../utils/timeFormat';
 import { StockMediaSearchModal } from './StockMediaSearchModal';
 import { AutoBrollBatchModal } from './AutoBrollBatchModal';
 import { switchSceneAlternative } from '../utils/sceneBrollManager';
+import { resolveRealSceneTimelinePosition } from '../utils/sceneOps';
 
 
 export const SceneStoryboardPanel = React.memo(function SceneStoryboardPanel({
   project,
   currentTime,
   setCurrentTime,
+  selectedSceneId = null,
+  onSelectScene = null,
   onOpenSceneDirector,
   onClearScenes,
   onDeleteScene,
   onUpdateProject,
-  onOpenAutoBrollBatch = null
+  onOpenAutoBrollBatch = null,
+  onOpenGraphicForScene = null
 }) {
   const [filterType, setFilterType] = useState('all'); // 'all' | 'video' | 'image'
   const [searchQuery, setSearchQuery] = useState('');
@@ -43,8 +47,42 @@ export const SceneStoryboardPanel = React.memo(function SceneStoryboardPanel({
   const [expandedSceneAlternatives, setExpandedSceneAlternatives] = useState(null);
   const [isSwappingAlternative, setIsSwappingAlternative] = useState(false);
   const [previewCollageModal, setPreviewCollageModal] = useState(null);
+  const listContainerRef = useRef(null);
+  const cardRefs = useRef({});
+  const [scrollTop, setScrollTop] = useState(0);
 
-  const scenes = project.scenes?.list || [];
+  const handleListScroll = useCallback((e) => {
+    setScrollTop(e.target.scrollTop);
+  }, []);
+
+  const sceneTrack = (project.tracks || []).find(t => t.type === 'scene');
+  const scenes = useMemo(() => {
+    const rawScenes = project.scenes?.list || [];
+    if (!sceneTrack || !Array.isArray(sceneTrack.clips)) return rawScenes;
+
+    return rawScenes.map(s => {
+      const sNum = s.sceneNumber ? Number(s.sceneNumber) : null;
+      const sClip = sceneTrack.clips.find(c => {
+        if (sNum && Number(c.sceneNumber) === sNum) return true;
+        if (s.id && (c.sceneId === s.id || c.id === s.id)) return true;
+        if (sNum && c.name) {
+          const m = c.name.match(/\[E\s*0*(\d+)\]/i);
+          if (m && Number(m[1]) === sNum) return true;
+        }
+        return false;
+      });
+      if (sClip && typeof sClip.startTime === 'number') {
+        const dur = typeof sClip.duration === 'number' ? sClip.duration : s.duration;
+        return {
+          ...s,
+          startTime: Number(sClip.startTime.toFixed(2)),
+          duration: Number(dur.toFixed(2)),
+          endTime: Number((sClip.startTime + dur).toFixed(2))
+        };
+      }
+      return s;
+    });
+  }, [project.scenes?.list, sceneTrack]);
   const scenesSummary = project.scenes?.summary || null;
   const rhythmProfile = project.scenes?.rhythmProfile || null;
 
@@ -60,6 +98,93 @@ export const SceneStoryboardPanel = React.memo(function SceneStoryboardPanel({
   const handleJumpToScene = (startTime) => {
     setCurrentTime(startTime);
   };
+
+  const handleUpdateScene = useCallback((sceneId, updates) => {
+    const updatedScenes = (project.scenes?.list || []).map(s => {
+      if (s.id === sceneId) {
+        return { ...s, ...updates };
+      }
+      return s;
+    });
+
+    const updatedTracks = (project.tracks || []).map(t => {
+      if (t.type === 'scene') {
+        return {
+          ...t,
+          clips: (t.clips || []).map(c => {
+            if (c.id === sceneId || c.sceneId === sceneId) {
+              return {
+                ...c,
+                ...(updates.title !== undefined ? { title: updates.title, name: `[E${c.sceneNumber || ''}] ${updates.title}` } : {}),
+                ...(updates.visualDescription !== undefined ? { visualDescription: updates.visualDescription } : {}),
+                ...(updates.visualType !== undefined ? {
+                  visualType: updates.visualType,
+                  color: updates.visualType === 'video' ? '#06b6d4' : '#6366f1'
+                } : {}),
+                ...(updates.scriptText !== undefined ? { text: updates.scriptText } : {}),
+                ...(updates.searchKeywords !== undefined ? { searchKeywords: updates.searchKeywords } : {})
+              };
+            }
+            return c;
+          })
+        };
+      }
+      return t;
+    });
+
+    if (onUpdateProject) {
+      onUpdateProject({
+        ...project,
+        tracks: updatedTracks,
+        scenes: {
+          ...(project.scenes || {}),
+          list: updatedScenes
+        }
+      });
+    }
+  }, [project, onUpdateProject]);
+
+  const handleUnassignBroll = useCallback((sceneId, e) => {
+    if (e) e.stopPropagation();
+    handleUpdateScene(sceneId, {
+      assignedMediaUrl: null,
+      assignedThumbnail: null,
+      assignedTitle: null,
+      assignedAssetId: null,
+      curatorCritique: null
+    });
+  }, [handleUpdateScene]);
+
+  // Auto-scroll directly to selected scene card whenever selectedSceneId updates
+  React.useEffect(() => {
+    if (!selectedSceneId || !scenes.length) return;
+
+    const targetIdx = scenes.findIndex(s =>
+      s.id === selectedSceneId ||
+      String(s.sceneNumber) === String(selectedSceneId)
+    );
+
+    if (targetIdx >= 0) {
+      if (listContainerRef.current) {
+        const ITEM_HEIGHT = 210;
+        const targetScroll = Math.max(0, (targetIdx * ITEM_HEIGHT) - 30);
+        listContainerRef.current.scrollTo({
+          top: targetScroll,
+          behavior: 'smooth'
+        });
+        setScrollTop(targetScroll);
+      }
+
+      const timer = setTimeout(() => {
+        const el = cardRefs.current[selectedSceneId] || document.getElementById(`scene-card-${selectedSceneId}`);
+        if (el) {
+          el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+      }, 70);
+
+      return () => clearTimeout(timer);
+    }
+  }, [selectedSceneId, scenes]);
 
   const handleToggleSceneVisualType = (sceneId, e) => {
     if (e) e.stopPropagation();
@@ -336,40 +461,166 @@ export const SceneStoryboardPanel = React.memo(function SceneStoryboardPanel({
         </div>
       </div>
 
-      {/* Storyboard Cards List */}
-      <div className="transcript-list" style={{ flex: 1, overflowY: 'auto', padding: '10px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
-        {filteredScenes.map((scene) => {
-          const isCurrent = currentTime >= scene.startTime && currentTime <= scene.endTime;
-          const hasAssignedMedia = Boolean(scene.assignedMediaUrl || scene.assignedAssetId);
+      {/* Storyboard Cards List with Lightweight Virtual Windowing */}
+      {(() => {
+        const ITEM_ESTIMATED_HEIGHT = 200;
+        const isVirtualized = filteredScenes.length > 20;
+        const visibleCount = 10;
+        const overscan = 5;
+
+        const selectedIndex = selectedSceneId
+          ? filteredScenes.findIndex(s => s.id === selectedSceneId || String(s.sceneNumber) === String(selectedSceneId))
+          : -1;
+
+        const baseStart = isVirtualized
+          ? Math.max(0, Math.floor(scrollTop / ITEM_ESTIMATED_HEIGHT) - overscan)
+          : 0;
+        const baseEnd = isVirtualized
+          ? Math.min(filteredScenes.length, baseStart + visibleCount + (overscan * 2))
+          : filteredScenes.length;
+
+        const startIndex = selectedIndex !== -1 ? Math.min(baseStart, Math.max(0, selectedIndex - 2)) : baseStart;
+        const endIndex = selectedIndex !== -1 ? Math.max(baseEnd, Math.min(filteredScenes.length, selectedIndex + 4)) : baseEnd;
+
+        const visibleScenes = isVirtualized
+          ? filteredScenes.slice(startIndex, endIndex)
+          : filteredScenes;
+
+        const topSpacerHeight = isVirtualized ? startIndex * ITEM_ESTIMATED_HEIGHT : 0;
+        const bottomSpacerHeight = isVirtualized ? (filteredScenes.length - endIndex) * ITEM_ESTIMATED_HEIGHT : 0;
+
+        return (
+          <div
+            ref={listContainerRef}
+            onScroll={handleListScroll}
+            className="transcript-list"
+            style={{ flex: 1, overflowY: 'auto', padding: '10px', display: 'flex', flexDirection: 'column', gap: '8px' }}
+          >
+            {topSpacerHeight > 0 && <div style={{ height: `${topSpacerHeight}px`, flexShrink: 0 }} />}
+            {visibleScenes.map((scene) => {
+              const isCurrent = currentTime >= scene.startTime && currentTime <= scene.endTime;
+              const isSelected = Boolean(
+                selectedSceneId && (
+                  scene.id === selectedSceneId ||
+                  (scene.sceneNumber && String(scene.sceneNumber) === String(selectedSceneId))
+                )
+              );
+              const hasAssignedMedia = Boolean(scene.assignedMediaUrl || scene.assignedAssetId);
+              const hasGraphic = (project.tracks || [])
+                .find(t => t.id === 'track-graphics-g1' || t.type === 'graphics')
+                ?.clips?.some(c => c.sceneNumber === scene.sceneNumber || c.sceneId === scene.id);
 
           return (
             <div
               key={scene.id}
-              className={`transcript-item ${isCurrent ? 'active' : ''}`}
-              onClick={() => handleJumpToScene(scene.startTime)}
+              id={`scene-card-${scene.id}`}
+              ref={el => { if (el) cardRefs.current[scene.id] = el; }}
+              className={`transcript-item scene-card ${isSelected ? 'selected' : ''} ${isCurrent ? 'active' : ''}`}
+              onClick={() => {
+                if (onSelectScene) {
+                  onSelectScene(scene);
+                } else {
+                  handleJumpToScene(scene.startTime);
+                }
+              }}
               style={{
                 cursor: 'pointer',
-                borderRadius: '6px',
-                border: isCurrent ? `1px solid ${scene.color}` : '1px solid var(--border-subtle)',
-                borderLeft: `4px solid ${scene.color}`,
-                background: isCurrent ? 'rgba(6, 182, 212, 0.08)' : 'var(--bg-card)',
-                padding: '10px',
+                borderRadius: '8px',
+                border: isSelected
+                  ? '1.5px solid #06b6d4'
+                  : (isCurrent ? `1px solid ${scene.color || '#06b6d4'}` : '1px solid var(--border-subtle)'),
+                borderLeft: `5px solid ${isSelected ? '#06b6d4' : (scene.color || '#06b6d4')}`,
+                background: isSelected
+                  ? 'linear-gradient(180deg, rgba(6, 182, 212, 0.14) 0%, rgba(15, 23, 42, 0.85) 100%)'
+                  : (isCurrent ? 'rgba(6, 182, 212, 0.08)' : 'var(--bg-card)'),
+                boxShadow: isSelected
+                  ? '0 0 16px rgba(6, 182, 212, 0.35), 0 4px 14px rgba(0,0,0,0.5)'
+                  : undefined,
+                padding: isSelected ? '12px' : '10px',
                 display: 'flex',
                 flexDirection: 'column',
-                gap: '8px',
-                transition: 'all 0.15s ease'
+                gap: isSelected ? '10px' : '8px',
+                transition: 'all 0.18s ease'
               }}
             >
-              {/* Top row */}
+              {/* Selected Scene Header Banner */}
+              {isSelected && (
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    background: 'linear-gradient(90deg, rgba(6, 182, 212, 0.25), rgba(99, 102, 241, 0.18))',
+                    padding: '6px 10px',
+                    borderRadius: '5px',
+                    border: '1px solid rgba(6, 182, 212, 0.35)',
+                    marginBottom: '2px'
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <Sliders size={13} style={{ color: '#38bdf8' }} />
+                    <span style={{ fontSize: '11px', fontWeight: 700, color: '#38bdf8', letterSpacing: '0.04em' }}>
+                      PROPIEDADES DE LA ESCENA #[E{scene.sceneNumber}]
+                    </span>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <span className="badge badge-cyan" style={{ fontSize: '9px', padding: '1px 6px' }}>
+                      Activa
+                    </span>
+                    {onSelectScene && (
+                      <button
+                        type="button"
+                        className="btn-ghost icon-only"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onSelectScene(null);
+                        }}
+                        title="Cerrar propiedades de escena"
+                        style={{ padding: '2px', color: 'var(--text-dim)' }}
+                      >
+                        <X size={12} />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Top row: Title and format badge */}
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                  <span style={{ fontWeight: 600, fontSize: '12px', color: 'var(--text-primary)' }}>
-                    [E{scene.sceneNumber}] {scene.title}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flex: 1, minWidth: 0 }}>
+                  <span style={{ fontWeight: 700, fontSize: '12px', color: isSelected ? '#38bdf8' : 'var(--text-primary)' }}>
+                    [E{scene.sceneNumber}]
                   </span>
+                  {isSelected ? (
+                    <input
+                      type="text"
+                      value={scene.title || ''}
+                      onClick={(e) => e.stopPropagation()}
+                      onChange={(e) => handleUpdateScene(scene.id, { title: e.target.value })}
+                      placeholder="Título de la escena..."
+                      className="search-input"
+                      style={{
+                        fontSize: '12px',
+                        fontWeight: 600,
+                        color: 'var(--text-primary)',
+                        height: '26px',
+                        padding: '2px 8px',
+                        flex: 1,
+                        background: 'rgba(0,0,0,0.3)',
+                        border: '1px solid rgba(6, 182, 212, 0.3)',
+                        borderRadius: '4px'
+                      }}
+                    />
+                  ) : (
+                    <span style={{ fontWeight: 600, fontSize: '12px', color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {scene.title}
+                    </span>
+                  )}
+
                   <button
                     type="button"
                     onClick={(e) => handleToggleSceneVisualType(scene.id, e)}
-                    title={`Formato actual: ${scene.visualType === 'video' ? 'Video B-Roll' : 'Imagen Conceptual'}. Haz clic para alternar a ${scene.visualType === 'video' ? 'Imagen' : 'Video'}`}
+                    title={`Formato actual: ${scene.visualType === 'video' ? 'Video B-Roll' : 'Imagen Conceptual'}. Haz clic para alternar.`}
                     style={{
                       fontSize: '9px',
                       padding: '2px 6px',
@@ -380,7 +631,8 @@ export const SceneStoryboardPanel = React.memo(function SceneStoryboardPanel({
                       display: 'flex',
                       alignItems: 'center',
                       gap: '3px',
-                      cursor: 'pointer'
+                      cursor: 'pointer',
+                      flexShrink: 0
                     }}
                   >
                     {scene.visualType === 'video' ? <Video size={9} /> : <ImageIcon size={9} />}
@@ -388,83 +640,253 @@ export const SceneStoryboardPanel = React.memo(function SceneStoryboardPanel({
                   </button>
                 </div>
 
-                <span className="timecode" style={{ fontSize: '10px', color: isCurrent ? '#06b6d4' : 'var(--text-dim)' }}>
+                <span className="timecode" style={{ fontSize: '10px', color: (isSelected || isCurrent) ? '#06b6d4' : 'var(--text-dim)', flexShrink: 0, marginLeft: '6px' }}>
                   [{formatTimecode(scene.startTime)} - {formatTimecode(scene.endTime)}]
                 </span>
               </div>
 
-              {/* Script phrase */}
-              {scene.scriptText && (
-                <p style={{ margin: 0, fontSize: '11px', color: 'var(--text-secondary)', fontStyle: 'italic', lineHeight: 1.3 }}>
-                  &ldquo;{scene.scriptText}&rdquo;
-                </p>
-              )}
-
-              {/* Visual Prompt */}
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '6px', background: 'rgba(0,0,0,0.15)', padding: '6px 8px', borderRadius: '4px' }}>
-                <span style={{ fontSize: '11px', color: 'var(--text-primary)', lineHeight: 1.3 }}>
-                  <strong style={{ color: scene.color }}>Toma: </strong>
-                  {scene.visualDescription}
-                </span>
-
-                <div style={{ display: 'flex', alignItems: 'center', gap: '2px', flexShrink: 0 }}>
+              {/* Timing & Timeline sync bar when selected */}
+              {isSelected && (
+                <div style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  background: 'rgba(0,0,0,0.25)',
+                  padding: '5px 8px',
+                  borderRadius: '4px',
+                  fontSize: '11px',
+                  border: '1px solid rgba(255,255,255,0.06)'
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: 'var(--text-secondary)' }}>
+                    <Clock size={12} style={{ color: '#06b6d4' }} />
+                    <span>Duración: <strong style={{ color: '#fff' }}>{scene.duration.toFixed(1)}s</strong></span>
+                    <span style={{ color: 'var(--text-dim)' }}>({formatTimecode(scene.startTime)} → {formatTimecode(scene.endTime)})</span>
+                  </div>
                   <button
                     type="button"
-                    className="btn-ghost icon-only"
-                    onClick={(e) => handleCopyPrompt(scene.visualDescription, scene.id, e)}
-                    title="Copiar prompt visual"
-                    style={{ padding: '2px' }}
-                  >
-                    {copiedId === scene.id ? <Check size={12} className="text-emerald" /> : <Copy size={12} />}
-                  </button>
-
-                  <button
-                    type="button"
-                    className="btn-ghost icon-only"
+                    className="btn-ghost btn-xs"
                     onClick={(e) => {
                       e.stopPropagation();
-                      if (onDeleteScene) onDeleteScene(scene.id);
+                      setCurrentTime(scene.startTime);
                     }}
-                    title="Eliminar esta escena individual (Ctrl+Z para recuperar)"
-                    style={{ padding: '2px' }}
+                    style={{ fontSize: '10px', padding: '2px 7px', color: '#38bdf8', display: 'flex', alignItems: 'center', gap: '4px' }}
                   >
-                    <Trash2 size={12} className="text-dim hover-text-rose" />
+                    <Play size={10} /> Ir a Escena
                   </button>
                 </div>
+              )}
+
+              {/* Script phrase */}
+              {scene.scriptText && (
+                <div style={isSelected ? {
+                  background: 'rgba(0, 0, 0, 0.2)',
+                  padding: '6px 8px',
+                  borderRadius: '4px',
+                  borderLeft: '2px solid rgba(139, 92, 246, 0.5)'
+                } : undefined}>
+                  {isSelected && (
+                    <div style={{ fontSize: '9px', textTransform: 'uppercase', color: 'var(--text-dim)', fontWeight: 700, marginBottom: '2px' }}>
+                      Guion Narrativo / Audio
+                    </div>
+                  )}
+                  <p style={{ margin: 0, fontSize: '11px', color: 'var(--text-secondary)', fontStyle: 'italic', lineHeight: 1.35 }}>
+                    &ldquo;{scene.scriptText}&rdquo;
+                  </p>
+                </div>
+              )}
+
+              {/* Visual Prompt / Shot Description */}
+              <div style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '4px',
+                background: 'rgba(0,0,0,0.22)',
+                padding: '7px 8px',
+                borderRadius: '5px',
+                border: isSelected ? '1px solid rgba(255,255,255,0.08)' : undefined
+              }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ fontSize: '10px', fontWeight: 700, textTransform: 'uppercase', color: scene.color || '#06b6d4' }}>
+                    Toma Sugerida / Prompt Visual IA
+                  </span>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '2px' }}>
+                    <button
+                      type="button"
+                      className="btn-ghost icon-only"
+                      onClick={(e) => handleCopyPrompt(scene.visualDescription, scene.id, e)}
+                      title="Copiar prompt visual"
+                      style={{ padding: '2px' }}
+                    >
+                      {copiedId === scene.id ? <Check size={12} className="text-emerald" /> : <Copy size={12} />}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-ghost icon-only"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (onDeleteScene) onDeleteScene(scene.id);
+                      }}
+                      title="Eliminar esta escena individual (Ctrl+Z para recuperar)"
+                      style={{ padding: '2px' }}
+                    >
+                      <Trash2 size={12} className="text-dim hover-text-rose" />
+                    </button>
+                  </div>
+                </div>
+
+                {isSelected ? (
+                  <textarea
+                    value={scene.visualDescription || ''}
+                    onClick={(e) => e.stopPropagation()}
+                    onChange={(e) => handleUpdateScene(scene.id, { visualDescription: e.target.value })}
+                    rows={2}
+                    className="search-input"
+                    placeholder="Descripción cinematográfica de la toma..."
+                    style={{
+                      fontSize: '11px',
+                      color: 'var(--text-primary)',
+                      lineHeight: 1.35,
+                      height: 'auto',
+                      resize: 'vertical',
+                      background: 'rgba(0,0,0,0.35)',
+                      border: '1px solid rgba(255,255,255,0.1)',
+                      padding: '6px',
+                      borderRadius: '4px'
+                    }}
+                  />
+                ) : (
+                  <span style={{ fontSize: '11px', color: 'var(--text-primary)', lineHeight: 1.3 }}>
+                    {scene.visualDescription}
+                  </span>
+                )}
               </div>
 
-              {/* Visual Anchor and Search Keywords Badges */}
-              {(scene.visualAnchor || (Array.isArray(scene.searchKeywords) && scene.searchKeywords.length > 0)) && (
-                <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '6px', paddingTop: '2px' }}>
-                  {scene.visualAnchor && (
-                    <span style={{
-                      fontSize: '9px',
-                      background: 'rgba(245, 158, 11, 0.12)',
-                      color: '#f59e0b',
-                      border: '1px solid rgba(245, 158, 11, 0.25)',
-                      padding: '1px 5px',
-                      borderRadius: '3px',
-                      fontWeight: 600
-                    }}>
-                      🎯 {scene.visualAnchor}
+              {/* Visual Anchor and Search Keywords */}
+              {isSelected ? (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', background: 'rgba(0,0,0,0.18)', padding: '7px 8px', borderRadius: '5px' }}>
+                  {/* Visual Anchor Edit */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <span style={{ fontSize: '10px', color: 'var(--text-dim)', fontWeight: 600, width: '90px', flexShrink: 0 }}>
+                      🎯 Ancla Visual:
                     </span>
-                  )}
-                  {Array.isArray(scene.searchKeywords) && scene.searchKeywords.slice(0, 4).map((kw, i) => (
-                    <span
-                      key={i}
+                    <input
+                      type="text"
+                      value={scene.visualAnchor || ''}
+                      onClick={(e) => e.stopPropagation()}
+                      onChange={(e) => handleUpdateScene(scene.id, { visualAnchor: e.target.value })}
+                      placeholder="Elemento focal principal..."
+                      className="search-input"
                       style={{
-                        fontSize: '9px',
-                        background: 'rgba(255, 255, 255, 0.04)',
-                        color: '#94a3b8',
-                        border: '1px solid rgba(255, 255, 255, 0.08)',
-                        padding: '1px 4px',
+                        fontSize: '10px',
+                        color: '#f59e0b',
+                        height: '24px',
+                        padding: '2px 6px',
+                        flex: 1,
+                        background: 'rgba(245, 158, 11, 0.08)',
+                        border: '1px solid rgba(245, 158, 11, 0.25)',
                         borderRadius: '3px'
                       }}
-                    >
-                      🔍 {kw}
+                    />
+                  </div>
+
+                  {/* Keywords Chips + Add input */}
+                  <div style={{ display: 'flex', alignItems: 'flex-start', gap: '6px' }}>
+                    <span style={{ fontSize: '10px', color: 'var(--text-dim)', fontWeight: 600, width: '90px', flexShrink: 0, paddingTop: '3px' }}>
+                      🔍 Palabras Clave:
                     </span>
-                  ))}
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', alignItems: 'center', flex: 1 }}>
+                      {(scene.searchKeywords || []).map((kw, i) => (
+                        <span
+                          key={i}
+                          style={{
+                            fontSize: '9px',
+                            background: 'rgba(255, 255, 255, 0.05)',
+                            color: '#cbd5e1',
+                            border: '1px solid rgba(255, 255, 255, 0.1)',
+                            padding: '1px 5px',
+                            borderRadius: '3px',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '3px'
+                          }}
+                        >
+                          {kw}
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              const updated = (scene.searchKeywords || []).filter((_, idx) => idx !== i);
+                              handleUpdateScene(scene.id, { searchKeywords: updated });
+                            }}
+                            style={{ background: 'none', border: 'none', color: '#94a3b8', cursor: 'pointer', padding: 0, fontSize: '10px' }}
+                          >
+                            ×
+                          </button>
+                        </span>
+                      ))}
+                      <input
+                        type="text"
+                        placeholder="+ Tag (Enter)"
+                        onClick={(e) => e.stopPropagation()}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' && e.target.value.trim()) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            const val = e.target.value.trim();
+                            const cur = scene.searchKeywords || [];
+                            if (!cur.includes(val)) {
+                              handleUpdateScene(scene.id, { searchKeywords: [...cur, val] });
+                            }
+                            e.target.value = '';
+                          }
+                        }}
+                        style={{
+                          fontSize: '9px',
+                          background: 'transparent',
+                          border: '1px dashed rgba(255,255,255,0.2)',
+                          color: 'var(--text-secondary)',
+                          borderRadius: '3px',
+                          padding: '1px 5px',
+                          width: '75px',
+                          height: '18px'
+                        }}
+                      />
+                    </div>
+                  </div>
                 </div>
+              ) : (
+                (scene.visualAnchor || (Array.isArray(scene.searchKeywords) && scene.searchKeywords.length > 0)) && (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '6px', paddingTop: '2px' }}>
+                    {scene.visualAnchor && (
+                      <span style={{
+                        fontSize: '9px',
+                        background: 'rgba(245, 158, 11, 0.12)',
+                        color: '#f59e0b',
+                        border: '1px solid rgba(245, 158, 11, 0.25)',
+                        padding: '1px 5px',
+                        borderRadius: '3px',
+                        fontWeight: 600
+                      }}>
+                        🎯 {scene.visualAnchor}
+                      </span>
+                    )}
+                    {Array.isArray(scene.searchKeywords) && scene.searchKeywords.slice(0, 4).map((kw, i) => (
+                      <span
+                        key={i}
+                        style={{
+                          fontSize: '9px',
+                          background: 'rgba(255, 255, 255, 0.04)',
+                          color: '#94a3b8',
+                          border: '1px solid rgba(255, 255, 255, 0.08)',
+                          padding: '1px 4px',
+                          borderRadius: '3px'
+                        }}
+                      >
+                        🔍 {kw}
+                      </span>
+                    ))}
+                  </div>
+                )
               )}
 
               {/* Media Preview & Critique if populated */}
@@ -472,12 +894,11 @@ export const SceneStoryboardPanel = React.memo(function SceneStoryboardPanel({
                 <div style={{
                   display: 'flex',
                   gap: '10px',
-                  background: 'rgba(0, 0, 0, 0.25)',
+                  background: 'rgba(0, 0, 0, 0.3)',
                   padding: '8px',
                   borderRadius: '6px',
-                  border: '1px solid rgba(255, 255, 255, 0.05)'
+                  border: '1px solid rgba(255, 255, 255, 0.06)'
                 }}>
-                  {/* Visual Thumbnail */}
                   <div style={{
                     width: '68px',
                     height: '46px',
@@ -507,7 +928,6 @@ export const SceneStoryboardPanel = React.memo(function SceneStoryboardPanel({
                     </div>
                   </div>
 
-                  {/* Information & AI Verdict */}
                   <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: '3px' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                       <span className="badge badge-emerald" style={{ fontSize: '9px', display: 'flex', alignItems: 'center', gap: '3px' }}>
@@ -523,19 +943,63 @@ export const SceneStoryboardPanel = React.memo(function SceneStoryboardPanel({
                         &ldquo;{scene.curatorCritique.winnerReason}&rdquo;
                       </p>
                     )}
+
+                    {isSelected && (
+                      <div style={{ display: 'flex', gap: '6px', marginTop: '4px' }}>
+                        <button
+                          type="button"
+                          className="btn-ghost btn-xs text-rose"
+                          onClick={(e) => handleUnassignBroll(scene.id, e)}
+                          style={{ fontSize: '9px', padding: '1px 5px', color: '#f43f5e', border: '1px solid rgba(244,63,94,0.3)', borderRadius: '3px' }}
+                        >
+                          Quitar B-Roll
+                        </button>
+                      </div>
+                    )}
                   </div>
                 </div>
               )}
 
-              {/* B-Roll Action Bar on each Scene Card */}
+              {/* B-Roll & Actions Bar */}
               <div style={{
                 display: 'flex',
                 justifyContent: 'space-between',
                 alignItems: 'center',
-                paddingTop: '4px',
-                borderTop: '1px solid rgba(255, 255, 255, 0.04)'
+                paddingTop: '6px',
+                borderTop: '1px solid rgba(255, 255, 255, 0.05)',
+                flexWrap: 'wrap',
+                gap: '6px'
               }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  {!isSelected && (
+                    <button
+                      type="button"
+                      className="btn-ghost btn-xs"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (onSelectScene) {
+                          onSelectScene(scene);
+                        } else {
+                          handleJumpToScene(scene.startTime);
+                        }
+                      }}
+                      style={{
+                        fontSize: '10px',
+                        padding: '2px 7px',
+                        color: '#38bdf8',
+                        background: 'rgba(6, 182, 212, 0.1)',
+                        border: '1px solid rgba(6, 182, 212, 0.3)',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '4px',
+                        fontWeight: 600
+                      }}
+                    >
+                      <Sliders size={11} />
+                      Propiedades
+                    </button>
+                  )}
+
                   {scene.candidateAlternatives && scene.candidateAlternatives.length > 0 && (
                     <button
                       type="button"
@@ -586,34 +1050,73 @@ export const SceneStoryboardPanel = React.memo(function SceneStoryboardPanel({
                   )}
                 </div>
 
-                <button
-                  type="button"
-                  className={hasAssignedMedia ? "btn-secondary btn-xs" : "btn-primary btn-xs"}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setSelectedSceneForBroll(scene);
-                  }}
-                  style={{
-                    fontSize: '11px',
-                    padding: '3px 8px',
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '4px',
-                    background: hasAssignedMedia ? undefined : 'linear-gradient(135deg, #06b6d4, #6366f1)'
-                  }}
-                >
-                  {hasAssignedMedia ? (
-                    <>
-                      <RefreshCw size={10} />
-                      Cambiar B-Roll
-                    </>
-                  ) : (
-                    <>
-                      <Search size={10} />
-                      Buscar B-Roll
-                    </>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  {onOpenGraphicForScene && (
+                    <button
+                      type="button"
+                      className="btn-secondary btn-xs"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        const realPos = resolveRealSceneTimelinePosition(scene, project);
+                        onOpenGraphicForScene({
+                          ...scene,
+                          startTime: realPos.startTime,
+                          duration: realPos.duration,
+                          isTimelineClip: true
+                        });
+                      }}
+                      title={hasGraphic ? "Editar Efecto Visual / Motion Graphic de esta escena en Pista G1" : "Generar Efecto Visual IA para esta escena en Pista G1"}
+                      style={{
+                        fontSize: '11px',
+                        padding: '3px 8px',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '4px',
+                        borderColor: hasGraphic ? 'rgba(56, 189, 248, 0.4)' : 'rgba(255,255,255,0.15)',
+                        background: hasGraphic ? 'rgba(6, 182, 212, 0.12)' : 'rgba(255,255,255,0.04)',
+                        color: hasGraphic ? '#38bdf8' : 'var(--text-secondary)'
+                      }}
+                    >
+                      <Sparkles size={11} style={{ color: hasGraphic ? '#38bdf8' : '#a855f7' }} />
+                      <span>{hasGraphic ? 'Efecto G1' : 'Efecto Visual'}</span>
+                    </button>
                   )}
-                </button>
+
+                  <button
+                    type="button"
+                    className={hasAssignedMedia ? "btn-secondary btn-xs" : "btn-primary btn-xs"}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      const realPos = resolveRealSceneTimelinePosition(scene, project);
+                      setSelectedSceneForBroll({
+                        ...scene,
+                        startTime: realPos.startTime,
+                        duration: realPos.duration,
+                        endTime: Number((realPos.startTime + realPos.duration).toFixed(2))
+                      });
+                    }}
+                    style={{
+                      fontSize: '11px',
+                      padding: '3px 8px',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '4px',
+                      background: hasAssignedMedia ? undefined : 'linear-gradient(135deg, #06b6d4, #6366f1)'
+                    }}
+                  >
+                    {hasAssignedMedia ? (
+                      <>
+                        <RefreshCw size={10} />
+                        Cambiar B-Roll
+                      </>
+                    ) : (
+                      <>
+                        <Search size={10} />
+                        Buscar B-Roll
+                      </>
+                    )}
+                  </button>
+                </div>
               </div>
 
               {/* Expandable Alternatives Drawer */}
@@ -702,7 +1205,10 @@ export const SceneStoryboardPanel = React.memo(function SceneStoryboardPanel({
             </div>
           );
         })}
-      </div>
+            {bottomSpacerHeight > 0 && <div style={{ height: `${bottomSpacerHeight}px`, flexShrink: 0 }} />}
+          </div>
+        );
+      })()}
 
       {/* Individual Scene B-Roll Search Modal */}
       {selectedSceneForBroll && (
@@ -781,8 +1287,15 @@ export const SceneStoryboardPanel = React.memo(function SceneStoryboardPanel({
     </div>
   );
 }, (prev, next) => {
+  if (prev.selectedSceneId !== next.selectedSceneId) return false;
+  if (prev.onSelectScene !== next.onSelectScene) return false;
   if (prev.project !== next.project) return false;
   const getActiveSceneId = (props) => {
+    const sceneTrack = (props.project?.tracks || []).find(t => t.type === 'scene');
+    if (sceneTrack && Array.isArray(sceneTrack.clips)) {
+      const c = sceneTrack.clips.find(clip => props.currentTime >= clip.startTime && props.currentTime <= (clip.startTime + clip.duration));
+      if (c) return c.sceneId || c.id;
+    }
     const scenes = props.project?.scenes?.list || [];
     return scenes.find(s => props.currentTime >= s.startTime && props.currentTime <= s.endTime)?.id;
   };

@@ -4,16 +4,19 @@
  * executes Multimodal Vision AI evaluation to filter clichés and pick the best shot,
  * saves top alternatives, downloads files to disk folder, and places clips onto timeline.
  */
-import { searchStockMedia, downloadStockMediaToDisk, getSavedStockConfig, extractSceneConceptPills, getProjectMediaFolder } from './stockMediaClient.js';
+import { searchStockMedia, downloadStockMediaToDisk, getSavedStockConfig, extractSceneConceptPills, getProjectMediaFolder, getCachedBaseMediaDir, resolveProjectOrientation, getOrientationLabel, isMediaMatchingOrientation } from './stockMediaClient.js';
 import {
   generateSceneSearchStrategiesWithAI,
+  generateBatchSceneSearchStrategiesWithAI,
+  fallbackQueryGenerator,
   preFilterAndRankCandidatesWithAI,
   refineSearchQueriesFromFullSentence,
   evaluateSceneCandidatesWithVisionAI,
-  detectGlobalVideoTopic,
-  assessStockItemTopicDiscordance
+  evaluateDualScenesWithVisionAI,
+  detectGlobalVideoTopic
 } from './visualCuratorAgent.js';
 import { getSavedAiConfig } from './aiClient.js';
+import { resolveRealSceneTimelinePosition } from './sceneOps.js';
 
 /**
  * Ensures a dedicated B-Roll overlay video track exists on the timeline
@@ -104,7 +107,8 @@ export async function assignStockMediaToScene({
   alternatives = [],
   critique = null,
   collageDataUrl = null,
-  trackPreference = 'v2',
+  targetTrackId = null,
+  trackPreference = 'v1',
   projectFolder = null
 }) {
   const targetFolder = (projectFolder || getProjectMediaFolder(project)).trim();
@@ -117,94 +121,258 @@ export async function assignStockMediaToScene({
     scene
   });
 
-  // 2. Prepare tracks
+  // 2. Authoritative timeline placement:
+  // Must use the real timeline position of the scene ("el lugar de la escena"),
+  // NOT the script/transcript metadata timestamp ("el tiempo del guión")!
+  const realPos = resolveRealSceneTimelinePosition(scene, project);
+  let clipStartTime = Number(realPos.startTime.toFixed(2));
+  let clipDuration = Number((realPos.duration || scene.duration || (scene.endTime ? scene.endTime - scene.startTime : 0) || 4.0).toFixed(2));
+  if (!clipDuration || clipDuration <= 0) clipDuration = 4.0;
+  clipDuration = Math.max(0.5, clipDuration);
+
+  // Target scene number and ID
+  let targetSceneNumber = null;
+  if (scene?.sceneNumber !== undefined && scene?.sceneNumber !== null) {
+    targetSceneNumber = Number(scene.sceneNumber);
+  } else if (scene?.name) {
+    const m = scene.name.match(/\[E\s*0*(\d+)\]/i) || scene.name.match(/\bEscena\s*0*(\d+)\b/i);
+    if (m) targetSceneNumber = Number(m[1]);
+  } else if (scene?.title) {
+    const m = scene.title.match(/\[E\s*0*(\d+)\]/i) || scene.title.match(/\bEscena\s*0*(\d+)\b/i);
+    if (m) targetSceneNumber = Number(m[1]);
+  }
+  const targetSceneId = scene?.id || scene?.sceneId || (targetSceneNumber ? `scene_${targetSceneNumber}` : `scene_${Date.now()}`);
+
+  // 3. Prepare target track
   let tracks = [...(project.tracks || [])];
-  let targetTrack;
+  let targetTrack = null;
 
-  const stockConfig = getSavedStockConfig();
-  const effectiveTrackPreference = stockConfig.targetTrack || trackPreference || 'v2';
+  if (targetTrackId && targetTrackId !== 'auto') {
+    targetTrack = tracks.find(t => t.id === targetTrackId);
+  }
 
-  if (effectiveTrackPreference === 'v2') {
+  // If no explicit targetTrackId or if invalid, find the track with the gap or with clips
+  if (!targetTrack) {
+    const videoTracks = tracks.filter(t => t.type === 'video');
+
+    // Priority A: The video track that has an empty gap at or around clipStartTime!
+    const trackWithMatchingGap = videoTracks.find(t => {
+      const sorted = [...(t.clips || [])].sort((a, b) => a.startTime - b.startTime);
+      if (sorted.length === 0) return false;
+      if (sorted[0].startTime > 0.08) {
+        const gapStart = 0;
+        const gapEnd = Number(sorted[0].startTime.toFixed(2));
+        const overlaps = Math.max(0, Math.min(gapEnd, clipStartTime + clipDuration) - Math.max(gapStart, clipStartTime));
+        if (Math.abs(gapStart - clipStartTime) < 1.0 || overlaps > 0.1 || (clipStartTime >= gapStart - 0.1 && clipStartTime <= gapEnd + 0.1)) {
+          return true;
+        }
+      }
+      let prevEnd = sorted[0].startTime + sorted[0].duration;
+      for (let i = 1; i < sorted.length; i++) {
+        const c = sorted[i];
+        if (c.startTime - prevEnd > 0.08) {
+          const gapStart = Number(prevEnd.toFixed(2));
+          const gapEnd = Number(c.startTime.toFixed(2));
+          const overlaps = Math.max(0, Math.min(gapEnd, clipStartTime + clipDuration) - Math.max(gapStart, clipStartTime));
+          if (Math.abs(gapStart - clipStartTime) < 1.0 || overlaps > 0.1 || (clipStartTime >= gapStart - 0.1 && clipStartTime <= gapEnd + 0.1)) {
+            return true;
+          }
+        }
+        prevEnd = Math.max(prevEnd, c.startTime + c.duration);
+      }
+      return false;
+    });
+
+    if (trackWithMatchingGap) {
+      targetTrack = trackWithMatchingGap;
+    } else {
+      // Priority B: The video track that actually holds the sequence (most clips)
+      const trackWithMostClips = [...videoTracks].sort((a, b) => (b.clips?.length || 0) - (a.clips?.length || 0))[0];
+      if (trackWithMostClips && (trackWithMostClips.clips?.length || 0) > 0) {
+        targetTrack = trackWithMostClips;
+      } else {
+        targetTrack = videoTracks[0] || tracks[0];
+      }
+    }
+  }
+
+  if (!targetTrack) {
     const res = ensureBrollTrack(tracks);
     tracks = res.tracks;
     targetTrack = res.brollTrack;
-  } else {
-    targetTrack = tracks.find(t => t.id === 'track-v1' || t.name?.includes('V1')) || tracks.find(t => t.type === 'video') || tracks[0];
   }
 
-  const clipDuration = Number((scene.duration || asset.duration || 5).toFixed(2));
-  const clipStartTime = Number((scene.startTime || 0).toFixed(2));
+  // Snug gap fitting: if targetTrack has an empty gap matching clipStartTime, snap to it!
+  const sortedTargetClips = [...(targetTrack.clips || [])].sort((a, b) => a.startTime - b.startTime);
+  if (sortedTargetClips.length > 0) {
+    if (sortedTargetClips[0].startTime > 0.08) {
+      const gapStart = 0;
+      const gapEnd = Number(sortedTargetClips[0].startTime.toFixed(2));
+      const overlaps = Math.max(0, Math.min(gapEnd, clipStartTime + clipDuration) - Math.max(gapStart, clipStartTime));
+      if (Math.abs(gapStart - clipStartTime) < 1.0 || overlaps > 0.1 || (clipStartTime >= gapStart - 0.1 && clipStartTime <= gapEnd + 0.1)) {
+        clipStartTime = gapStart;
+        clipDuration = Number((gapEnd - gapStart).toFixed(2));
+      }
+    }
+    let pEnd = sortedTargetClips[0].startTime + sortedTargetClips[0].duration;
+    for (let i = 1; i < sortedTargetClips.length; i++) {
+      const c = sortedTargetClips[i];
+      if (c.startTime - pEnd > 0.08) {
+        const gapStart = Number(pEnd.toFixed(2));
+        const gapEnd = Number(c.startTime.toFixed(2));
+        const overlaps = Math.max(0, Math.min(gapEnd, clipStartTime + clipDuration) - Math.max(gapStart, clipStartTime));
+        if (Math.abs(gapStart - clipStartTime) < 1.0 || overlaps > 0.1 || (clipStartTime >= gapStart - 0.1 && clipStartTime <= gapEnd + 0.1)) {
+          clipStartTime = gapStart;
+          clipDuration = Number((gapEnd - gapStart).toFixed(2));
+          break;
+        }
+      }
+      pEnd = Math.max(pEnd, c.startTime + c.duration);
+    }
+  }
 
-  // 3. Create video/image clip on timeline
+  // 4. Create video/image clip on timeline
   const clipId = `clip_broll_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+  const isVideoAsset = asset.type === 'video' || (mediaItem?.type === 'video');
+
   const brollClip = {
     id: clipId,
     assetId: asset.id,
     trackId: targetTrack.id,
-    name: `[E${scene.sceneNumber || 1}] ${scene.title || asset.name}`,
+    name: `[E${targetSceneNumber || ''}] ${scene.title || asset.name}`,
     startTime: clipStartTime,
     duration: clipDuration,
     sourceStart: 0,
-    sourceEnd: clipDuration,
+    sourceEnd: isVideoAsset && asset.duration && asset.duration > 0 ? Math.min(clipDuration, asset.duration) : clipDuration,
     fit: 'cover',
     scale: 1,
     opacity: 1,
     color: scene.color || '#06b6d4',
-    sceneId: scene.id,
+    sceneId: targetSceneId,
+    sceneNumber: targetSceneNumber,
     isBroll: true
   };
 
-  // Helper to identify any conflicting prior clip for this scene
+  // 5. Helper to identify prior clip specifically for THIS scene on THIS track
   const isMatchingSceneClip = (c) => {
-    if (c.sceneId && scene.id && c.sceneId === scene.id) return true;
-    if (scene.sceneNumber) {
-      const prefix = `[E${scene.sceneNumber}]`;
-      const prefixSpace = `[E${scene.sceneNumber} `;
-      if (c.name && (c.name.startsWith(prefix) || c.name.startsWith(prefixSpace))) return true;
+    if (!c) return false;
+    // Strict ID match
+    if (scene.assignedClipId && c.id === scene.assignedClipId) return true;
+    if (c.sceneId && targetSceneId && c.sceneId === targetSceneId) return true;
+    // Strict sceneNumber match within scene's timeline interval
+    if (targetSceneNumber && c.sceneNumber && Number(c.sceneNumber) === Number(targetSceneNumber)) {
+      return true;
+    }
+    // Name pattern match strictly for this scene number [E#]
+    if (targetSceneNumber && c.name) {
+      const match = c.name.match(/\[E\s*0*(\d+)\]/i) || c.name.match(/\bEscena\s*0*(\d+)\b/i);
+      if (match && Number(match[1]) === Number(targetSceneNumber)) return true;
+    }
+    // Exact slot replacement (within 0.05s) on this track only if it does not belong to another scene
+    if (Math.abs(c.startTime - clipStartTime) < 0.05) {
+      if (c.sceneNumber && targetSceneNumber && Number(c.sceneNumber) !== Number(targetSceneNumber)) {
+        return false;
+      }
+      return true;
     }
     return false;
   };
 
-  // Add clip to the target track, and remove any conflicting prior clip for this scene ACROSS ALL VIDEO TRACKS
-  // This prevents ghost duplicate clips from lingering on V1 when B-roll is placed on V2 (or vice-versa)
+  // Add clip to the target track, replacing ONLY prior clip for this specific scene!
+  // All other clips (before, after, and on other tracks) remain 100% untouched!
   tracks = tracks.map(t => {
-    if (t.type === 'video') {
+    if (t.id === targetTrack.id) {
       const filteredClips = (t.clips || []).filter(c => !isMatchingSceneClip(c));
-      if (t.id === targetTrack.id) {
-        return {
-          ...t,
-          clips: [...filteredClips, brollClip]
-        };
-      }
       return {
         ...t,
-        clips: filteredClips
+        clips: [...filteredClips, brollClip].sort((a, b) => a.startTime - b.startTime)
       };
+    }
+    if (t.type === 'scene') {
+      const updatedSceneClips = (t.clips || []).map(sc => {
+        if (sc.id === targetSceneId || (targetSceneNumber && Number(sc.sceneNumber) === Number(targetSceneNumber))) {
+          return {
+            ...sc,
+            assignedAssetId: asset.id,
+            assignedMediaUrl: asset.url,
+            assignedTitle: asset.name,
+            assignedThumbnail: asset.thumbnail || mediaItem.thumbnail || mediaItem.previewUrl
+          };
+        }
+        return sc;
+      });
+      return { ...t, clips: updatedSceneClips };
     }
     return t;
   });
 
-  // 4. Update scene metadata with winner and alternatives
-  const updatedScenesList = (project.scenes?.list || []).map(s => {
-    if (s.id === scene.id) {
-      return {
-        ...s,
-        assignedAssetId: asset.id,
-        assignedMediaUrl: asset.url,
-        assignedClipId: clipId,
-        assignedTitle: asset.name,
-        assignedThumbnail: asset.thumbnail || mediaItem.thumbnail || mediaItem.previewUrl,
-        candidateAlternatives: alternatives.length > 0 ? alternatives : (s.candidateAlternatives || []),
-        curatorCritique: critique || s.curatorCritique || null,
-        visualCollagePreview: collageDataUrl || s.visualCollagePreview || null
-      };
-    }
-    return s;
-  });
+  // 6. Update scene metadata
+  let updatedScenesList = [...(project.scenes?.list || [])];
+  const foundIndex = updatedScenesList.findIndex(s =>
+    (targetSceneId && s.id === targetSceneId) ||
+    (targetSceneNumber && Number(s.sceneNumber) === Number(targetSceneNumber))
+  );
 
+  const sceneMetaUpdate = {
+    assignedAssetId: asset.id,
+    assignedMediaUrl: asset.url,
+    assignedClipId: clipId,
+    assignedTitle: asset.name,
+    assignedThumbnail: asset.thumbnail || mediaItem.thumbnail || mediaItem.previewUrl,
+    candidateAlternatives: alternatives.length > 0 ? alternatives : (foundIndex >= 0 ? updatedScenesList[foundIndex].candidateAlternatives || [] : []),
+    curatorCritique: critique || (foundIndex >= 0 ? updatedScenesList[foundIndex].curatorCritique || null : null),
+    visualCollagePreview: null
+  };
+
+  if (foundIndex >= 0) {
+    updatedScenesList = updatedScenesList.map((s, idx) => idx === foundIndex ? {
+      ...s,
+      startTime: clipStartTime,
+      duration: clipDuration,
+      endTime: Number((clipStartTime + clipDuration).toFixed(2)),
+      ...sceneMetaUpdate
+    } : s);
+  } else if (updatedScenesList.length > 0) {
+    updatedScenesList = [...updatedScenesList, {
+      id: targetSceneId,
+      sceneNumber: targetSceneNumber,
+      title: scene.title || `Escena ${targetSceneNumber}`,
+      scriptText: scene.scriptText || '',
+      visualDescription: scene.visualDescription || '',
+      visualType: isVideoAsset ? 'video' : 'image',
+      visualTypeLabel: isVideoAsset ? 'Video B-Roll' : 'Foto',
+      startTime: clipStartTime,
+      duration: clipDuration,
+      endTime: Number((clipStartTime + clipDuration).toFixed(2)),
+      color: scene.color || '#06b6d4',
+      ...sceneMetaUpdate
+    }].sort((a, b) => a.startTime - b.startTime);
+  } else {
+    updatedScenesList = [{
+      id: targetSceneId,
+      sceneNumber: targetSceneNumber,
+      title: scene.title || `Escena ${targetSceneNumber}`,
+      scriptText: scene.scriptText || '',
+      visualDescription: scene.visualDescription || '',
+      visualType: isVideoAsset ? 'video' : 'image',
+      visualTypeLabel: isVideoAsset ? 'Video B-Roll' : 'Foto',
+      startTime: clipStartTime,
+      duration: clipDuration,
+      endTime: Number((clipStartTime + clipDuration).toFixed(2)),
+      color: scene.color || '#06b6d4',
+      ...sceneMetaUpdate
+    }];
+  }
+
+  // 7. Update assets list safely without accidentally dropping assets
   const oldAssetId = scene.assignedAssetId;
   const updatedAssets = [
-    ...(project.assets || []).filter(a => a.id !== asset.id && a.id !== oldAssetId && a.sceneId !== scene.id),
+    ...(project.assets || []).filter(a => {
+      if (a.id === asset.id) return false;
+      if (oldAssetId && a.id === oldAssetId) return false;
+      if (targetSceneId && a.sceneId && a.sceneId === targetSceneId) return false;
+      return true;
+    }),
     asset
   ];
 
@@ -280,13 +448,14 @@ export function isScenePopulated(scene, project) {
   // 2. Video track clip covering this scene
   if (project?.tracks) {
     const videoTracks = project.tracks.filter(t => t.type === 'video');
+    const sNum = scene.sceneNumber ? Number(scene.sceneNumber) : null;
     for (const track of videoTracks) {
       for (const clip of (track.clips || [])) {
         if (clip.sceneId && scene.id && clip.sceneId === scene.id) return true;
-        if (scene.sceneNumber) {
-          const prefix = `[E${scene.sceneNumber}]`;
-          const prefixSpace = `[E${scene.sceneNumber} `;
-          if (clip.name && (clip.name.startsWith(prefix) || clip.name.startsWith(prefixSpace))) return true;
+        if (sNum && clip.sceneNumber && Number(clip.sceneNumber) === sNum) return true;
+        if (sNum) {
+          const match = clip.name?.match(/\[E\s*0*(\d+)\]/i) || clip.name?.match(/\bEscena\s*0*(\d+)\b/i);
+          if (match && Number(match[1]) === sNum) return true;
         }
       }
     }
@@ -403,6 +572,8 @@ export async function autoPopulateAllScenesBroll({
   }
 
   const formatLabel = effectivePreference === 'video' ? 'Solo Videos' : (effectivePreference === 'image' ? 'Solo Imágenes' : 'Combinada (Híbrido)');
+  const projectOrientation = resolveProjectOrientation(currentProject, stockConfig.preferredOrientation);
+  const orientationBadge = getOrientationLabel(projectOrientation);
 
   const resumeText = onlyEmptyScenes
     ? `[Reanudando: ${total} escenas vacías pendientes de ${totalProjectScenes} totales]`
@@ -410,8 +581,8 @@ export async function autoPopulateAllScenesBroll({
 
   onLog({
     phase: 'Inicio',
-    text: `Iniciando Agente Curador Visual IA ${resumeText} [Formato: ${formatLabel}] (Búsqueda Estilo Editor & Mosaico 4x4)...`,
-    icon: '👁️'
+    text: `Iniciando Agente Curador Visual IA ${resumeText} [Formato: ${formatLabel} • Encuadre: ${orientationBadge}] (Búsqueda Estilo Editor & Mosaico)...`,
+    icon: projectOrientation === 'portrait' ? '📱' : '👁️'
   });
 
   // Step 0: Detect Global Video Topic & Visual Universe
@@ -430,29 +601,136 @@ export async function autoPopulateAllScenesBroll({
 
   onLog({
     phase: 'Tema Fijado',
-    text: `🎯 TEMA PRINCIPAL: "${globalVideoTopic.coreTopic}" | Universo Visual: "${globalVideoTopic.visualDomain}" (Filtro anti-discordancias/zanahorias activo)`,
+    text: `🎯 TEMA PRINCIPAL: "${globalVideoTopic.coreTopic}" | Universo Visual: "${globalVideoTopic.visualDomain}" | Orientación: ${orientationBadge}`,
     icon: '🎯',
     topicData: globalVideoTopic
   });
 
-  for (let i = 0; i < total; i++) {
+  // Step 1: Batch Visual Search Strategy Planning
+  // Groups all scenes to process into optimized AI batches (BATCH_SIZE = 8),
+  // reducing Ollama Cloud requests and prompt token consumption by ~85% while providing panoramic narrative continuity.
+  onLog({
+    phase: 'Planificación en Lote',
+    text: `Planificando ángulos de búsqueda en lote con IA para ${total} escenas (visión panorámica y ahorro de peticiones)...`,
+    icon: '📋'
+  });
+
+  const batchStrategiesMap = await generateBatchSceneSearchStrategiesWithAI({
+    scenes: scenesToProcess,
+    globalVideoTopic,
+    aiConfig,
+    signal,
+    onLog
+  });
+
+  onLog({
+    phase: 'Estrategia Lista',
+    text: `✓ Estrategias de búsqueda en lote consolidadas para las ${total} escenas (${orientationBadge}). Iniciando búsqueda y montaje...`,
+    icon: '🎯'
+  });
+
+  // Helper to fetch candidates for a single scene (max 2 queries, max 12 fresh candidates strictly matching orientation)
+  const fetchCandidatesForScene = async (scene, queries, targetType) => {
+    const queriesToUse = (queries && queries.length > 0 ? queries.slice(0, 2) : ['cinematic visual']);
+    const candidatesByQuery = {};
+    const allFound = [];
+
+    for (const q of queriesToUse) {
+      if (signal && signal.aborted) break;
+      try {
+        const res = await searchStockMedia({
+          query: q,
+          type: targetType,
+          orientation: projectOrientation,
+          project: currentProject,
+          perPage: 16,
+          skipTranslation: true
+        });
+        const fresh = (res.results || []).filter(item => {
+          return !projectSeenIds.has(item.id) && !projectSeenUrls.has(item.previewUrl || item.downloadUrl);
+        });
+        const orientationMatched = fresh.filter(item => isMediaMatchingOrientation(item, projectOrientation));
+        const pool = orientationMatched.length > 0 ? orientationMatched : fresh;
+        const matching = targetType === 'video' ? pool.filter(item => item.type === 'video') : pool;
+        const list = matching.length > 0 ? matching : pool;
+        candidatesByQuery[q] = list;
+        allFound.push(...list);
+      } catch (err) {
+        console.warn(`[StockSearch] Error en "${q}":`, err.message);
+      }
+    }
+
+    return selectEquitableCandidates(candidatesByQuery, allFound, 12);
+  };
+
+  // Helper to resolve rescue candidate if no stock matched
+  const rescueSceneCandidate = async (scene, targetType) => {
+    try {
+      const rescueQuery = `${scene.visualAnchor || globalVideoTopic?.mandatoryKeywords?.[0] || 'cinematic'}`;
+      onLog({
+        phase: `Rescate de Escena`,
+        text: `Sin coincidencias directas para Escena ${scene.sceneNumber}. Intentando rescate temático (${orientationBadge}): "${rescueQuery}"...`,
+        icon: '🆘'
+      });
+      const rescueRes = await searchStockMedia({
+        query: rescueQuery,
+        type: targetType,
+        orientation: projectOrientation,
+        project: currentProject,
+        perPage: 16,
+        skipTranslation: true
+      });
+      const freshRescue = (rescueRes.results || []).filter(item => !projectSeenIds.has(item.id) && (!item.previewUrl || !projectSeenUrls.has(item.previewUrl)));
+      const orientedRescue = freshRescue.filter(item => isMediaMatchingOrientation(item, projectOrientation));
+      const rescueCandidates = orientedRescue.length > 0 ? orientedRescue : freshRescue;
+      if (rescueCandidates.length > 0) {
+        return {
+          winner: rescueCandidates[0],
+          alternatives: rescueCandidates.slice(1, 12),
+          score: 7.0
+        };
+      }
+    } catch (rescErr) {
+      console.warn('[AutoBroll] Error en búsqueda de rescate:', rescErr.message);
+    }
+    return null;
+  };
+
+  // Step 2: Dual-Scene Mosaic & Unified Mount Loop (Solution 1: Evaluates 2 scenes per Vision AI call!)
+  for (let i = 0; i < total; i += 2) {
     if (signal && signal.aborted) {
       onLog({ phase: 'Cancelado', text: 'Proceso cancelado por el usuario.', icon: '⏹️' });
       break;
     }
 
-    const rawScene = scenesToProcess[i];
-    const targetMediaType = (effectivePreference === 'video' || effectivePreference === 'image')
-      ? effectivePreference
-      : (rawScene.visualType || 'video');
+    const rawSceneA = scenesToProcess[i];
+    const rawSceneB = (i + 1 < total) ? scenesToProcess[i + 1] : null;
 
-    const scene = {
-      ...rawScene,
-      visualType: targetMediaType,
-      visualTypeLabel: targetMediaType === 'video' ? 'Video B-Roll' : 'Imagen Conceptual'
+    // Prepare Scene A
+    const targetMediaTypeA = (effectivePreference === 'video' || effectivePreference === 'image')
+      ? effectivePreference
+      : (rawSceneA.visualType || 'video');
+    const sceneA = {
+      ...rawSceneA,
+      visualType: targetMediaTypeA,
+      visualTypeLabel: targetMediaTypeA === 'video' ? 'Video B-Roll' : 'Imagen Conceptual'
     };
 
-    const sceneNum = scene.sceneNumber || (i + 1);
+    // Prepare Scene B (if exists)
+    let sceneB = null;
+    let targetMediaTypeB = 'video';
+    if (rawSceneB) {
+      targetMediaTypeB = (effectivePreference === 'video' || effectivePreference === 'image')
+        ? effectivePreference
+        : (rawSceneB.visualType || 'video');
+      sceneB = {
+        ...rawSceneB,
+        visualType: targetMediaTypeB,
+        visualTypeLabel: targetMediaTypeB === 'video' ? 'Video B-Roll' : 'Imagen Conceptual'
+      };
+    }
+
+    const pairLabel = sceneB ? `Escenas ${sceneA.sceneNumber} y ${sceneB.sceneNumber}` : `Escena ${sceneA.sceneNumber}`;
     const overallIndex = alreadyPopulatedBase + i;
     const percent = Math.min(99, Math.round((overallIndex / totalProjectScenes) * 100));
 
@@ -462,336 +740,225 @@ export async function autoPopulateAllScenesBroll({
       overallCurrent: overallIndex + 1,
       overallTotal: totalProjectScenes,
       percent,
-      sceneTitle: scene.title,
-      sceneNumber: sceneNum,
-      message: `[${sceneNum}/${totalProjectScenes} Total | Pendiente ${i + 1}/${total}] Escena ${sceneNum} (${targetMediaType === 'video' ? 'Video' : 'Imagen'}): IA planificando estrategias estilo editor...`
+      sceneTitle: sceneA.title,
+      sceneNumber: sceneA.sceneNumber,
+      message: `[${overallIndex + 1}/${totalProjectScenes} Total] ${pairLabel}: Buscando candidatos de stock...`
     });
 
     onLog({
-      phase: `Escena ${scene.sceneNumber}`,
-      text: `Analizando guion: "${(scene.scriptText || scene.title || '').substring(0, 85)}..." [Toma sugerida: "${scene.visualDescription || scene.visualAnchor || scene.title}"] | Tema: "${globalVideoTopic.coreTopic}"`,
-      icon: '🧠'
+      phase: pairLabel,
+      text: sceneB
+        ? `Iniciando bloque dual: Escena ${sceneA.sceneNumber} ("${sceneA.title}") + Escena ${sceneB.sceneNumber} ("${sceneB.title}")...`
+        : `Analizando Escena ${sceneA.sceneNumber} ("${sceneA.title}")...`,
+      icon: '🎬'
     });
 
     try {
-      // 1. AI Search Strategy Planning: Formulate distinct English queries anchored in the Suggested Shot & Concepts
-      onLog({
-        phase: `Estrategia IA`,
-        text: `Formulando ángulos de búsqueda estilo editor a partir de la toma sugerida y conceptos...`,
-        icon: '💡'
-      });
+      // 1. Obtener estrategias de búsqueda en lote
+      const stratA = batchStrategiesMap.get(sceneA.id) || batchStrategiesMap.get(sceneA.sceneNumber) || fallbackQueryGenerator(sceneA, globalVideoTopic);
+      const stratB = sceneB ? (batchStrategiesMap.get(sceneB.id) || batchStrategiesMap.get(sceneB.sceneNumber) || fallbackQueryGenerator(sceneB, globalVideoTopic)) : null;
 
-      const { concept, queries } = await generateSceneSearchStrategiesWithAI({
-        scene,
-        globalVideoTopic,
-        previousQueries: usedQueriesHistory,
-        aiConfig,
-        signal
-      });
+      usedQueriesHistory.push(...stratA.queries);
+      if (stratB) usedQueriesHistory.push(...stratB.queries);
 
-      usedQueriesHistory.push(...queries);
+      // 2. Buscar candidatos de stock para Escena A y B
+      const candidatesA = await fetchCandidatesForScene(sceneA, stratA.queries, targetMediaTypeA);
+      const candidatesB = sceneB ? await fetchCandidatesForScene(sceneB, stratB.queries, targetMediaTypeB) : [];
 
-      onLog({
-        phase: `Plan de Búsqueda`,
-        text: `Concepto: "${concept}" | Consultas formuladas: ${queries.map(q => `"${q}"`).join(', ')}`,
-        icon: '📋'
-      });
+      // 3. EVALUACIÓN VISUAL DUAL CON OJO CRÍTICO (1 SOLA LLAMADA A OLLAMA CLOUD PARA AMBAS ESCENAS)
+      let winnerDataA = null;
+      let winnerDataB = null;
 
-      // 2. Bucle Visual Inteligente por Búsqueda (16 recursos en cuadrícula 4x4 por consulta con Early-Exit)
-      let selectedMedia = null;
-      let alternatives = [];
-      let critiqueData = null;
-      let collageDataUrl = null;
-      let highestScore = -1;
-
-      // Resguardo de alta fidelidad: almacena el mejor video de stock evaluado entre todas las consultas
-      let bestStockCandidateOverall = null;
-      let bestStockCandidateScore = -1;
-      let bestStockCandidateAlternatives = [];
-      let bestStockCandidateCollage = null;
-
-      for (let qIdx = 0; qIdx < queries.length; qIdx++) {
-        if (signal && signal.aborted) break;
-
-        const currentQuery = queries[qIdx];
-        onProgress({
-          current: i + 1,
-          total,
-          percent: percent + Math.round((qIdx / queries.length) * 20),
-          sceneTitle: scene.title,
-          message: `[${i + 1}/${total}] Búsqueda [${qIdx + 1}/${queries.length}]: "${currentQuery}" (Evaluación visual 4x4)...`
-        });
-
-        onLog({
-          phase: `Búsqueda [${qIdx + 1}/${queries.length}]`,
-          text: `Buscando en ${stockConfig.preferredProvider || 'pexels'}: "${currentQuery}" (${targetMediaType === 'video' ? 'videos' : 'imágenes'} en cuadrícula 4x4)...`,
-          icon: '🔍'
-        });
-
-        let searchRes;
-        try {
-          searchRes = await searchStockMedia({
-            query: currentQuery,
-            type: targetMediaType,
-            orientation: stockConfig.preferredOrientation || 'landscape',
-            perPage: 16,
-            skipTranslation: true
-          });
-        } catch (searchErr) {
-          console.warn(`[StockSearch] Error en consulta "${currentQuery}":`, searchErr.message);
-          continue;
-        }
-
-        const rawResults = searchRes.results || [];
-        // Filtro anti-duplicados a nivel de proyecto
-        const freshResults = rawResults.filter(item => {
-          const idKey = item.id;
-          const urlKey = item.previewUrl || item.downloadUrl;
-          return !projectSeenIds.has(idKey) && !projectSeenUrls.has(urlKey);
-        });
-
-        // Asegurar correspondencia estricta con el formato pedido (si se pide video, no aceptar imágenes fijas)
-        const formatMatchingResults = targetMediaType === 'video'
-          ? freshResults.filter(item => item.type === 'video')
-          : freshResults;
-
-        const candidatesToEvaluate = formatMatchingResults.length > 0 ? formatMatchingResults : freshResults;
-
-        if (candidatesToEvaluate.length === 0) {
+      if (useVisionAI && (candidatesA.length > 1 || candidatesB.length > 1)) {
+        if (sceneB && candidatesB.length > 0) {
           onLog({
-            phase: `Búsqueda [${qIdx + 1}/${queries.length}]`,
-            text: `Sin recursos inéditos para "${currentQuery}". Pasando a la siguiente consulta...`,
-            icon: '⚠️'
-          });
-          continue;
-        }
-
-        // Registrar candidato base de stock por si la IA es excesivamente estricta en el puntaje
-        if (!bestStockCandidateOverall && candidatesToEvaluate.length > 0) {
-          bestStockCandidateOverall = candidatesToEvaluate[0];
-          bestStockCandidateAlternatives = candidatesToEvaluate.slice(1, 4);
-          bestStockCandidateScore = 7.0;
-        }
-
-        // EVALUACIÓN 100% VISUAL DE LOS 16 CANDIDATOS (CUADRÍCULA 4x4)
-        if (useVisionAI && candidatesToEvaluate.length > 1) {
-          onLog({
-            phase: `Ojo Crítico IA`,
-            text: `Construyendo mosaico 4x4 de ${candidatesToEvaluate.length} candidatos de "${currentQuery}" para evaluación visual...`,
-            icon: '👁️'
+            phase: `Mosaico Dual IA`,
+            text: `👁️ Evaluando Mosaico Dual para Escenas ${sceneA.sceneNumber} y ${sceneB.sceneNumber} en 1 sola llamada a Ollama Cloud...`,
+            icon: '✨'
           });
 
           try {
-            const evalResult = await evaluateSceneCandidatesWithVisionAI({
-              scene,
+            const dualResult = await evaluateDualScenesWithVisionAI({
+              sceneA,
+              candidatesA,
+              sceneB,
+              candidatesB,
               globalVideoTopic,
-              candidates: candidatesToEvaluate,
               aiConfig,
               signal
             });
 
-            const winner = evalResult.winner;
-            const winnerScore = evalResult.critique?.winnerScore || (winner ? 8.0 : 0);
-            const reviews = evalResult.critique?.candidateReviews || [];
+            winnerDataA = dualResult.sceneA;
+            winnerDataB = dualResult.sceneB;
 
-            // Identificar el candidato mejor calificado en esta evaluación (incluso si allRejected fue true)
-            const sortedReviews = [...reviews].sort((a, b) => (Number(b.score) || 0) - (Number(a.score) || 0));
-            const topRatedReview = sortedReviews[0];
-            if (topRatedReview && topRatedReview.candidateIndex) {
-              const topItem = candidatesToEvaluate[topRatedReview.candidateIndex - 1];
-              const scoreVal = Number(topRatedReview.score) || 7.0;
-              if (topItem && scoreVal > bestStockCandidateScore) {
-                bestStockCandidateScore = scoreVal;
-                bestStockCandidateOverall = topItem;
-                bestStockCandidateAlternatives = candidatesToEvaluate.filter(c => c.id !== topItem.id).slice(0, 3);
-                bestStockCandidateCollage = evalResult.collageDataUrl;
-              }
-            }
-
-            // Transmitir calificaciones candidato por candidato en tiempo real
-            for (const rev of reviews) {
-              const verdictIcon = rev.verdict === 'EXCELENTE' ? '⭐' : (rev.verdict === 'ACEPTABLE' ? '✔️' : '❌');
-              const scoreText = rev.score ? `[${rev.score}/10]` : `[${rev.verdict}]`;
-              onLog({
-                phase: `Thinking [Candidato #${rev.candidateIndex}]`,
-                text: `${verdictIcon} ${scoreText}: ${rev.critique || 'Evaluado'}`,
-                icon: '🧐'
+            // Actualizar vista previa en vivo en la interfaz
+            if (dualResult.sceneA?.collageDataUrl) {
+              onCurrentCollage({
+                sceneNumber: `${sceneA.sceneNumber} & #${sceneB.sceneNumber}`,
+                sceneTitle: `[A] "${sceneA.title}" • [B] "${sceneB.title}"`,
+                collageDataUrl: dualResult.sceneA.collageDataUrl,
+                critique: {
+                  winnerIndex: `A${dualResult.sceneA.critique?.winnerIndex || 1} | B${dualResult.sceneB.critique?.winnerIndex || 1}`,
+                  winnerReason: `[Escena ${sceneA.sceneNumber}]: ${dualResult.sceneA.critique?.winnerReason || 'OK'} • [Escena ${sceneB.sceneNumber}]: ${dualResult.sceneB.critique?.winnerReason || 'OK'}`
+                },
+                winner: dualResult.sceneA.winner,
+                alternatives: [
+                  ...(dualResult.sceneA.alternatives || []).slice(0, 2),
+                  ...(dualResult.sceneB.alternatives || []).slice(0, 2)
+                ]
               });
             }
-
-            // Actualizar vista previa del mosaico en vivo en la interfaz
-            onCurrentCollage({
-              sceneNumber: scene.sceneNumber,
-              sceneTitle: scene.title,
-              collageDataUrl: evalResult.collageDataUrl,
-              critique: evalResult.critique,
-              winner,
-              alternatives: evalResult.alternatives || []
-            });
-
-            // ¿Encontramos una toma sobresaliente (>= 8.5/10)? ¡BINGO!
-            if (winner && winnerScore >= 8.5) {
-              onLog({
-                phase: `🎯 ¡Toma Sobresaliente!`,
-                text: `¡Candidato ganador con nota alta (${winnerScore}/10): "${winner.title || 'Recurso'}"! Seleccionado de inmediato.`,
-                icon: '⭐'
-              });
-
-              selectedMedia = winner;
-              alternatives = evalResult.alternatives || [];
-              critiqueData = evalResult.critique;
-              collageDataUrl = evalResult.collageDataUrl;
-              highestScore = winnerScore;
-              break; // Early-exit inteligente: ¡No malgasta tiempo ni cuotas en más búsquedas!
-            }
-
-            // Si es un candidato aceptable y supera lo que teníamos antes, guardarlo como mejor opción
-            if (winner && winnerScore > highestScore) {
-              highestScore = winnerScore;
-              selectedMedia = winner;
-              alternatives = evalResult.alternatives || [];
-              critiqueData = evalResult.critique;
-              collageDataUrl = evalResult.collageDataUrl;
-
-              if (qIdx < queries.length - 1) {
-                onLog({
-                  phase: `Buscando Alternativa`,
-                  text: `Opciones viables encontradas (mejor nota: ${winnerScore}/10). Probando consulta [${qIdx + 2}/${queries.length}] para intentar superar este estándar...`,
-                  icon: '🔄'
-                });
-              }
-            }
-          } catch (visErr) {
-            console.warn(`[VisualEvaluation] Error evaluando visualmente búsqueda ${qIdx + 1}:`, visErr.message);
-            if (!selectedMedia && candidatesToEvaluate.length > 0) {
-              selectedMedia = candidatesToEvaluate[0];
-              alternatives = candidatesToEvaluate.slice(1, 4);
-            }
+          } catch (dualErr) {
+            console.warn('[AutoBroll] Error en evaluación dual:', dualErr.message);
           }
         } else {
-          // Si Visión IA está desactivada, tomar el primer recurso disponible
-          if (!selectedMedia && candidatesToEvaluate.length > 0) {
-            selectedMedia = candidatesToEvaluate[0];
-            alternatives = candidatesToEvaluate.slice(1, 4);
-            break;
-          }
-        }
-      }
-
-      // Si ningún candidato alcanzó el umbral super estricto (8.5), pero tenemos el mejor video de stock evaluado:
-      if (!selectedMedia && bestStockCandidateOverall) {
-        onLog({
-          phase: `Selección de Stock`,
-          text: `ℹ️ Asignando el mejor recurso de stock evaluado (${bestStockCandidateScore > 0 ? `${bestStockCandidateScore}/10` : 'Óptimo'}: "${bestStockCandidateOverall.title}"). Evitando imágenes externas discordantes.`,
-          icon: '🎬'
-        });
-        selectedMedia = bestStockCandidateOverall;
-        alternatives = bestStockCandidateAlternatives;
-        collageDataUrl = bestStockCandidateCollage;
-        highestScore = bestStockCandidateScore;
-      }
-
-      // Si ningún candidato fue seleccionado, intentar rescate de emergencia antes de saltar la escena
-      if (!selectedMedia) {
-        try {
-          const rescueQuery = `${scene.visualAnchor || globalVideoTopic?.mandatoryKeywords?.[0] || 'cinematic'}`;
+          // Solo Escena A (impar o última)
           onLog({
-            phase: `Rescate de Escena`,
-            text: `Sin coincidencias directas. Intentando rescate temático: "${rescueQuery}"...`,
-            icon: '🆘'
+            phase: `Ojo Crítico IA`,
+            text: `👁️ Evaluando Escena ${sceneA.sceneNumber} con Visión IA (${candidatesA.length} candidatos)...`,
+            icon: '👁️'
           });
-          const rescueRes = await searchStockMedia({
-            query: rescueQuery,
-            type: targetMediaType,
-            orientation: stockConfig.preferredOrientation || 'landscape',
-            perPage: 12,
-            skipTranslation: true
-          });
-          const rescueCandidates = (rescueRes.results || []).filter(item => !projectSeenIds.has(item.id) && (!item.previewUrl || !projectSeenUrls.has(item.previewUrl)));
-          if (rescueCandidates.length > 0) {
-            selectedMedia = rescueCandidates[0];
-            alternatives = rescueCandidates.slice(1, 4);
-            highestScore = 7.0;
-            onLog({
-              phase: `Rescate Exitoso`,
-              text: `Recurso temático de rescate asegurado para Escena ${scene.sceneNumber}: "${selectedMedia.title}"`,
-              icon: '🛡️'
+
+          try {
+            winnerDataA = await evaluateSceneCandidatesWithVisionAI({
+              scene: sceneA,
+              candidates: candidatesA,
+              globalVideoTopic,
+              aiConfig,
+              minAcceptableScore: 7.5,
+              signal
             });
+
+            if (winnerDataA?.collageDataUrl) {
+              onCurrentCollage({
+                sceneNumber: sceneA.sceneNumber,
+                sceneTitle: sceneA.title,
+                collageDataUrl: winnerDataA.collageDataUrl,
+                critique: winnerDataA.critique,
+                winner: winnerDataA.winner,
+                alternatives: winnerDataA.alternatives || []
+              });
+            }
+          } catch (singleErr) {
+            console.warn('[AutoBroll] Error en evaluación simple:', singleErr.message);
           }
-        } catch (rescErr) {
-          console.warn('[AutoBroll] Error en búsqueda de rescate:', rescErr.message);
         }
       }
 
-      if (!selectedMedia) {
+      // Manejo de Rechazo por Calidad y Auto-Rescate Independiente para cada Escena
+      if (winnerDataA?.allRejected || !winnerDataA?.winner) {
         onLog({
-          phase: `Escena ${scene.sceneNumber}`,
-          text: `Sin resultados en bibliotecas de stock para las consultas formuladas. Saltando escena.`,
-          icon: '⏭️'
+          phase: `Auto-Rescate Escena ${sceneA.sceneNumber}`,
+          text: `⚠️ Candidatos de Escena ${sceneA.sceneNumber} no alcanzaron la calidad mínima (${winnerDataA?.score || 5}/10). Buscando rescate temático...`,
+          icon: '🆘'
         });
-        continue;
+        const rescuedA = await rescueSceneCandidate(sceneA, targetMediaTypeA);
+        if (rescuedA?.winner) {
+          winnerDataA = rescuedA;
+        } else if (candidatesA.length > 0) {
+          winnerDataA = {
+            winner: candidatesA[0],
+            alternatives: candidatesA.slice(1, 12),
+            score: 6.5,
+            critique: { winnerScore: 6.5, winnerReason: 'Opción de reserva tras rescate temático' }
+          };
+        }
       }
 
-      // Registrar recurso elegido para prevenir repeticiones
-      projectSeenIds.add(selectedMedia.id);
-      if (selectedMedia.previewUrl) projectSeenUrls.add(selectedMedia.previewUrl);
-      if (selectedMedia.downloadUrl) projectSeenUrls.add(selectedMedia.downloadUrl);
+      if (sceneB && (winnerDataB?.allRejected || !winnerDataB?.winner)) {
+        onLog({
+          phase: `Auto-Rescate Escena ${sceneB.sceneNumber}`,
+          text: `⚠️ Candidatos de Escena ${sceneB.sceneNumber} no alcanzaron la calidad mínima (${winnerDataB?.score || 5}/10). Buscando rescate temático...`,
+          icon: '🆘'
+        });
+        const rescuedB = await rescueSceneCandidate(sceneB, targetMediaTypeB);
+        if (rescuedB?.winner) {
+          winnerDataB = rescuedB;
+        } else if (candidatesB.length > 0) {
+          winnerDataB = {
+            winner: candidatesB[0],
+            alternatives: candidatesB.slice(1, 12),
+            score: 6.5,
+            critique: { winnerScore: 6.5, winnerReason: 'Opción de reserva tras rescate temático' }
+          };
+        }
+      }
 
-      onLog({
-        phase: `Veredicto Final`,
-        text: `✓ Asignado recurso final: "${selectedMedia.title}" (${selectedMedia.type === 'video' ? 'Video' : 'Imagen'} | Nota: ${highestScore > 0 ? `${highestScore}/10` : 'Selección directa'}) | ${alternatives.length} alternativas listas`,
-        icon: '🏆'
-      });
+      // 4. Descarga a Disco y Asignación para Escena A
+      if (winnerDataA?.winner) {
+        const selectedA = winnerDataA.winner;
+        projectSeenIds.add(selectedA.id);
+        if (selectedA.previewUrl) projectSeenUrls.add(selectedA.previewUrl);
+        if (selectedA.downloadUrl) projectSeenUrls.add(selectedA.downloadUrl);
 
+        const projectFolder = getProjectMediaFolder(currentProject);
+        const resA = await assignStockMediaToScene({
+          project: currentProject,
+          scene: sceneA,
+          mediaItem: selectedA,
+          alternatives: winnerDataA.alternatives || [],
+          critique: winnerDataA.critique || null,
+          collageDataUrl: winnerDataA.collageDataUrl || null,
+          trackPreference: stockConfig.targetTrack || 'v2',
+          projectFolder
+        });
+        currentProject = resA.updatedProject;
+
+        try { onSceneAssigned(currentProject, sceneA, selectedA); } catch (e) {}
+
+        onLog({
+          phase: `Montaje Escena ${sceneA.sceneNumber}`,
+          text: `✓ Asignado recurso: "${selectedA.title}" (${selectedA.type === 'video' ? 'Video' : 'Imagen'}) [${sceneA.startTime}s - ${sceneA.endTime}s] ✅`,
+          icon: '🏆'
+        });
+      }
+
+      // 5. Descarga a Disco y Asignación para Escena B (si existe)
+      if (sceneB && winnerDataB?.winner) {
+        const selectedB = winnerDataB.winner;
+        projectSeenIds.add(selectedB.id);
+        if (selectedB.previewUrl) projectSeenUrls.add(selectedB.previewUrl);
+        if (selectedB.downloadUrl) projectSeenUrls.add(selectedB.downloadUrl);
+
+        const projectFolder = getProjectMediaFolder(currentProject);
+        const resB = await assignStockMediaToScene({
+          project: currentProject,
+          scene: sceneB,
+          mediaItem: selectedB,
+          alternatives: winnerDataB.alternatives || [],
+          critique: winnerDataB.critique || null,
+          collageDataUrl: winnerDataB.collageDataUrl || null,
+          trackPreference: stockConfig.targetTrack || 'v2',
+          projectFolder
+        });
+        currentProject = resB.updatedProject;
+
+        try { onSceneAssigned(currentProject, sceneB, selectedB); } catch (e) {}
+
+        onLog({
+          phase: `Montaje Escena ${sceneB.sceneNumber}`,
+          text: `✓ Asignado recurso: "${selectedB.title}" (${selectedB.type === 'video' ? 'Video' : 'Imagen'}) [${sceneB.startTime}s - ${sceneB.endTime}s] ✅`,
+          icon: '🏆'
+        });
+      }
+
+      const currentPairCount = Math.min(i + (sceneB ? 2 : 1), total);
       onProgress({
-        current: i + 1,
+        current: currentPairCount,
         total,
-        overallCurrent: overallIndex + 1,
+        overallCurrent: alreadyPopulatedBase + currentPairCount,
         overallTotal: totalProjectScenes,
-        percent: Math.min(99, Math.round(((overallIndex + 0.8) / totalProjectScenes) * 100)),
-        sceneTitle: scene.title,
-        sceneNumber: sceneNum,
-        message: `[${sceneNum}/${totalProjectScenes} Total] Descargando a disco: "${scene.title}"...`
-      });
-
-      const projectFolder = getProjectMediaFolder(currentProject);
-      onLog({
-        phase: `Descarga Disco`,
-        text: `Guardando archivo en carpeta local projects_media/${projectFolder}/...`,
-        icon: '💾'
-      });
-
-      // 5. Download to disk and place on timeline
-      const result = await assignStockMediaToScene({
-        project: currentProject,
-        scene,
-        mediaItem: selectedMedia,
-        alternatives,
-        critique: critiqueData,
-        collageDataUrl,
-        trackPreference: stockConfig.targetTrack || 'v2',
-        projectFolder
-      });
-
-      currentProject = result.updatedProject;
-
-      try {
-        onSceneAssigned(currentProject, scene, selectedMedia);
-      } catch (assignErr) {
-        console.warn('[AutoBroll] Error en callback onSceneAssigned:', assignErr);
-      }
-
-      onLog({
-        phase: `Montaje Listo`,
-        text: `Clip insertado en [${scene.startTime}s - ${scene.endTime}s] (${result.newAsset.name}) ✅`,
-        icon: '🎬'
+        percent: Math.min(99, Math.round(((alreadyPopulatedBase + currentPairCount) / totalProjectScenes) * 100)),
+        sceneTitle: sceneB?.title || sceneA.title,
+        sceneNumber: sceneB?.sceneNumber || sceneA.sceneNumber,
+        message: `[${alreadyPopulatedBase + currentPairCount}/${totalProjectScenes} Total] Procesadas ${currentPairCount}/${total} escenas...`
       });
 
     } catch (err) {
-      console.error(`Error procesando escena ${scene.sceneNumber}:`, err);
+      console.error(`Error procesando bloque dual:`, err);
       onLog({
         phase: `Error`,
-        text: `Error en Escena ${scene.sceneNumber}: ${err.message}`,
+        text: `Error en ${pairLabel}: ${err.message}`,
         icon: '❌'
       });
     }

@@ -244,14 +244,7 @@ export async function saveProjectToCache(project, directoryName = null) {
         updatedAt: cleanProject.updatedAt,
         settings: cleanProject.settings,
         trackCount: cleanProject.tracks?.length || 0,
-        assetCount: cleanProject.assets?.length || 0,
-        tracks: cleanProject.tracks,
-        assets: cleanProject.assets?.map(a => ({
-          ...a,
-          url: a.url?.startsWith('data:') && a.url.length > 50000 ? '' : a.url
-        })),
-        scenes: cleanProject.scenes,
-        transcript: cleanProject.transcript
+        assetCount: cleanProject.assets?.length || 0
       };
       const filtered = list.filter(p => p && p.id !== summary.id);
       filtered.unshift(summary);
@@ -326,6 +319,32 @@ export async function getCachedProject(id) {
 }
 
 export async function deleteCachedProject(id) {
+  if (!id) return false;
+
+  // 1. Remove from localStorage backup and active project cache
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const raw = localStorage.getItem('montage_cached_projects_backup');
+      if (raw) {
+        const list = JSON.parse(raw);
+        const filtered = list.filter(p => p && p.id !== id);
+        localStorage.setItem('montage_cached_projects_backup', JSON.stringify(filtered));
+      }
+      const current = localStorage.getItem('montage_current_project');
+      if (current) {
+        try {
+          const parsed = JSON.parse(current);
+          if (parsed && (parsed.id === id || parsed.fileName === id)) {
+            localStorage.removeItem('montage_current_project');
+          }
+        } catch (_) {}
+      }
+    }
+  } catch (lsErr) {
+    console.warn('Could not remove cached project from localStorage:', lsErr);
+  }
+
+  // 2. Remove from IndexedDB
   try {
     const db = await openDB();
     return new Promise((resolve, reject) => {
@@ -337,5 +356,49 @@ export async function deleteCachedProject(id) {
     });
   } catch (err) {
     console.warn('Could not delete project from IndexedDB:', err);
+    return false;
+  }
+}
+
+export async function deleteCachedProjectByFileName(fileName) {
+  if (!fileName) return false;
+
+  // 1. Remove from localStorage backup
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const raw = localStorage.getItem('montage_cached_projects_backup');
+      if (raw) {
+        const list = JSON.parse(raw);
+        const filtered = list.filter(p => p && p.fileName !== fileName && p.name !== fileName && p.id !== fileName);
+        localStorage.setItem('montage_cached_projects_backup', JSON.stringify(filtered));
+      }
+    }
+  } catch (_) {}
+
+  // 2. Remove matching items from IndexedDB
+  try {
+    const db = await openDB();
+    const all = await new Promise((resolve) => {
+      const tx = db.transaction(STORE_PROJECTS, 'readonly');
+      const store = tx.objectStore(STORE_PROJECTS);
+      const req = store.getAll();
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => resolve([]);
+    });
+
+    for (const p of all) {
+      if (p && (p.fileName === fileName || p.id === fileName || p.name === fileName)) {
+        await new Promise((resolve) => {
+          const tx = db.transaction(STORE_PROJECTS, 'readwrite');
+          const req = tx.objectStore(STORE_PROJECTS).delete(p.id);
+          req.onsuccess = () => resolve(true);
+          req.onerror = () => resolve(false);
+        });
+      }
+    }
+    return true;
+  } catch (err) {
+    console.warn('Could not delete cached project by fileName:', err);
+    return false;
   }
 }

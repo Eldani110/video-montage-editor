@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   ArrowLeft,
   Save,
@@ -23,7 +23,13 @@ import {
   CloudOff,
   Loader2,
   ShieldCheck,
-  RefreshCw
+  RefreshCw,
+  Volume2,
+  Share2,
+  Check,
+  Eye,
+  KeyRound,
+  Lock
 } from 'lucide-react';
 import { MediaLibrary } from './MediaLibrary';
 import { ClipInspector } from './ClipInspector';
@@ -33,27 +39,37 @@ import { ProjectSettingsModal } from './ProjectSettingsModal';
 import { ExportModal } from './ExportModal';
 import { TranscribeModal } from './TranscribeModal';
 import { TranscriptPanel } from './TranscriptPanel';
+import { AudioMixerPanel } from './AudioMixerPanel';
+import { EffectControlsPanel } from './EffectControlsPanel';
+import { LumetriColorPanel } from './LumetriColorPanel';
 import { SceneDirectorModal } from './SceneDirectorModal';
 import { GraphicDirectorModal } from './GraphicDirectorModal';
+import { AutoCutModal } from './AutoCutModal';
 import { SceneStoryboardPanel } from './SceneStoryboardPanel';
 import { GlobalSettingsModal } from './GlobalSettingsModal';
 import { AutoBrollBatchModal } from './AutoBrollBatchModal';
 import { StockMediaSearchModal } from './StockMediaSearchModal';
 import { saveProjectToDisk, hasDiskFileHandle } from '../utils/fileSystem';
-import { saveProjectToCache, getMediaBlob, saveMediaBlob } from '../utils/storage';
+import { saveDiskProject } from '../services/localProjectService';
+import { saveProjectToCache, getCachedProject, getMediaBlob, saveMediaBlob } from '../utils/storage';
+import { tabLockCoordinator } from '../utils/tabLockCoordinator';
 import { getAutosaveConfig, saveAutosaveConfig } from '../utils/autosaveConfig';
 import { AutosaveSettingsModal } from './AutosaveSettingsModal';
 import { extractAudioTrackToWavBlob } from '../utils/audioExtractor';
 import { extractWaveformData } from '../utils/audioWaveform';
 import { addAssetToTimeline, sanitizeDuplicateSceneClips, separateAudioFromClip, unlinkClips } from '../utils/timelineOps';
+import { migrateProjectMediaPaths, resolveProjectAssetsOnDisk } from '../utils/stockMediaClient';
 import {
   clearScenesFromProject,
   deleteSingleScene,
   clearGuideTrackFromProject,
   deleteTrackFromProject,
-  clearTimelineClips
+  clearTimelineClips,
+  resolveRealSceneTimelinePosition
 } from '../utils/sceneOps';
+import { isSubtitleClip, updateSubtitleClipWithBatchSync } from '../utils/transcriptOps';
 import { UserNav } from './UserNav';
+import { useRouter } from '../context/RouterContext';
 
 export function EditorPage({
   initialProject,
@@ -61,11 +77,12 @@ export function EditorPage({
   currentDirHandle,
   onGoToAuth
 }) {
-  const [project, setProject] = useState(() => sanitizeDuplicateSceneClips(initialProject));
+  const prepareProject = (p) => migrateProjectMediaPaths(sanitizeDuplicateSceneClips(p));
+  const [project, setProject] = useState(() => prepareProject(initialProject));
 
   useEffect(() => {
     if (initialProject) {
-      setProject(sanitizeDuplicateSceneClips(initialProject));
+      setProject(prepareProject(initialProject));
     }
   }, [initialProject]);
   const [currentTime, setCurrentTime] = useState(0);
@@ -73,7 +90,7 @@ export function EditorPage({
   const [isScrubbing, setIsScrubbing] = useState(false);
   const [selectedClipIds, setSelectedClipIds] = useState([]);
   const selectedClipId = selectedClipIds[selectedClipIds.length - 1] || null;
-  const setSelectedClipId = (idOrUpdater) => {
+  const setSelectedClipId = useCallback((idOrUpdater) => {
     if (typeof idOrUpdater === 'function') {
       setSelectedClipIds(prev => {
         const current = prev[prev.length - 1] || null;
@@ -90,8 +107,129 @@ export function EditorPage({
         return [idOrUpdater];
       });
     }
+  }, []);
+  const currentTimeRef = useRef(currentTime);
+  currentTimeRef.current = currentTime;
+  const selectedClipIdsRef = useRef(selectedClipIds);
+  selectedClipIdsRef.current = selectedClipIds;
+  const selectedClipIdRef = useRef(selectedClipId);
+
+  const { queryParams, setQueryParam, copyShareUrl } = useRouter();
+  const initialTabFromUrl = queryParams?.get('tab');
+  const validInitialTab = (initialTabFromUrl === 'transcript' || initialTabFromUrl === 'scenes' || initialTabFromUrl === 'library')
+    ? initialTabFromUrl
+    : 'library';
+
+  const [activeSidebarTab, setActiveSidebarTab] = useState(validInitialTab); // 'library' | 'transcript' | 'scenes'
+  const [selectedSceneId, setSelectedSceneId] = useState(null);
+  const [activeRightTab, setActiveRightTab] = useState('effects'); // 'effects' | 'lumetri' | 'graphics' | 'mixer'
+  const [activeWorkspacePreset, setActiveWorkspacePreset] = useState('ESSENTIALS'); // 'ESSENTIALS' | 'COLOR' | 'AUDIO' | 'AI'
+  const [focusedPanel, setFocusedPanel] = useState('timeline'); // 'left' | 'center' | 'right' | 'timeline'
+  const [rightDockWidth, setRightDockWidth] = useState(335);
+  const [mountedTabs, setMountedTabs] = useState({
+    library: true,
+    inspector: true,
+    scenes: true,
+    [validInitialTab]: true
+  });
+  const [shareCopied, setShareCopied] = useState(false);
+
+  // Update browser tab title to reflect active project name
+  useEffect(() => {
+    if (project?.name) {
+      document.title = `${project.name} • Montage Studio`;
+    }
+    return () => {
+      document.title = 'Montage Studio - Editor de Video';
+    };
+  }, [project?.name]);
+
+  const handleShareProject = useCallback(() => {
+    if (!project?.id) return;
+    copyShareUrl(project.id);
+    setShareCopied(true);
+    setTimeout(() => setShareCopied(false), 2400);
+  }, [project?.id, copyShareUrl]);
+
+  const handleSelectSidebarTab = useCallback((tab) => {
+    if (tab === 'inspector') {
+      setMountedTabs(prev => prev.inspector ? prev : { ...prev, inspector: true });
+      setActiveRightTab(prev => (prev === 'mixer' ? 'effects' : prev));
+      setFocusedPanel('right');
+      return;
+    }
+    if (tab === 'mixer') {
+      setMountedTabs(prev => prev.mixer ? prev : { ...prev, mixer: true });
+      setActiveRightTab('mixer');
+      setFocusedPanel('right');
+      return;
+    }
+    setMountedTabs(prev => prev[tab] ? prev : { ...prev, [tab]: true });
+    React.startTransition(() => {
+      setActiveSidebarTab(tab);
+      setFocusedPanel('left');
+    });
+    setQueryParam('tab', tab);
+  }, [setQueryParam]);
+
+  const handleSelectScene = useCallback((sceneOrClip) => {
+    if (!sceneOrClip) {
+      setSelectedSceneId(null);
+      return;
+    }
+    const sceneId = typeof sceneOrClip === 'string' ? sceneOrClip : (sceneOrClip.id || sceneOrClip.sceneId);
+    const scenesList = project.scenes?.list || [];
+    const sNum = sceneOrClip.sceneNumber ? Number(sceneOrClip.sceneNumber) : null;
+    const nameMatch = sceneOrClip.name?.match(/\[E\s*0*(\d+)\]/i) || sceneOrClip.title?.match(/\[E\s*0*(\d+)\]/i);
+    const extractedNum = nameMatch ? Number(nameMatch[1]) : null;
+    const targetNum = sNum || extractedNum;
+
+    const matchedScene = scenesList.find(s =>
+      s.id === sceneId ||
+      s.id === sceneOrClip.sceneId ||
+      (targetNum && Number(s.sceneNumber) === targetNum)
+    ) || (typeof sceneOrClip === 'object' ? sceneOrClip : null);
+
+    const finalSceneId = matchedScene?.id || sceneId;
+    setSelectedSceneId(finalSceneId);
+
+    // Switch left panel tab directly to 'scenes' (Escenas IA)
+    handleSelectSidebarTab('scenes');
+
+    // Sync timeline clip selection if a corresponding clip is in scene track
+    const sceneTrack = (project.tracks || []).find(t => t.type === 'scene');
+    if (sceneTrack && Array.isArray(sceneTrack.clips)) {
+      const matchingClip = sceneTrack.clips.find(c =>
+        c.id === finalSceneId ||
+        c.sceneId === finalSceneId ||
+        (matchedScene?.sceneNumber && Number(c.sceneNumber) === Number(matchedScene.sceneNumber))
+      );
+      if (matchingClip && selectedClipIdRef.current !== matchingClip.id) {
+        setSelectedClipIds([matchingClip.id]);
+      }
+    }
+
+    if (matchedScene && typeof matchedScene.startTime === 'number') {
+      setCurrentTime(matchedScene.startTime);
+    }
+  }, [project.scenes?.list, project.tracks, handleSelectSidebarTab, setCurrentTime, setSelectedClipIds]);
+
+  const handleRightDockResizerMouseDown = (e) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = rightDockWidth;
+    const onMove = (ev) => {
+      const deltaX = startX - ev.clientX;
+      const nextW = Math.max(270, Math.min(540, Math.round(startW + deltaX)));
+      setRightDockWidth(nextW);
+    };
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
   };
-  const [activeSidebarTab, setActiveSidebarTab] = useState('library'); // 'library' | 'inspector' | 'transcript' | 'scenes'
   const [autosaveConfig, setAutosaveConfig] = useState(getAutosaveConfig);
   const [autosaveStatus, setAutosaveStatus] = useState('saved'); // 'saved' | 'saving' | 'pending' | 'disabled' | 'error'
   const [lastSavedTime, setLastSavedTime] = useState(() => new Date());
@@ -109,8 +247,10 @@ export function EditorPage({
   const [showSceneDirectorModal, setShowSceneDirectorModal] = useState(false);
   const [showGraphicDirectorModal, setShowGraphicDirectorModal] = useState(false);
   const [showGlobalSettingsModal, setShowGlobalSettingsModal] = useState(false);
+  const [showAutoCutModal, setShowAutoCutModal] = useState(false);
   const [showAutoBrollBatchModal, setShowAutoBrollBatchModal] = useState(false);
   const [selectedSceneForBrollModal, setSelectedSceneForBrollModal] = useState(null);
+  const [graphicTargetScene, setGraphicTargetScene] = useState(null);
   const [toast, setToast] = useState(null); // { message: string, type: 'success' | 'info' | 'error' }
   const toastTimeoutRef = useRef(null);
 
@@ -322,6 +462,67 @@ export function EditorPage({
   const projectRef = useRef(project);
   projectRef.current = project;
 
+  // Single-Editor Tab Lock State (Prevents race conditions & data loss across multiple browser tabs)
+  const [tabLockState, setTabLockState] = useState(() => ({
+    isOwner: true,
+    ownerTabId: null,
+    tabId: tabLockCoordinator.tabId,
+    projectId: initialProject?.id || null
+  }));
+  const isOwnerRef = useRef(true);
+  isOwnerRef.current = tabLockState.isOwner;
+
+  // Monitor project lock across tabs
+  useEffect(() => {
+    if (!project?.id) return;
+    tabLockCoordinator.watchProject(project.id);
+    const unsubscribe = tabLockCoordinator.subscribe((state) => {
+      setTabLockState(state);
+    });
+    return () => {
+      unsubscribe();
+    };
+  }, [project?.id]);
+
+  // Flush any pending dirty state if another tab asks for handover
+  useEffect(() => {
+    const unregister = tabLockCoordinator.onPrepareHandover(async () => {
+      if (isDirtyRef.current && projectRef.current) {
+        try {
+          await saveProjectToCache(projectRef.current, currentDirHandle?.name);
+        } catch (err) {
+          console.warn('[TabLock] Error flushing project before handover:', err);
+        }
+      }
+    });
+    return () => {
+      unregister();
+    };
+  }, [currentDirHandle]);
+
+  // Spectator tab takes control of editing
+  const handleTakeControl = useCallback(async () => {
+    if (!project?.id) return;
+    try {
+      setSaveStatusText('Sincronizando y tomando control...');
+      await tabLockCoordinator.requestHandoverAndClaim(350);
+
+      // Reload latest cached state saved by previous tab
+      const latest = await getCachedProject(project.id);
+      if (latest) {
+        const prepared = prepareProject(latest);
+        projectRef.current = prepared;
+        setProject(prepared);
+      }
+      setIsSaved(true);
+      setSaveStatusText('Control de edición activado');
+      showToast('Has tomado el control de edición de este proyecto.', 'success');
+    } catch (err) {
+      console.error('Error claiming tab lock:', err);
+      tabLockCoordinator.claimLock();
+    }
+  }, [project?.id]);
+
   // Restore local media blobs from IndexedDB if URLs need revivification (Clipchamp-style)
   useEffect(() => {
     let isCancelled = false;
@@ -348,6 +549,27 @@ export function EditorPage({
             if (blob) {
               hasRestored = true;
               currentAsset = { ...currentAsset, url: URL.createObjectURL(blob) };
+            } else if (currentAsset.diskPath && (currentAsset.diskPath.startsWith('/') || /^[a-zA-Z]:\\/.test(currentAsset.diskPath))) {
+              hasRestored = true;
+              currentAsset = {
+                ...currentAsset,
+                url: `/media-library/abs?path=${encodeURIComponent(currentAsset.diskPath)}`
+              };
+            } else if (currentAsset.name) {
+              // Tolerant server media recovery by filename
+              try {
+                const testUrl = `/media-library/${encodeURIComponent(currentAsset.name)}`;
+                const head = await fetch(testUrl, { method: 'HEAD' });
+                if (head.ok) {
+                  hasRestored = true;
+                  const diskHeader = head.headers.get('x-resolved-disk-path');
+                  currentAsset = {
+                    ...currentAsset,
+                    url: testUrl,
+                    diskPath: diskHeader || currentAsset.diskPath || currentAsset.name
+                  };
+                }
+              } catch (_) {}
             }
           }
 
@@ -383,7 +605,9 @@ export function EditorPage({
       if (hasRestored && !isCancelled) {
         setProject(prev => {
           const next = { ...prev, assets: updatedAssets };
-          saveProjectToCache(next);
+          if (isOwnerRef.current) {
+            saveProjectToCache(next);
+          }
           return next;
         });
       }
@@ -393,17 +617,59 @@ export function EditorPage({
     return () => { isCancelled = true; };
   }, []);
 
-
-
-  // Auto-switch to inspector tab when a clip is selected
+  // Batch resolve project assets against filesystem on mount or project switch
   useEffect(() => {
-    if (selectedClipId) {
-      setActiveSidebarTab('inspector');
+    let isCancelled = false;
+    async function resolveAssets() {
+      if (!project?.assets || project.assets.length === 0) return;
+      const updated = await resolveProjectAssetsOnDisk(project);
+      if (!isCancelled && updated && updated !== project) {
+        setProject(updated);
+        if (isOwnerRef.current) {
+          saveProjectToCache(updated);
+        }
+      }
     }
-  }, [selectedClipId]);
+    resolveAssets();
+    return () => { isCancelled = true; };
+  }, [project?.id]);
+
+
+
+  // Auto-switch to scenes tab (Escenas IA) when a scene clip is selected, or inspector for normal clips
+  useEffect(() => {
+    if (!selectedClipId) return;
+
+    // Check if the selected clip belongs to the dedicated scene track or is an AI scene
+    const sceneTrack = (project.tracks || []).find(t => t.type === 'scene');
+    const isSceneClip = sceneTrack?.clips?.some(c => c.id === selectedClipId);
+
+    if (isSceneClip) {
+      const clip = sceneTrack.clips.find(c => c.id === selectedClipId);
+      const sNum = clip?.sceneNumber ? Number(clip.sceneNumber) : null;
+      const nameMatch = clip?.name?.match(/\[E\s*0*(\d+)\]/i) || clip?.title?.match(/\[E\s*0*(\d+)\]/i);
+      const extractedNum = nameMatch ? Number(nameMatch[1]) : null;
+      const targetNum = sNum || extractedNum;
+
+      const matchedScene = (project.scenes?.list || []).find(s =>
+        s.id === clip?.id ||
+        s.id === clip?.sceneId ||
+        (targetNum && Number(s.sceneNumber) === targetNum)
+      );
+
+      const finalId = matchedScene?.id || clip?.sceneId || clip?.id;
+      setSelectedSceneId(finalId);
+      handleSelectSidebarTab('scenes');
+    } else {
+      handleSelectSidebarTab('inspector');
+    }
+  }, [selectedClipId, project.tracks, project.scenes?.list, handleSelectSidebarTab]);
 
   // Central Autosave Engine: saves to IndexedDB cache & silently to disk if handle exists
   const performAutosave = useCallback(async (isForced = false) => {
+    if (!isOwnerRef.current) {
+      return; // Do not auto-save from read-only spectator tab
+    }
     if (!autosaveConfig.enabled && !isForced) {
       return;
     }
@@ -433,6 +699,16 @@ export function EditorPage({
             initialProject?.fileHandle,
             true // silentOnly = true
           );
+          if (diskRes && diskRes.success) {
+            savedToDisk = true;
+            diskFileName = diskRes.fileName;
+          }
+        }
+        if (!savedToDisk) {
+          const diskRes = await saveDiskProject(currentProject, {
+            fileName: currentProject.fileName,
+            filePath: currentProject.filePath
+          });
           if (diskRes && diskRes.success) {
             savedToDisk = true;
             diskFileName = diskRes.fileName;
@@ -489,13 +765,13 @@ export function EditorPage({
   // Flush save on tab switch, window blur, or beforeunload
   useEffect(() => {
     const handleBeforeUnload = (e) => {
-      if (isDirtyRef.current && projectRef.current) {
+      if (isOwnerRef.current && isDirtyRef.current && projectRef.current) {
         saveProjectToCache(projectRef.current, currentDirHandle?.name);
       }
     };
 
     const handleVisibilityChange = () => {
-      if (document.visibilityState === 'hidden' && isDirtyRef.current && projectRef.current) {
+      if (isOwnerRef.current && document.visibilityState === 'hidden' && isDirtyRef.current && projectRef.current) {
         performAutosave(true);
       }
     };
@@ -511,13 +787,86 @@ export function EditorPage({
     };
   }, [currentDirHandle, performAutosave]);
 
+  // Transaction and continuous-coalesce history refs to prevent micro-step pollution
+  const historyTransactionSnapshotRef = useRef(null);
+  const coalesceTimerRef = useRef(null);
+  const coalesceSnapshotRef = useRef(null);
+
+  const beginHistoryTransaction = useCallback(() => {
+    if (coalesceTimerRef.current) {
+      clearTimeout(coalesceTimerRef.current);
+      coalesceTimerRef.current = null;
+    }
+    coalesceSnapshotRef.current = null;
+
+    if (!historyTransactionSnapshotRef.current && projectRef.current) {
+      try {
+        historyTransactionSnapshotRef.current = JSON.parse(JSON.stringify(projectRef.current));
+      } catch (err) {
+        console.warn('Failed to snapshot transaction start:', err);
+      }
+    }
+  }, []);
+
+  const commitHistoryTransaction = useCallback((customSnapshot = null) => {
+    if (coalesceTimerRef.current) {
+      clearTimeout(coalesceTimerRef.current);
+      coalesceTimerRef.current = null;
+    }
+    coalesceSnapshotRef.current = null;
+
+    const startSnapshot = customSnapshot || historyTransactionSnapshotRef.current;
+    historyTransactionSnapshotRef.current = null;
+    if (!startSnapshot || !projectRef.current) return;
+
+    try {
+      const startStr = JSON.stringify(startSnapshot);
+      const curStr = JSON.stringify(projectRef.current);
+      if (startStr !== curStr) {
+        setHistoryPast(prev => [...prev.slice(-40), startSnapshot]);
+        setHistoryFuture([]);
+        isDirtyRef.current = true;
+        setIsSaved(false);
+      }
+    } catch (err) {
+      console.warn('Failed to commit history transaction:', err);
+    }
+  }, []);
+
+  const cancelHistoryTransaction = useCallback(() => {
+    if (coalesceTimerRef.current) {
+      clearTimeout(coalesceTimerRef.current);
+      coalesceTimerRef.current = null;
+    }
+    coalesceSnapshotRef.current = null;
+
+    const startSnapshot = historyTransactionSnapshotRef.current;
+    historyTransactionSnapshotRef.current = null;
+    if (startSnapshot) {
+      projectRef.current = startSnapshot;
+      setProject(startSnapshot);
+    }
+  }, []);
+
   // Mark unsaved on project modifications and trigger debounced autosave
-  const updateProjectData = (updatedProject, immediate = false, recordHistory = true) => {
+  const updateProjectData = useCallback((updatedProject, immediate = false, recordHistory = true, customSnapshot = null) => {
+    if (!isOwnerRef.current) {
+      console.warn('[TabLock] Edición bloqueada: esta pestaña está en modo visualización.');
+      showToast('Modo Visualización: Haz clic en "Tomar el control aquí" para editar.', 'warning');
+      return;
+    }
     const cleanProject = sanitizeDuplicateSceneClips(updatedProject);
-    if (recordHistory) {
+    if (customSnapshot) {
+      try {
+        setHistoryPast(prev => [...prev.slice(-40), customSnapshot]);
+        setHistoryFuture([]);
+      } catch (err) {
+        console.warn('Failed to snapshot history with custom snapshot:', err);
+      }
+    } else if (recordHistory && !historyTransactionSnapshotRef.current) {
       try {
         const snapshot = JSON.parse(JSON.stringify(projectRef.current));
-        setHistoryPast(prev => [...prev.slice(-30), snapshot]);
+        setHistoryPast(prev => [...prev.slice(-40), snapshot]);
         setHistoryFuture([]);
       } catch (err) {
         console.warn('Failed to snapshot history:', err);
@@ -552,72 +901,108 @@ export function EditorPage({
       setAutosaveStatus('disabled');
       setSaveStatusText('Autoguardado desactivado (Usa Ctrl+S)');
     }
-  };
+  }, [currentDirHandle, autosaveConfig, performAutosave]);
 
   // Undo and Redo handlers
-  const handleUndo = () => {
-    if (historyPast.length === 0) return;
-    const previous = historyPast[historyPast.length - 1];
-    const newPast = historyPast.slice(0, historyPast.length - 1);
-    
-    try {
-      const currentSnapshot = JSON.parse(JSON.stringify(projectRef.current));
-      setHistoryFuture(prev => [currentSnapshot, ...prev.slice(0, 30)]);
-    } catch (e) {
-      console.warn('Could not record redo snapshot', e);
+  const handleUndo = useCallback(() => {
+    // 1. Flush any uncommitted transaction or coalesce timer first
+    if (historyTransactionSnapshotRef.current) {
+      commitHistoryTransaction();
+    } else if (coalesceTimerRef.current && coalesceSnapshotRef.current) {
+      clearTimeout(coalesceTimerRef.current);
+      coalesceTimerRef.current = null;
+      const snap = coalesceSnapshotRef.current;
+      coalesceSnapshotRef.current = null;
+      try {
+        if (JSON.stringify(snap) !== JSON.stringify(projectRef.current)) {
+          setHistoryPast(prev => [...prev.slice(-40), snap]);
+          setHistoryFuture([]);
+        }
+      } catch (e) {
+        console.warn('Flush error in undo:', e);
+      }
     }
 
-    setHistoryPast(newPast);
-    projectRef.current = previous;
-    setProject(previous);
-    isDirtyRef.current = true;
-    setIsSaved(false);
-    setSaveStatusText('Deshacer aplicado (Ctrl+Z)');
-    performAutosave();
-  };
+    setHistoryPast(prevPast => {
+      if (prevPast.length === 0) return prevPast;
+      const previous = prevPast[prevPast.length - 1];
+      const newPast = prevPast.slice(0, prevPast.length - 1);
 
-  const handleRedo = () => {
-    if (historyFuture.length === 0) return;
-    const next = historyFuture[0];
-    const newFuture = historyFuture.slice(1);
+      try {
+        const currentSnapshot = JSON.parse(JSON.stringify(projectRef.current));
+        setHistoryFuture(prevFuture => [currentSnapshot, ...prevFuture.slice(0, 40)]);
+      } catch (e) {
+        console.warn('Could not record redo snapshot', e);
+      }
 
-    try {
-      const currentSnapshot = JSON.parse(JSON.stringify(projectRef.current));
-      setHistoryPast(prev => [...prev.slice(-30), currentSnapshot]);
-    } catch (e) {
-      console.warn('Could not record undo snapshot', e);
+      projectRef.current = previous;
+      setProject(previous);
+      isDirtyRef.current = true;
+      setIsSaved(false);
+      setSaveStatusText('Deshacer aplicado (Ctrl+Z)');
+      performAutosave();
+      return newPast;
+    });
+  }, [commitHistoryTransaction, performAutosave]);
+
+  const handleRedo = useCallback(() => {
+    if (historyTransactionSnapshotRef.current) {
+      commitHistoryTransaction();
+    } else if (coalesceTimerRef.current && coalesceSnapshotRef.current) {
+      clearTimeout(coalesceTimerRef.current);
+      coalesceTimerRef.current = null;
+      coalesceSnapshotRef.current = null;
     }
 
-    setHistoryFuture(newFuture);
-    projectRef.current = next;
-    setProject(next);
-    isDirtyRef.current = true;
-    setIsSaved(false);
-    setSaveStatusText('Rehacer aplicado (Ctrl+Y)');
-    performAutosave();
-  };
+    setHistoryFuture(prevFuture => {
+      if (prevFuture.length === 0) return prevFuture;
+      const next = prevFuture[0];
+      const newFuture = prevFuture.slice(1);
+
+      try {
+        const currentSnapshot = JSON.parse(JSON.stringify(projectRef.current));
+        setHistoryPast(prevPast => [...prevPast.slice(-40), currentSnapshot]);
+      } catch (e) {
+        console.warn('Could not record undo snapshot', e);
+      }
+
+      projectRef.current = next;
+      setProject(next);
+      isDirtyRef.current = true;
+      setIsSaved(false);
+      setSaveStatusText('Rehacer aplicado (Ctrl+Y)');
+      performAutosave();
+      return newFuture;
+    });
+  }, [commitHistoryTransaction, performAutosave]);
 
   // Clear Scenes from Project
-  const handleClearScenes = () => {
-    const updated = clearScenesFromProject(project);
+  const handleClearScenes = useCallback(() => {
+    const current = projectRef.current;
+    if (!current) return;
+    const updated = clearScenesFromProject(current);
     updateProjectData(updated, true);
     setSaveStatusText('Escenas eliminadas (Ctrl+Z para recuperar)');
-  };
+  }, [updateProjectData]);
 
   // Delete Single Scene
-  const handleDeleteSingleScene = (sceneId) => {
-    const updated = deleteSingleScene(project, sceneId);
+  const handleDeleteSingleScene = useCallback((sceneId) => {
+    const current = projectRef.current;
+    if (!current) return;
+    const updated = deleteSingleScene(current, sceneId);
     updateProjectData(updated);
-  };
+  }, [updateProjectData]);
 
   // Delete Track
-  const handleDeleteTrack = (trackId) => {
-    const track = project.tracks?.find(t => t.id === trackId);
+  const handleDeleteTrack = useCallback((trackId) => {
+    const current = projectRef.current;
+    if (!current) return;
+    const track = current.tracks?.find(t => t.id === trackId);
     if (!track) return;
-    const updated = deleteTrackFromProject(project, trackId);
+    const updated = deleteTrackFromProject(current, trackId);
     updateProjectData(updated, true);
     setSaveStatusText(`Pista "${track.name}" eliminada (Ctrl+Z para recuperar)`);
-  };
+  }, [updateProjectData]);
 
   // Clear All Clips from Timeline
   const handleClearTimelineClips = () => {
@@ -631,14 +1016,27 @@ export function EditorPage({
 
   // Save Project to Local Disk manually (Ctrl+S or Button)
   const handleSaveToDisk = async (forceSaveAs = false) => {
+    if (!isOwnerRef.current) {
+      showToast('Esta pestaña está en Modo Visualización. Haz clic en "Tomar el control aquí" para guardar.', 'warning');
+      return;
+    }
     try {
       setAutosaveStatus('saving');
-      const res = await saveProjectToDisk(
+      let res = await saveProjectToDisk(
         projectRef.current || project,
         currentDirHandle,
         forceSaveAs ? null : initialProject?.fileHandle,
         false // silentOnly = false (allow picker if needed)
       );
+      if (!res?.success || (!res.isDiskFile && !res.downloaded)) {
+        const diskRes = await saveDiskProject(projectRef.current || project, {
+          fileName: (projectRef.current || project).fileName,
+          filePath: (projectRef.current || project).filePath
+        });
+        if (diskRes && diskRes.success) {
+          res = { success: true, fileName: diskRes.fileName, isDiskFile: true };
+        }
+      }
       if (res && res.success) {
         isDirtyRef.current = false;
         setIsSaved(true);
@@ -657,13 +1055,13 @@ export function EditorPage({
   };
 
   // Central Unified Transport Controller (Guarantees absolute sync between Space, Media keys, and UI buttons)
-  const handleTogglePlayPause = (forcedState) => {
+  const handleTogglePlayPause = useCallback((forcedState) => {
     // Blur any active DOM element so subsequent Space presses never trigger button click AND keydown simultaneously
     if (document.activeElement && typeof document.activeElement.blur === 'function') {
       document.activeElement.blur();
     }
     setIsPlaying((prev) => (typeof forcedState === 'boolean' ? forcedState : !prev));
-  };
+  }, []);
 
   // Global Keyboard Shortcuts (Space/MediaPlayPause/Pause/K for Play/Pause, Ctrl+S for Save, Ctrl+Z / Ctrl+Y for Undo/Redo, Delete/Backspace for Clip)
   useEffect(() => {
@@ -880,88 +1278,192 @@ export function EditorPage({
   }, [isPlaying]);
 
   // Asset handlers
-  const handleAddAsset = (asset) => {
-    const updatedAssets = [...(project.assets || []), asset];
-    updateProjectData({ ...project, assets: updatedAssets });
-  };
+  const handleAddAsset = useCallback((asset) => {
+    const current = projectRef.current;
+    const existingIndex = (current?.assets || []).findIndex(a => a.id === asset.id);
+    let updatedAssets;
+    if (existingIndex >= 0) {
+      updatedAssets = (current?.assets || []).map(a => a.id === asset.id ? { ...a, ...asset } : a);
+    } else {
+      updatedAssets = [...(current?.assets || []), asset];
+    }
+    updateProjectData({ ...current, assets: updatedAssets });
+  }, [updateProjectData]);
 
-  const handleDeleteAsset = (assetId) => {
-    const updatedAssets = (project.assets || []).filter(a => a.id !== assetId);
+  const handleUpdateAsset = useCallback((updatedAsset) => {
+    const current = projectRef.current;
+    if (!current?.assets) return;
+    const updatedAssets = current.assets.map(a => a.id === updatedAsset.id ? { ...a, ...updatedAsset } : a);
+    updateProjectData({ ...current, assets: updatedAssets });
+  }, [updateProjectData]);
+
+  const handleDeleteAsset = useCallback((assetId) => {
+    const current = projectRef.current;
+    const updatedAssets = (current?.assets || []).filter(a => a.id !== assetId);
     // Remove references in tracks
-    const updatedTracks = project.tracks.map(t => ({
+    const updatedTracks = (current?.tracks || []).map(t => ({
       ...t,
-      clips: t.clips.filter(c => c.assetId !== assetId)
+      clips: (t.clips || []).filter(c => c.assetId !== assetId)
     }));
-    updateProjectData({ ...project, assets: updatedAssets, tracks: updatedTracks });
-  };
+    updateProjectData({ ...current, assets: updatedAssets, tracks: updatedTracks });
+  }, [updateProjectData]);
 
-  const handleAddToTimeline = (asset) => {
+  const handleAddToTimeline = useCallback((asset) => {
+    const current = projectRef.current;
     let targetTrack = null;
-    if (selectedClip) {
-      const parentTrack = (project.tracks || []).find(t => t.id === selectedClip.trackId);
-      if (parentTrack && parentTrack.type === asset.type) {
-        targetTrack = parentTrack.id;
+    const activeSelectedId = selectedClipIdsRef.current[selectedClipIdsRef.current.length - 1] || null;
+    if (activeSelectedId) {
+      for (const t of (current?.tracks || [])) {
+        if ((t.clips || []).some(c => c.id === activeSelectedId) && t.type === asset.type) {
+          targetTrack = t.id;
+          break;
+        }
       }
     }
     if (!targetTrack && asset.type === 'audio') {
-      const firstAudioTrack = (project.tracks || []).find(t => t.type === 'audio' && !t.locked);
+      const firstAudioTrack = (current?.tracks || []).find(t => t.type === 'audio' && !t.locked);
       if (firstAudioTrack) targetTrack = firstAudioTrack.id;
     }
     const { updatedProject, selectedClipId: newSelectedId } = addAssetToTimeline(
-      project,
+      current,
       asset,
       targetTrack,
-      currentTime
+      currentTimeRef.current
     );
     updateProjectData(updatedProject);
     if (newSelectedId) {
       setSelectedClipId(newSelectedId);
     }
-  };
+  }, [updateProjectData, setSelectedClipId]);
 
   // Selected clip handlers
-  const selectedClip = (() => {
+  const selectedClip = useMemo(() => {
     if (!selectedClipId || !project?.tracks) return null;
     for (const track of (project.tracks || [])) {
       const c = (track.clips || []).find(clip => clip.id === selectedClipId);
       if (c) return c;
     }
     return null;
-  })();
+  }, [selectedClipId, project?.tracks]);
 
-  const handleUpdateClip = (clipId, updates) => {
-    const updatedTracks = project.tracks.map(t => ({
-      ...t,
-      clips: t.clips.map(c => c.id === clipId ? { ...c, ...updates } : c)
-    }));
-    updateProjectData({ ...project, tracks: updatedTracks });
-  };
+  const handleUpdateClip = useCallback((clipId, updates, recordHistory = true, customSnapshot = null) => {
+    const current = projectRef.current;
+    if (!current) return;
 
-  const handleDeleteClip = (clipId = null) => {
-    const idsToDelete = clipId ? [clipId] : (selectedClipIds.length > 0 ? selectedClipIds : (selectedClipId ? [selectedClipId] : []));
+    // Check if the clip being updated is a subtitle clip
+    let isSubClip = false;
+    for (const t of (current.tracks || [])) {
+      const found = (t.clips || []).find(c => c.id === clipId);
+      if (found) {
+        if (isSubtitleClip(found, t)) {
+          isSubClip = true;
+        }
+        break;
+      }
+    }
+
+    let nextProject;
+    if (isSubClip) {
+      nextProject = updateSubtitleClipWithBatchSync(current, clipId, updates);
+    } else {
+      const updatedTracks = (current.tracks || []).map(t => ({
+        ...t,
+        clips: (t.clips || []).map(c => c.id === clipId ? { ...c, ...updates } : c)
+      }));
+      nextProject = { ...current, tracks: updatedTracks };
+    }
+
+    // 1. If an explicit custom snapshot was provided, commit it atomically
+    if (customSnapshot) {
+      updateProjectData(nextProject, false, true, customSnapshot);
+      return;
+    }
+
+    // 2. If recordHistory is false or an active transaction is open, update state without history push
+    if (!recordHistory || historyTransactionSnapshotRef.current) {
+      updateProjectData(nextProject, false, false);
+      return;
+    }
+
+    // 3. Coalesce rapid consecutive updates (e.g., slider sliding or rapid key taps) into 1 history step
+    if (!coalesceSnapshotRef.current) {
+      try {
+        coalesceSnapshotRef.current = JSON.parse(JSON.stringify(current));
+      } catch (err) {
+        console.warn('Failed to snapshot coalesce start:', err);
+      }
+    }
+
+    if (coalesceTimerRef.current) {
+      clearTimeout(coalesceTimerRef.current);
+    }
+
+    coalesceTimerRef.current = setTimeout(() => {
+      if (coalesceSnapshotRef.current && projectRef.current) {
+        const snap = coalesceSnapshotRef.current;
+        coalesceSnapshotRef.current = null;
+        coalesceTimerRef.current = null;
+        try {
+          if (JSON.stringify(snap) !== JSON.stringify(projectRef.current)) {
+            setHistoryPast(prev => [...prev.slice(-40), snap]);
+            setHistoryFuture([]);
+          }
+        } catch (e) {
+          console.warn('Coalesce commit error:', e);
+        }
+      }
+    }, 350);
+
+    // Apply change immediately to UI state without creating an immediate micro-step
+    updateProjectData(nextProject, false, false);
+  }, [updateProjectData]);
+
+  const handleDeleteClip = useCallback((clipId = null) => {
+    const current = projectRef.current;
+    const idsToDelete = clipId ? [clipId] : (selectedClipIdsRef.current.length > 0 ? selectedClipIdsRef.current : (selectedClipIdRef.current ? [selectedClipIdRef.current] : []));
     if (idsToDelete.length === 0) return;
     const deleteSet = new Set(idsToDelete);
 
-    const updatedTracks = project.tracks.map(t => ({
+    const updatedTracks = (current?.tracks || []).map(t => ({
       ...t,
-      clips: t.clips
+      clips: (t.clips || [])
         .filter(c => !deleteSet.has(c.id))
         .map(c => deleteSet.has(c.linkedClipId) ? { ...c, linkedClipId: undefined } : c)
     }));
-    updateProjectData({ ...project, tracks: updatedTracks });
+    updateProjectData({ ...current, tracks: updatedTracks });
     setSelectedClipIds([]);
-  };
+  }, [updateProjectData]);
+
+  const handleOpenProjectSettings = useCallback(() => setShowSettingsModal(true), []);
 
   const handleOpenTranscribeModal = useCallback(() => setShowTranscribeModal(true), []);
   const handleOpenSceneDirector = useCallback(() => setShowSceneDirectorModal(true), []);
   const handleOpenGraphicDirector = useCallback(() => setShowGraphicDirectorModal(true), []);
+  const handleOpenAutoCutModal = useCallback(() => setShowAutoCutModal(true), []);
   const handleOpenAutoBrollBatch = useCallback(() => setShowAutoBrollBatchModal(true), []);
   const handleSeekToTime = useCallback((t) => setCurrentTime(t), []);
   const handleSelectClip = useCallback((clipId) => {
     setSelectedClipId(clipId);
-    setActiveSidebarTab('inspector');
+    if (clipId) {
+      handleSelectSidebarTab('inspector');
+      setActiveRightTab(prev => (prev === 'mixer' ? 'effects' : prev));
+    }
+  }, [handleSelectSidebarTab]);
+  const handleOpenSceneBroll = useCallback((scene) => {
+    if (!scene) return;
+    const realPos = resolveRealSceneTimelinePosition(scene, project);
+    setSelectedSceneForBrollModal({
+      ...scene,
+      startTime: realPos.startTime,
+      duration: realPos.duration,
+      endTime: Number((realPos.startTime + realPos.duration).toFixed(2))
+    });
+  }, [project]);
+  const handleOpenGraphicForScene = useCallback((sceneOrClip) => {
+    if (!sceneOrClip) return;
+    setGraphicTargetScene(sceneOrClip);
+    setShowGraphicDirectorModal(true);
   }, []);
-  const handleOpenSceneBroll = useCallback((scene) => setSelectedSceneForBrollModal(scene), []);
 
   const handleSeparateAudio = async (clipId) => {
     const targetId = clipId || selectedClipId;
@@ -1048,23 +1550,26 @@ export function EditorPage({
     }
   };
 
-  const handleUnlinkClip = (clipId) => {
-    const targetId = clipId || selectedClipId;
-    if (!targetId) return;
-    const updatedProject = unlinkClips(project, targetId);
+  const handleUnlinkClip = useCallback((clipId) => {
+    const current = projectRef.current;
+    const targetId = clipId || selectedClipIdRef.current;
+    if (!targetId || !current) return;
+    const updatedProject = unlinkClips(current, targetId);
     updateProjectData(updatedProject);
     setSaveStatusText('Clips desvinculados (ahora son independientes)');
-  };
+  }, [updateProjectData]);
 
-  const handleDuplicateClip = (clipId = null) => {
-    const idsToDup = clipId ? [clipId] : (selectedClipIds.length > 0 ? selectedClipIds : (selectedClipId ? [selectedClipId] : []));
+  const handleDuplicateClip = useCallback((clipId = null) => {
+    const current = projectRef.current;
+    if (!current?.tracks) return;
+    const idsToDup = clipId ? [clipId] : (selectedClipIdsRef.current.length > 0 ? selectedClipIdsRef.current : (selectedClipIdRef.current ? [selectedClipIdRef.current] : []));
     if (idsToDup.length === 0) return;
     const dupSet = new Set(idsToDup);
 
     const newClipsByTrack = new Map();
     const newSelectedIds = [];
 
-    for (const track of project.tracks) {
+    for (const track of current.tracks) {
       for (const clip of track.clips) {
         if (dupSet.has(clip.id)) {
           const newId = `clip_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
@@ -1083,7 +1588,7 @@ export function EditorPage({
       }
     }
 
-    const updatedTracks = project.tracks.map(t => {
+    const updatedTracks = current.tracks.map(t => {
       const added = newClipsByTrack.get(t.id);
       if (added && added.length > 0) {
         return { ...t, clips: [...t.clips, ...added] };
@@ -1091,11 +1596,11 @@ export function EditorPage({
       return t;
     });
 
-    updateProjectData({ ...project, tracks: updatedTracks });
+    updateProjectData({ ...current, tracks: updatedTracks });
     if (newSelectedIds.length > 0) {
       setSelectedClipIds(newSelectedIds);
     }
-  };
+  }, [updateProjectData]);
 
   if (!project || !project.tracks) {
     return (
@@ -1111,17 +1616,51 @@ export function EditorPage({
 
   return (
     <div className="editor-layout">
-      {/* Top Application Bar */}
-      <header className="editor-top-bar">
-        <div className="top-bar-left">
-          <button className="btn-ghost" onClick={onBackToHome} title="Regresar al Gestor de Proyectos">
-            <ArrowLeft size={16} />
-            Proyectos
+      {/* Adobe Premiere Pro Top Application Bar */}
+      <header className="editor-top-bar premiere-top-bar">
+        <div className="premiere-top-left">
+          <button
+            type="button"
+            className="premiere-home-btn"
+            onClick={onBackToHome}
+            title="Inicio / Gestor de Proyectos"
+          >
+            <ArrowLeft size={15} />
           </button>
+
+          {/* Premiere Pro Mode Tabs: Import | Edit | Export */}
+          <div className="premiere-mode-tabs">
+            <button
+              type="button"
+              className="premiere-mode-tab"
+              onClick={() => {
+                handleSelectSidebarTab('library');
+                setFocusedPanel('left');
+              }}
+              title="Importar recursos al Bin"
+            >
+              Import
+            </button>
+            <button
+              type="button"
+              className="premiere-mode-tab active"
+              title="Espacio de trabajo de Edición (Premiere Pro)"
+            >
+              Edit
+            </button>
+            <button
+              type="button"
+              className="premiere-mode-tab"
+              onClick={() => setShowExportModal(true)}
+              title="Exportar secuencia final"
+            >
+              Export
+            </button>
+          </div>
 
           <div className="top-divider"></div>
 
-          {/* Undo / Redo Action Buttons */}
+          {/* Undo / Redo + Save Action Buttons */}
           <div className="top-history-controls" style={{ display: 'flex', alignItems: 'center', gap: '2px' }}>
             <button
               className="btn-ghost icon-only"
@@ -1134,7 +1673,7 @@ export function EditorPage({
                 padding: '4px 6px'
               }}
             >
-              <Undo2 size={15} />
+              <Undo2 size={14} />
             </button>
             <button
               className="btn-ghost icon-only"
@@ -1147,245 +1686,341 @@ export function EditorPage({
                 padding: '4px 6px'
               }}
             >
-              <Redo2 size={15} />
+              <Redo2 size={14} />
             </button>
-          </div>
-
-          <div className="top-divider"></div>
-
-          <div className="project-title-editor">
-            <input
-              type="text"
-              className="project-name-input"
-              value={project.name}
-              onChange={(e) => updateProjectData({ ...project, name: e.target.value })}
-              title="Haz clic para renombrar el proyecto"
-            />
-            <span className="badge badge-indigo">
-              {project.settings?.aspectRatio || '16:9'}
-            </span>
-          </div>
-
-          <div
-            className="save-status-indicator"
-            onClick={() => setShowAutosaveModal(true)}
-            title="Clic para ver detalles y configuración del sistema de autoguardado"
-            role="button"
-            tabIndex={0}
-          >
-            {autosaveStatus === 'saving' ? (
-              <span className="status-saving">
-                <Loader2 size={13} className="spin text-cyan" />
-                <span>Autoguardando...</span>
-              </span>
-            ) : autosaveStatus === 'saved' ? (
-              <span className="status-saved">
-                <span className="pulsing-dot" />
-                <CheckCircle2 size={13} className="text-emerald" />
-                <span>{saveStatusText}</span>
-              </span>
-            ) : autosaveStatus === 'pending' ? (
-              <span className="status-pending">
-                <CloudUpload size={13} className="text-amber" />
-                <span>{saveStatusText}</span>
-              </span>
-            ) : autosaveStatus === 'disabled' ? (
-              <span className="status-disabled">
-                <CloudOff size={13} className="text-dim" />
-                <span>Autoguardado en pausa</span>
-              </span>
-            ) : (
-              <span className="status-unsaved">
-                <AlertCircle size={13} className="text-amber" />
-                <span>{saveStatusText}</span>
-              </span>
-            )}
+            <button
+              className="btn-ghost icon-only"
+              onClick={() => handleSaveToDisk(false)}
+              title="Guardar proyecto en disco (Ctrl+S)"
+              style={{ padding: '4px 6px' }}
+            >
+              <Save size={14} />
+            </button>
           </div>
         </div>
 
-        <div className="top-bar-right">
-          <button
-            className="btn-secondary btn-sm"
-            onClick={() => setShowSceneDirectorModal(true)}
-            title="Analizar guion con IA y crear escenas de montaje (Storyboard)"
+        {/* Centered Premiere Pro Project Title + Save Status */}
+        <div className="premiere-top-center">
+          <input
+            type="text"
+            className="premiere-center-title-input"
+            value={project.name}
+            onChange={(e) => updateProjectData({ ...project, name: e.target.value })}
+            title="Haz clic para renombrar el proyecto"
+          />
+          <span style={{ fontSize: '11px', color: '#787878', marginLeft: '-6px' }}>
+            — Edited
+          </span>
+
+          <div
+            className="save-status-indicator"
+            onClick={() => {
+              if (!tabLockState.isOwner) {
+                handleTakeControl();
+              } else {
+                setShowAutosaveModal(true);
+              }
+            }}
+            title={!tabLockState.isOwner ? 'Modo visualización (Haz clic para tomar el control de edición)' : saveStatusText}
+            role="button"
+            tabIndex={0}
             style={{
-              borderColor: 'rgba(6, 182, 212, 0.45)',
-              background: 'linear-gradient(135deg, rgba(6, 182, 212, 0.18), rgba(99, 102, 241, 0.18))',
-              color: '#38bdf8'
+              padding: '2px 7px',
+              fontSize: '10.5px',
+              background: !tabLockState.isOwner ? 'rgba(245, 158, 11, 0.15)' : '#222222',
+              borderColor: !tabLockState.isOwner ? 'rgba(245, 158, 11, 0.45)' : '#303030',
+              cursor: 'pointer'
             }}
           >
-            <Film size={14} style={{ color: '#06b6d4' }} />
+            {!tabLockState.isOwner ? (
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', color: '#fbbf24', fontWeight: 600 }}>
+                <Lock size={11} />
+                Visualización
+              </span>
+            ) : autosaveStatus === 'saving' ? (
+              <span className="status-saving">
+                <Loader2 size={11} className="spin" style={{ color: '#3898ff' }} />
+              </span>
+            ) : (
+              <span className="status-saved">
+                <CheckCircle2 size={11} className="text-emerald" />
+              </span>
+            )}
+          </div>
+
+          <button
+            type="button"
+            className="btn-ghost icon-only"
+            onClick={handleShareProject}
+            title="Copiar enlace de este proyecto (para compartir o abrir en otra pestaña)"
+            style={{
+              padding: '3px 8px',
+              fontSize: '11px',
+              fontWeight: 600,
+              background: shareCopied ? 'rgba(16, 185, 129, 0.16)' : '#222222',
+              color: shareCopied ? '#34d399' : '#a8a8a8',
+              border: '1px solid',
+              borderColor: shareCopied ? 'rgba(16, 185, 129, 0.45)' : '#303030',
+              borderRadius: '4px',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '5px',
+              marginLeft: '4px',
+              cursor: 'pointer',
+              transition: 'all 0.15s ease'
+            }}
+          >
+            {shareCopied ? <Check size={12} className="text-emerald" /> : <Share2 size={12} />}
+            <span>{shareCopied ? '¡Copiado!' : 'Compartir'}</span>
+          </button>
+        </div>
+
+        {/* Right Workspace Switcher + AI Studio Actions + Export + User */}
+        <div className="premiere-top-right">
+          <div className="premiere-workspace-pills">
+            <button
+              type="button"
+              className={`premiere-workspace-pill ${activeWorkspacePreset === 'ESSENTIALS' ? 'active' : ''}`}
+              onClick={() => {
+                setActiveWorkspacePreset('ESSENTIALS');
+                setMountedTabs(prev => ({ ...prev, inspector: true }));
+                setActiveRightTab('effects');
+              }}
+            >
+              ESSENTIALS
+            </button>
+            <button
+              type="button"
+              className={`premiere-workspace-pill ${activeWorkspacePreset === 'COLOR' ? 'active' : ''}`}
+              onClick={() => {
+                setActiveWorkspacePreset('COLOR');
+                setMountedTabs(prev => ({ ...prev, inspector: true }));
+                setActiveRightTab('lumetri');
+                setFocusedPanel('right');
+              }}
+            >
+              COLOR
+            </button>
+            <button
+              type="button"
+              className={`premiere-workspace-pill ${activeWorkspacePreset === 'AUDIO' ? 'active' : ''}`}
+              onClick={() => {
+                setActiveWorkspacePreset('AUDIO');
+                setMountedTabs(prev => ({ ...prev, mixer: true }));
+                setActiveRightTab('mixer');
+                setFocusedPanel('right');
+              }}
+            >
+              AUDIO
+            </button>
+          </div>
+
+          <button
+            className="btn-secondary btn-xs"
+            onClick={() => setShowSceneDirectorModal(true)}
+            title="Director de Escenas IA (Storyboard & Auto B-Roll)"
+            style={{ background: '#242424', borderColor: '#383838', color: '#3898ff', padding: '4px 8px' }}
+          >
+            <Film size={12} />
             Editor IA
           </button>
 
           <button
-            className="btn-secondary btn-sm"
+            className="btn-secondary btn-xs"
             onClick={() => setShowGraphicDirectorModal(true)}
-            title="Diseñar títulos con sombra, gráficos estadísticos y animaciones con el Diseñador Gráfico IA en 2 etapas"
-            style={{
-              borderColor: 'rgba(236, 72, 153, 0.45)',
-              background: 'linear-gradient(135deg, rgba(6, 182, 212, 0.18), rgba(236, 72, 153, 0.18))',
-              color: '#f472b6'
-            }}
+            title="Diseñador Gráfico IA (Títulos y Gráficos Animados)"
+            style={{ background: '#242424', borderColor: '#383838', color: '#e5e5e5', padding: '4px 8px' }}
           >
-            <Sparkles size={14} style={{ color: '#ec4899' }} />
-            Efectos & Gráficos IA
+            <Sparkles size={12} style={{ color: '#3898ff' }} />
+            Gráficos IA
           </button>
 
           <button
-            className="btn-secondary btn-sm"
+            className="btn-secondary btn-xs"
             onClick={() => setShowTranscribeModal(true)}
-            title="Transcribir audio/video con IA y generar Línea Guía"
-            style={{ borderColor: 'rgba(139, 92, 246, 0.4)', background: 'rgba(139, 92, 246, 0.1)' }}
+            title="Transcribir audio/video con IA y generar Subtítulos CC"
+            style={{ background: '#242424', borderColor: '#383838', color: '#e5e5e5', padding: '4px 8px' }}
           >
-            <Sparkles size={14} style={{ color: '#c084fc' }} />
-            Transcribir IA
+            <FileText size={12} style={{ color: '#f59e0b' }} />
+            Subtítulos IA
           </button>
 
           <button
-            className="btn-secondary btn-sm"
+            className="premiere-home-btn"
             onClick={() => setShowSettingsModal(true)}
-            title="Ajustes de resolución y dimensiones"
+            title="Ajustes de secuencia y formato (16:9 / 9:16)"
           >
             <Settings size={14} />
-            Ajustes
           </button>
 
           <button
-            className="btn-secondary btn-sm"
-            onClick={() => handleSaveToDisk(false)}
-            title="Guardar archivo en disco (Ctrl+S)"
-          >
-            <Save size={14} />
-            Guardar en Disco
-          </button>
-
-          <button
-            className="btn-primary btn-sm"
+            className="premiere-home-btn"
             onClick={() => setShowExportModal(true)}
-            title="Exportar video montado como archivo final"
+            title="Exportar secuencia de video"
+            style={{ color: '#3898ff' }}
           >
-            <Film size={14} />
-            Exportar Video
+            <Download size={14} />
           </button>
-
-          <div style={{ width: '1px', height: '22px', background: 'var(--border-subtle)', margin: '0 4px' }} />
 
           <UserNav onGoToAuth={onGoToAuth} />
         </div>
       </header>
 
-      {/* Main Workspace (Split: Left Sidebar + Center Monitor / Bottom Timeline) */}
-      <div className="editor-workspace">
-        {/* Left Side Panel (Tabs: Assets Library, Properties Inspector & AI Transcript) */}
+      {/* Read-Only Spectator Lock Banner when project is active in another tab */}
+      {!tabLockState.isOwner && (
+        <aside className="premiere-tab-lock-banner" role="status" aria-live="polite">
+          <div className="tab-lock-badge-group">
+            <span className="tab-lock-pill">
+              <Eye size={12} className="tab-lock-icon" />
+              Modo Visualización
+            </span>
+            <span className="tab-lock-text">
+              Este proyecto está activo en otra pestaña del navegador. La edición está protegida para evitar pérdidas o conflictos.
+            </span>
+          </div>
+          <div className="tab-lock-actions">
+            <button
+              type="button"
+              className="btn-take-control"
+              onClick={handleTakeControl}
+              title="Tomar el control de edición en esta pestaña y cargar las últimas modificaciones guardadas"
+            >
+              <KeyRound size={13} />
+              Tomar el control aquí
+            </button>
+          </div>
+        </aside>
+      )}
+
+      {/* Upper 3-Column Adobe Premiere Pro Docked Workspace */}
+      <div className="editor-workspace premiere-upper-workspace">
+        {/* 1. LEFT DOCKED PANEL: Project Bin / Storyboard Scenes / Transcript CC */}
         <aside
-          className="editor-sidebar"
+          className={`premiere-left-dock nle-panel ${focusedPanel === 'left' ? 'is-focused' : ''}`}
+          onMouseDown={() => setFocusedPanel('left')}
           style={{
             width: `${sidebarWidth}px`,
             minWidth: `${sidebarWidth}px`,
             maxWidth: `${sidebarWidth}px`
           }}
         >
-          <div className="sidebar-tabs-header">
-            <button
-              className={`sidebar-tab ${activeSidebarTab === 'library' ? 'active' : ''}`}
-              onClick={() => setActiveSidebarTab('library')}
-            >
-              <Layers size={15} />
-              Recursos ({project.assets?.length || 0})
-            </button>
-            <button
-              className={`sidebar-tab ${activeSidebarTab === 'inspector' ? 'active' : ''}`}
-              onClick={() => setActiveSidebarTab('inspector')}
-            >
-              <Sliders size={15} />
-              Propiedades
-            </button>
-            <button
-              className={`sidebar-tab ${activeSidebarTab === 'transcript' ? 'active' : ''}`}
-              onClick={() => setActiveSidebarTab('transcript')}
-            >
-              <FileText size={15} style={{ color: (project.tracks || []).some(t => t.type === 'guide') ? '#c084fc' : undefined }} />
-              Guion IA {(project.tracks || []).some(t => t.type === 'guide') ? '✓' : ''}
-            </button>
-            <button
-              className={`sidebar-tab ${activeSidebarTab === 'scenes' ? 'active' : ''}`}
-              onClick={() => setActiveSidebarTab('scenes')}
-            >
-              <Film size={15} style={{ color: (project.scenes?.list || []).length > 0 ? '#06b6d4' : undefined }} />
-              Escenas {(project.scenes?.list || []).length > 0 ? `(${project.scenes.list.length})` : ''}
-            </button>
+          <div className="premiere-panel-header">
+            <div className="premiere-panel-tabs">
+              <button
+                type="button"
+                className={`premiere-panel-tab ${activeSidebarTab === 'library' ? 'active' : ''}`}
+                onClick={() => handleSelectSidebarTab('library')}
+              >
+                <span>Bin: {project.name || 'Recursos'}</span>
+                <span className="premiere-tab-menu-dots">≡</span>
+              </button>
+              <button
+                type="button"
+                className={`premiere-panel-tab ${activeSidebarTab === 'scenes' ? 'active' : ''}`}
+                onClick={() => handleSelectSidebarTab('scenes')}
+              >
+                <span>Escenas IA {(project.scenes?.list || []).length > 0 ? `(${project.scenes.list.length})` : ''}</span>
+              </button>
+              <button
+                type="button"
+                className={`premiere-panel-tab ${activeSidebarTab === 'transcript' ? 'active' : ''}`}
+                onClick={() => handleSelectSidebarTab('transcript')}
+              >
+                <span>Guion / CC {(project.tracks || []).some(t => t.type === 'guide') ? '✓' : ''}</span>
+              </button>
+            </div>
 
-            {/* Quick Expand / Restore Button */}
             <button
-              className={`sidebar-tab-action-btn ${isSidebarExpanded ? 'active' : ''}`}
+              type="button"
+              className="premiere-bin-icon-btn"
               onClick={handleToggleMaximizeSidebar}
-              title={isSidebarExpanded ? "Restaurar ancho normal" : "Ampliar panel de propiedades"}
+              title={isSidebarExpanded ? 'Restaurar ancho del Bin' : 'Ampliar panel del Bin'}
             >
-              {isSidebarExpanded ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
+              {isSidebarExpanded ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
             </button>
           </div>
 
-          <div className="sidebar-content">
-            {activeSidebarTab === 'library' && (
-              <MediaLibrary
-                assets={project.assets || []}
-                onAddAsset={handleAddAsset}
-                onDeleteAsset={handleDeleteAsset}
-                onAddToTimeline={handleAddToTimeline}
-                project={project}
-                onOpenProjectSettings={() => setShowSettingsModal(true)}
-              />
+          <div className="sidebar-content" style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, overflow: 'hidden', padding: 0 }}>
+            {mountedTabs.library && (
+              <div
+                style={{
+                  display: activeSidebarTab === 'library' ? 'flex' : 'none',
+                  flexDirection: 'column',
+                  height: '100%',
+                  overflow: 'hidden'
+                }}
+              >
+                <MediaLibrary
+                  assets={project.assets || []}
+                  onAddAsset={handleAddAsset}
+                  onUpdateAsset={handleUpdateAsset}
+                  onDeleteAsset={handleDeleteAsset}
+                  onAddToTimeline={handleAddToTimeline}
+                  project={project}
+                  onOpenProjectSettings={handleOpenProjectSettings}
+                />
+              </div>
             )}
-            {activeSidebarTab === 'inspector' && (
-              <ClipInspector
-                selectedClip={selectedClip}
-                selectedClipIds={selectedClipIds}
-                project={project}
-                onUpdateClip={handleUpdateClip}
-                onDeleteClip={handleDeleteClip}
-                onDuplicateClip={handleDuplicateClip}
-                onSeparateAudio={handleSeparateAudio}
-                onUnlinkClip={handleUnlinkClip}
-                onOpenProjectSettings={() => setShowSettingsModal(true)}
-                onUpdateProject={updateProjectData}
-              />
+            {mountedTabs.transcript && (
+              <div
+                style={{
+                  display: activeSidebarTab === 'transcript' ? 'block' : 'none',
+                  height: '100%',
+                  overflowY: 'auto',
+                  padding: '12px'
+                }}
+              >
+                <TranscriptPanel
+                  project={project}
+                  currentTime={currentTime}
+                  onSeekToTime={handleSeekToTime}
+                  onOpenTranscribeModal={handleOpenTranscribeModal}
+                  onUpdateProject={updateProjectData}
+                />
+              </div>
             )}
-            {activeSidebarTab === 'transcript' && (
-              <TranscriptPanel
-                project={project}
-                currentTime={currentTime}
-                onSeekToTime={handleSeekToTime}
-                onOpenTranscribeModal={handleOpenTranscribeModal}
-              />
-            )}
-            {activeSidebarTab === 'scenes' && (
-              <SceneStoryboardPanel
-                project={project}
-                currentTime={currentTime}
-                setCurrentTime={setCurrentTime}
-                onOpenSceneDirector={handleOpenSceneDirector}
-                onClearScenes={handleClearScenes}
-                onDeleteScene={handleDeleteSingleScene}
-                onUpdateProject={updateProjectData}
-                onOpenAutoBrollBatch={handleOpenAutoBrollBatch}
-              />
+            {mountedTabs.scenes && (
+              <div
+                style={{
+                  display: activeSidebarTab === 'scenes' ? 'flex' : 'none',
+                  flexDirection: 'column',
+                  height: '100%',
+                  overflow: 'hidden'
+                }}
+              >
+                <SceneStoryboardPanel
+                  project={project}
+                  currentTime={currentTime}
+                  setCurrentTime={setCurrentTime}
+                  selectedSceneId={selectedSceneId}
+                  onSelectScene={handleSelectScene}
+                  onOpenSceneDirector={handleOpenSceneDirector}
+                  onClearScenes={handleClearScenes}
+                  onDeleteScene={handleDeleteSingleScene}
+                  onUpdateProject={updateProjectData}
+                  onOpenAutoBrollBatch={handleOpenAutoBrollBatch}
+                  onOpenGraphicForScene={handleOpenGraphicForScene}
+                />
+              </div>
             )}
           </div>
         </aside>
 
-        {/* Sidebar Horizontal Resizer Splitter */}
+        {/* Left Dock Splitter */}
         <div
           className={`sidebar-resizer ${isResizingSidebar ? 'resizing' : ''}`}
           onMouseDown={handleSidebarResizerMouseDown}
           onDoubleClick={handleToggleMaximizeSidebar}
-          title="Arrastra para cambiar el ancho del panel lateral (doble clic para ampliar)"
+          title="Arrastra para ajustar el ancho del Bin"
         >
           <div className="sidebar-resizer-handle" />
         </div>
 
-        {/* Center Canvas Monitor Area */}
-        <main className="editor-monitor-area">
+        {/* 2. CENTER DOCKED PANEL: Source / Program Monitor */}
+        <main
+          className={`premiere-center-dock nle-panel ${focusedPanel === 'center' ? 'is-focused' : ''}`}
+          onMouseDown={() => setFocusedPanel('center')}
+        >
           <PreviewPlayer
             project={project}
             currentTime={currentTime}
@@ -1397,10 +2032,141 @@ export function EditorPage({
             selectedClipId={selectedClipId}
             onSelectClip={handleSelectClip}
             onUpdateClip={handleUpdateClip}
+            onBeginTransform={beginHistoryTransaction}
+            onEndTransform={commitHistoryTransaction}
+            onCancelTransform={cancelHistoryTransaction}
             onOpenSceneBroll={handleOpenSceneBroll}
             onOpenBatchBroll={handleOpenAutoBrollBatch}
+            onSelectScene={handleSelectScene}
           />
         </main>
+
+        {/* Right Dock Splitter */}
+        <div
+          className="sidebar-resizer"
+          onMouseDown={handleRightDockResizerMouseDown}
+          title="Arrastra para ajustar el ancho del panel de Controles / Lumetri Color"
+        >
+          <div className="sidebar-resizer-handle" />
+        </div>
+
+        {/* 3. RIGHT DOCKED PANEL: Effect Controls / Lumetri Color / Essential Graphics / Audio Mixer */}
+        <aside
+          className={`premiere-right-dock nle-panel ${focusedPanel === 'right' ? 'is-focused' : ''}`}
+          onMouseDown={() => setFocusedPanel('right')}
+          style={{
+            width: `${rightDockWidth}px`,
+            minWidth: `${rightDockWidth}px`,
+            maxWidth: `${rightDockWidth}px`
+          }}
+        >
+          <div className="premiere-panel-header">
+            <div className="premiere-panel-tabs">
+              <button
+                type="button"
+                className={`premiere-panel-tab ${activeRightTab === 'effects' ? 'active' : ''}`}
+                onClick={() => {
+                  setMountedTabs(prev => ({ ...prev, inspector: true }));
+                  setActiveRightTab('effects');
+                }}
+              >
+                <span>Effect Controls</span>
+              </button>
+              <button
+                type="button"
+                className={`premiere-panel-tab ${activeRightTab === 'lumetri' ? 'active' : ''}`}
+                onClick={() => {
+                  setMountedTabs(prev => ({ ...prev, inspector: true }));
+                  setActiveRightTab('lumetri');
+                }}
+              >
+                <span>Lumetri Color</span>
+                <span className="premiere-tab-menu-dots">≡</span>
+              </button>
+              <button
+                type="button"
+                className={`premiere-panel-tab ${activeRightTab === 'graphics' ? 'active' : ''}`}
+                onClick={() => {
+                  setMountedTabs(prev => ({ ...prev, inspector: true }));
+                  setActiveRightTab('graphics');
+                }}
+              >
+                <span>Essential Graphics</span>
+              </button>
+              <button
+                type="button"
+                className={`premiere-panel-tab ${activeRightTab === 'mixer' ? 'active' : ''}`}
+                onClick={() => {
+                  setMountedTabs(prev => ({ ...prev, mixer: true }));
+                  setActiveRightTab('mixer');
+                }}
+              >
+                <span>Audio Mixer</span>
+              </button>
+            </div>
+          </div>
+
+          <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '10px', background: '#1d1d1d' }}>
+            {activeRightTab === 'mixer' ? (
+              <AudioMixerPanel
+                project={project}
+                isPlaying={isPlaying}
+                onUpdateProject={updateProjectData}
+                onAddTrack={(type) => {
+                  const count = (project.tracks || []).filter(t => t.type === type).length + 1;
+                  const newTrack = {
+                    id: `track-${type}-${Date.now()}`,
+                    name: `A${count} (Pista Audio)`,
+                    type: 'audio',
+                    visible: true,
+                    muted: false,
+                    locked: false,
+                    volume: 1.0,
+                    clips: []
+                  };
+                  updateProjectData({ ...project, tracks: [...(project.tracks || []), newTrack] }, true);
+                }}
+              />
+            ) : activeRightTab === 'effects' ? (
+              <EffectControlsPanel
+                selectedClip={selectedClip}
+                project={project}
+                onUpdateClip={handleUpdateClip}
+                onBeginTransform={beginHistoryTransaction}
+                onEndTransform={commitHistoryTransaction}
+                onDeleteClip={handleDeleteClip}
+                onDuplicateClip={handleDuplicateClip}
+                onSeparateAudio={handleSeparateAudio}
+                onUnlinkClip={handleUnlinkClip}
+              />
+            ) : activeRightTab === 'lumetri' ? (
+              <LumetriColorPanel
+                selectedClip={selectedClip}
+                onUpdateClip={handleUpdateClip}
+                onBeginTransform={beginHistoryTransaction}
+                onEndTransform={commitHistoryTransaction}
+              />
+            ) : (
+              <ClipInspector
+                selectedClip={selectedClip}
+                selectedClipIds={selectedClipIds}
+                project={project}
+                onUpdateClip={handleUpdateClip}
+                onBeginTransform={beginHistoryTransaction}
+                onEndTransform={commitHistoryTransaction}
+                onDeleteClip={handleDeleteClip}
+                onDuplicateClip={handleDuplicateClip}
+                onSeparateAudio={handleSeparateAudio}
+                onUnlinkClip={handleUnlinkClip}
+                onOpenProjectSettings={handleOpenProjectSettings}
+                onUpdateProject={updateProjectData}
+                onOpenGraphicForScene={handleOpenGraphicForScene}
+                onOpenSceneBroll={handleOpenSceneBroll}
+                onSelectScene={handleSelectScene}
+              />
+            )}
+          </div>
+        </aside>
       </div>
 
       {/* Draggable Resizer Bar (Splitter) */}
@@ -1419,6 +2185,7 @@ export function EditorPage({
       <footer
         className={`editor-timeline-area ${isTimelineExpanded ? 'is-expanded' : ''}`}
         style={{ height: `${timelineHeight}px` }}
+        onMouseDown={() => setFocusedPanel('timeline')}
       >
         <Timeline
           project={project}
@@ -1432,12 +2199,17 @@ export function EditorPage({
           setSelectedClipId={setSelectedClipId}
           selectedClipIds={selectedClipIds}
           setSelectedClipIds={setSelectedClipIds}
+          selectedSceneId={selectedSceneId}
+          onSelectScene={handleSelectScene}
           onDeleteClips={handleDeleteClip}
           onDuplicateClips={handleDuplicateClip}
           onUpdateProject={updateProjectData}
           onOpenTranscribeModal={handleOpenTranscribeModal}
           onOpenSceneDirector={handleOpenSceneDirector}
           onOpenGraphicDirector={handleOpenGraphicDirector}
+          onOpenAutoCutModal={handleOpenAutoCutModal}
+          onOpenGraphicForScene={handleOpenGraphicForScene}
+          onOpenSceneBroll={handleOpenSceneBroll}
           onUndo={handleUndo}
           onRedo={handleRedo}
           canUndo={historyPast.length > 0}
@@ -1450,6 +2222,7 @@ export function EditorPage({
           isTimelineExpanded={isTimelineExpanded}
           onToggleMaximizeTimeline={handleToggleMaximizeTimeline}
           onAddAsset={handleAddAsset}
+          onUpdateAsset={handleUpdateAsset}
         />
       </footer>
 
@@ -1473,9 +2246,23 @@ export function EditorPage({
         project={project}
         onUpdateProject={(updated) => {
           updateProjectData(updated, true);
-          setActiveSidebarTab('transcript');
+          handleSelectSidebarTab('transcript');
           showToast('¡Guion transcrito e insertado en la Línea Guía con éxito!', 'success');
         }}
+      />
+
+      <AutoCutModal
+        isOpen={showAutoCutModal}
+        onClose={() => setShowAutoCutModal(false)}
+        project={project}
+        selectedClipIds={selectedClipIds}
+        selectedClipId={selectedClipId}
+        onUpdateProject={(updated) => {
+          updateProjectData(updated, true);
+          showToast('¡Recortes automáticos IA aplicados con éxito! (Ctrl+Z para deshacer)', 'success');
+        }}
+        onBeginTransform={beginHistoryTransaction}
+        onEndTransform={commitHistoryTransaction}
       />
 
       {showSceneDirectorModal && (
@@ -1486,7 +2273,7 @@ export function EditorPage({
           onUpdateProject={updateProjectData}
           onApplyScenes={(updatedProj, { autoDownloadBroll = false } = {}) => {
             updateProjectData(updatedProj, true);
-            setActiveSidebarTab('scenes');
+            handleSelectSidebarTab('scenes');
             setShowSceneDirectorModal(false);
             const sceneCount = (updatedProj.scenes?.list || []).length;
             showToast(`¡${sceneCount} escenas añadidas con éxito al Storyboard y Timeline!`, 'success');
@@ -1504,8 +2291,15 @@ export function EditorPage({
 
       <GraphicDirectorModal
         isOpen={showGraphicDirectorModal}
-        onClose={() => setShowGraphicDirectorModal(false)}
+        onClose={() => {
+          setShowGraphicDirectorModal(false);
+          setGraphicTargetScene(null);
+        }}
         project={project}
+        currentTime={currentTime}
+        onSeek={handleSeekToTime}
+        targetScene={graphicTargetScene}
+        initialSceneNumber={graphicTargetScene?.sceneNumber}
         onUpdateProject={(updated) => {
           updateProjectData(updated, true);
           showToast('¡Gráficos y animaciones aplicados a la pista G1 con éxito!', 'success');
@@ -1513,7 +2307,7 @@ export function EditorPage({
         onOpenSettings={() => setShowGlobalSettingsModal(true)}
         onSelectClip={(clipId) => {
           setSelectedClipId(clipId);
-          setActiveSidebarTab('inspector');
+          handleSelectSidebarTab('inspector');
         }}
       />
 
@@ -1540,7 +2334,7 @@ export function EditorPage({
         project={project}
         onBatchComplete={(updatedProj) => {
           updateProjectData(updatedProj, true);
-          setActiveSidebarTab('scenes');
+          handleSelectSidebarTab('scenes');
           showToast('¡Tomas de video B-Roll descargadas en disco e insertadas en la pista V2!', 'success');
         }}
       />

@@ -204,3 +204,23 @@ export function readProjectFromFile(file) {
     reader.readAsText(file);
   });
 }
+
+/**
+ * Deletes a project file from a directory handle (FileSystemDirectoryHandle)
+ */
+export async function deleteProjectFromDirectoryHandle(dirHandle, fileName, projectId = null) {
+  if (!dirHandle || !fileName) return false;
+  if (projectId) {
+    fileHandlesMap.delete(projectId);
+  }
+  try {
+    if (typeof dirHandle.removeEntry === 'function') {
+      await dirHandle.removeEntry(fileName);
+      return true;
+    }
+  } catch (err) {
+    console.warn('Error deleting project from directory handle:', err);
+  }
+  return false;
+}
+

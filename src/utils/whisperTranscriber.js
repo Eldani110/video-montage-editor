@@ -94,7 +94,8 @@ export async function transcribeWithWhisperLocal(mediaSource, options = {}) {
           id: `whisper_${Date.now()}_${idx}`,
           start: s.start,
           end: s.end,
-          text: s.text
+          text: s.text,
+          words: s.words || []
         }));
 
         resolve(formatted);
@@ -107,11 +108,26 @@ export async function transcribeWithWhisperLocal(mediaSource, options = {}) {
     worker.onerror = (err) => {
       cleanup();
       console.error('Whisper worker error:', err);
-      reject(new Error('El motor de Whisper encontró un error en el hilo secundario.'));
+      const detail = err?.message || (typeof err === 'string' ? err : 'Error en hilo Web Worker');
+      reject(new Error(`El motor de Whisper encontró un error en el hilo secundario: ${detail}`));
     };
 
     // Post audio data to worker with zero-copy buffer transfer
     const buffer = float32Data.buffer;
+    const modelMap = {
+      'whisper-tiny': 'onnx-community/whisper-tiny',
+      'whisper-base': 'onnx-community/whisper-base',
+      'whisper-small': 'onnx-community/whisper-small',
+      'whisper-large': 'onnx-community/whisper-large-v3-turbo',
+      'whisper-large-v3-turbo': 'onnx-community/whisper-large-v3-turbo'
+    };
+    const targetModel = modelMap[options.model || options.whisperModel] || options.model || options.whisperModel || 'onnx-community/whisper-base';
+
+    const transferables = [];
+    if (buffer && buffer.byteLength > 0) {
+      transferables.push(buffer);
+    }
+
     worker.postMessage(
       {
         type: 'transcribe',
@@ -119,10 +135,11 @@ export async function transcribeWithWhisperLocal(mediaSource, options = {}) {
           float32Data,
           sampleRate,
           language: options.language || 'spanish',
-          maxChunks: options.maxChunks || null
+          maxChunks: options.maxChunks || null,
+          model: targetModel
         }
       },
-      [buffer]
+      transferables
     );
   });
 }

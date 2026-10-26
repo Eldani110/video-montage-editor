@@ -4,36 +4,38 @@
    ========================================================================== */
 
 :root {
-  /* Color Palette */
-  --bg-primary: #090b10;
-  --bg-secondary: #0f131c;
-  --bg-surface: #161b26;
-  --bg-surface-elevated: #1e2433;
-  --bg-surface-hover: #262d3f;
-  --bg-input: #121620;
+  /* Color Palette — Neutral Charcoal Adobe Premiere Pro NLE */
+  --bg-primary: #111111;
+  --bg-secondary: #1b1b1b;
+  --bg-surface: #222222;
+  --bg-surface-elevated: #282828;
+  --bg-surface-hover: #2f2f2f;
+  --bg-input: #151515;
 
   /* Borders & Dividers */
   --border-subtle: rgba(255, 255, 255, 0.07);
-  --border-medium: rgba(255, 255, 255, 0.12);
-  --border-strong: rgba(255, 255, 255, 0.22);
-  --border-accent: rgba(99, 102, 241, 0.45);
+  --border-medium: rgba(255, 255, 255, 0.13);
+  --border-strong: rgba(255, 255, 255, 0.24);
+  --border-accent: rgba(43, 125, 233, 0.7);
 
-  /* Accents & Brand */
-  --accent-primary: #6366f1;
-  --accent-primary-hover: #4f46e5;
-  --accent-glow: rgba(99, 102, 241, 0.35);
-  
-  --accent-cyan: #06b6d4;
+  /* Accents & Brand (Adobe Premiere Spectrum Blue) */
+  --accent-primary: #2b7de9;
+  --accent-primary-hover: #1d6bd4;
+  --accent-glow: rgba(43, 125, 233, 0.35);
+  --premiere-blue: #2b7de9;
+  --premiere-timecode: #3898ff;
+
+  --accent-cyan: #3898ff;
   --accent-emerald: #10b981;
   --accent-amber: #f59e0b;
-  --accent-rose: #f43f5e;
-  --accent-playhead: #ff3366;
+  --accent-rose: #ef4444;
+  --accent-playhead: #2b7de9;
 
   /* Typography */
-  --text-primary: #f8fafc;
-  --text-secondary: #94a3b8;
-  --text-muted: #64748b;
-  --text-dim: #475569;
+  --text-primary: #e8e8e8;
+  --text-secondary: #a8a8a8;
+  --text-muted: #787878;
+  --text-dim: #545454;
 
   /* Font Families */
   --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
@@ -44,32 +46,36 @@
   --timeline-track-height: 52px;
   --timeline-header-width: 220px;
   --timeline-ruler-height: 36px;
-  --timeline-bg: #0d1017;
+  --timeline-bg: #171717;
   --timeline-grid: rgba(255, 255, 255, 0.04);
 
   /* Shadows & Glassmorphism */
-  --glass-bg: rgba(18, 23, 34, 0.85);
-  --glass-border: rgba(255, 255, 255, 0.09);
-  --shadow-sm: 0 2px 4px rgba(0, 0, 0, 0.4);
-  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.5);
-  --shadow-lg: 0 12px 28px rgba(0, 0, 0, 0.65);
-  --shadow-glow: 0 0 24px rgba(99, 102, 241, 0.25);
+  --glass-bg: rgba(27, 27, 27, 0.92);
+  --glass-border: rgba(255, 255, 255, 0.1);
+  --shadow-sm: 0 2px 4px rgba(0, 0, 0, 0.5);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.65);
+  --shadow-lg: 0 12px 28px rgba(0, 0, 0, 0.8);
+  --shadow-glow: 0 0 18px rgba(43, 125, 233, 0.35);
 
   /* Radii */
-  --radius-xs: 4px;
-  --radius-sm: 6px;
-  --radius-md: 10px;
-  --radius-lg: 14px;
+  --radius-xs: 3px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
   --radius-full: 9999px;
 }
 
-*, *::before, *::after {
+*,
+*::before,
+*::after {
   box-sizing: border-box;
   margin: 0;
   padding: 0;
 }
 
-html, body, #root {
+html,
+body,
+#root {
   width: 100%;
   height: 100%;
   overflow: hidden;
@@ -88,13 +94,16 @@ html, body, #root {
   width: 7px;
   height: 7px;
 }
+
 ::-webkit-scrollbar-track {
   background: var(--bg-primary);
 }
+
 ::-webkit-scrollbar-thumb {
   background: var(--bg-surface-elevated);
   border-radius: var(--radius-full);
 }
+
 ::-webkit-scrollbar-thumb:hover {
   background: var(--text-dim);
 }
@@ -130,10 +139,12 @@ button:disabled {
   padding: 8px 16px;
   box-shadow: 0 2px 10px rgba(99, 102, 241, 0.3);
 }
+
 .btn-primary:hover:not(:disabled) {
   transform: translateY(-1px);
   box-shadow: 0 4px 16px rgba(99, 102, 241, 0.45);
 }
+
 .btn-primary:active:not(:disabled) {
   transform: translateY(0);
 }
@@ -144,6 +155,7 @@ button:disabled {
   border: 1px solid var(--border-medium);
   padding: 8px 14px;
 }
+
 .btn-secondary:hover:not(:disabled) {
   background: var(--bg-surface-hover);
   border-color: var(--border-strong);
@@ -155,6 +167,7 @@ button:disabled {
   color: var(--text-secondary);
   padding: 6px 10px;
 }
+
 .btn-ghost:hover:not(:disabled) {
   background: var(--bg-surface-hover);
   color: var(--text-primary);
@@ -166,6 +179,7 @@ button:disabled {
   border: 1px solid rgba(244, 63, 94, 0.3);
   padding: 8px 14px;
 }
+
 .btn-danger:hover:not(:disabled) {
   background: rgba(244, 63, 94, 0.25);
   border-color: var(--accent-rose);
@@ -224,6 +238,7 @@ button:disabled {
   cursor: pointer;
   transition: all 0.15s ease;
 }
+
 .btn-amber:hover {
   background: #fbbf24;
   box-shadow: 0 0 12px rgba(245, 158, 11, 0.4);

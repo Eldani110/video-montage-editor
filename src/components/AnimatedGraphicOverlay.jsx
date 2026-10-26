@@ -1,9 +1,9 @@
-import React, { useRef, useState } from 'react';
+import React, { useRef, useState, useEffect } from 'react';
 import {
   computeGraphicAnimationState,
   FONT_OPTIONS
 } from '../utils/graphicEngine.js';
-import { Move, Check, Sparkles } from 'lucide-react';
+import { Move, Check, Sparkles, RotateCw, RotateCcw, X, Type } from 'lucide-react';
 
 export function AnimatedGraphicOverlay({
   clip,
@@ -11,10 +11,83 @@ export function AnimatedGraphicOverlay({
   isSelected = false,
   onSelect = null,
   onUpdatePosition = null,
-  stageDimensions = { width: 1280, height: 720 }
+  onBeginTransform = null,
+  onEndTransform = null,
+  stageDimensions = { width: 1280, height: 720 },
+  monitorZoom = 1.0
 }) {
   const containerRef = useRef(null);
+  const textInputRef = useRef(null);
   const [isDragging, setIsDragging] = useState(false);
+  const [isScaling, setIsScaling] = useState(false);
+  const [isRotating, setIsRotating] = useState(false);
+  const [isResizingWidth, setIsResizingWidth] = useState(false);
+  const [isEditingText, setIsEditingText] = useState(false);
+  const [draftText, setDraftText] = useState(clip.title || clip.text || '');
+
+  // Sync draftText whenever clip text/title changes from external edits (e.g. Inspector or Transcript)
+  useEffect(() => {
+    if (!isEditingText) {
+      setDraftText(clip.title !== undefined ? clip.title : (clip.text || ''));
+    }
+  }, [clip.title, clip.text, isEditingText]);
+
+  // Reset editing mode if deselecting
+  useEffect(() => {
+    if (!isSelected) {
+      setIsEditingText(false);
+    }
+  }, [isSelected]);
+
+  // Focus and select text when entering editing mode
+  useEffect(() => {
+    if (isEditingText && textInputRef.current) {
+      textInputRef.current.focus();
+      textInputRef.current.select();
+    }
+  }, [isEditingText]);
+
+  // Keyboard Arrow Key Nudging and Escape to Deselect (Placed at top level to satisfy React Rules of Hooks)
+  useEffect(() => {
+    if (!isSelected || !clip) return;
+
+    const handleKeyDown = (e) => {
+      if (isEditingText) return;
+      const tag = document.activeElement?.tagName?.toLowerCase();
+      if (tag === 'input' || tag === 'textarea' || document.activeElement?.isContentEditable) return;
+
+      if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) {
+        e.preventDefault();
+        const step = e.shiftKey ? 10 : 1;
+        const curX = clip.positionX ?? clip.position?.x ?? 0;
+        const curY = clip.positionY ?? clip.position?.y ?? 0;
+        let nextX = curX;
+        let nextY = curY;
+
+        if (e.key === 'ArrowLeft') nextX -= step;
+        if (e.key === 'ArrowRight') nextX += step;
+        if (e.key === 'ArrowUp') nextY -= step;
+        if (e.key === 'ArrowDown') nextY += step;
+
+        if (onUpdatePosition) {
+          onUpdatePosition(clip.id, {
+            positionX: nextX,
+            positionY: nextY,
+            position: {
+              ...(clip.position || {}),
+              x: nextX,
+              y: nextY
+            }
+          }, true);
+        }
+      } else if (e.key === 'Escape') {
+        if (onSelect) onSelect(null);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isSelected, clip?.id, clip?.positionX, clip?.positionY, clip?.position, onUpdatePosition, onSelect]);
 
   if (!clip || !clip.isGraphic) return null;
 
@@ -28,6 +101,16 @@ export function AnimatedGraphicOverlay({
   const refW = isVertical ? 720 : 1280;
   const previewScale = Math.max(0.1, stageW / refW);
 
+  // Maximum allowed width before touching video margins (leaves safe margin for handles)
+  const maxSafeWidth = Math.round(refW * (isVertical ? 0.88 : 0.92));
+  // Default box width optimized for comfortable 2-line formatting
+  const defaultBoxWidth = Math.round(refW * (isVertical ? 0.82 : 0.78)); // ~590px in vertical 9:16, ~1000px in horizontal 16:9
+  const activeBoxWidth = Math.min(maxSafeWidth, Math.max(260, Number(clip.boxWidth || defaultBoxWidth)));
+
+  // Counter-scale factor so gizmo handles and badges stay crisp and normal-sized regardless of stage scaling
+  const effectiveTotalScale = Math.max(0.1, (anim.scale || 1.0) * previewScale);
+  const counterScale = 1 / effectiveTotalScale;
+
   const fontFam = clip.fontFamily || 'Outfit';
   const fontSize = clip.fontSize || 42;
   const accentColor = clip.accentColor || '#06b6d4';
@@ -38,7 +121,7 @@ export function AnimatedGraphicOverlay({
   const defaultShadow = isDocType ? 'rgba(0, 0, 0, 0.95)' : 'rgba(0, 0, 0, 0.85)';
   const shadowColor = clip.textShadowColor || defaultShadow;
 
-  let titleText = clip.title || '';
+  let titleText = clip.title !== undefined ? clip.title : (clip.text || '');
   if (clip.textTransform === 'uppercase') {
     titleText = titleText.toUpperCase();
   }
@@ -47,40 +130,244 @@ export function AnimatedGraphicOverlay({
     titleText = titleText.substring(0, charsToShow);
   }
 
-  // Handle Dragging on Canvas with normalized delta scaling
+  // 1. Drag to Move on Canvas with normalized delta scaling
   const handleMouseDown = (e) => {
+    if (e.button !== 0) return;
     e.stopPropagation();
     if (onSelect) onSelect(clip.id);
 
     if (!onUpdatePosition) return;
+    if (onBeginTransform) onBeginTransform();
 
     setIsDragging(true);
     const startClientX = e.clientX;
     const startClientY = e.clientY;
-    const initialPosX = clip.position?.x || 0;
-    const initialPosY = clip.position?.y || 0;
+    const initialPosX = clip.positionX ?? clip.position?.x ?? 0;
+    const initialPosY = clip.positionY ?? clip.position?.y ?? 0;
 
     const handleMouseMove = (moveEvt) => {
-      const deltaX = (moveEvt.clientX - startClientX) / previewScale;
-      const deltaY = (moveEvt.clientY - startClientY) / previewScale;
+      const deltaX = (moveEvt.clientX - startClientX) / (previewScale * monitorZoom);
+      const deltaY = (moveEvt.clientY - startClientY) / (previewScale * monitorZoom);
+      const nextX = Math.round(initialPosX + deltaX);
+      const nextY = Math.round(initialPosY + deltaY);
       onUpdatePosition(clip.id, {
+        positionX: nextX,
+        positionY: nextY,
         position: {
           ...(clip.position || {}),
-          x: Math.round(initialPosX + deltaX),
-          y: Math.round(initialPosY + deltaY)
+          x: nextX,
+          y: nextY
         }
-      });
+      }, false);
     };
 
     const handleMouseUp = () => {
       setIsDragging(false);
       window.removeEventListener('mousemove', handleMouseMove);
       window.removeEventListener('mouseup', handleMouseUp);
+      if (onEndTransform) onEndTransform();
     };
 
     window.addEventListener('mousemove', handleMouseMove);
     window.addEventListener('mouseup', handleMouseUp);
   };
+
+  // 2. Drag to Scale with Corner Handles
+  const handleStartScale = (e, handleId) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setIsScaling(true);
+    if (onBeginTransform) onBeginTransform();
+
+    const initialScale = clip.scale ?? clip.position?.scale ?? 1.0;
+    const rect = containerRef.current?.getBoundingClientRect();
+    const centerX = rect ? (rect.left + rect.width / 2) : e.clientX;
+    const centerY = rect ? (rect.top + rect.height / 2) : e.clientY;
+    const initialDist = Math.hypot(e.clientX - centerX, e.clientY - centerY);
+
+    const handleMouseMove = (moveEvt) => {
+      const currentDist = Math.hypot(moveEvt.clientX - centerX, moveEvt.clientY - centerY);
+      const distRatio = currentDist / Math.max(12, initialDist);
+      const nextScale = Math.max(0.2, Math.min(4.0, Number((initialScale * distRatio).toFixed(2))));
+
+      if (onUpdatePosition) {
+        onUpdatePosition(clip.id, {
+          scale: nextScale,
+          position: {
+            ...(clip.position || {}),
+            scale: nextScale
+          }
+        }, false);
+      }
+    };
+
+    const handleMouseUp = () => {
+      setIsScaling(false);
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+      if (onEndTransform) onEndTransform();
+    };
+
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+  };
+
+  // 3. Drag to Rotate with Top Knob
+  const handleStartRotate = (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setIsRotating(true);
+    if (onBeginTransform) onBeginTransform();
+
+    const rect = containerRef.current?.getBoundingClientRect();
+    const centerX = rect ? (rect.left + rect.width / 2) : e.clientX;
+    const centerY = rect ? (rect.top + rect.height / 2) : e.clientY;
+
+    const handleMouseMove = (moveEvt) => {
+      const angleRad = Math.atan2(moveEvt.clientY - centerY, moveEvt.clientX - centerX);
+      let angleDeg = Math.round((angleRad * 180) / Math.PI) - 90;
+
+      while (angleDeg > 180) angleDeg -= 360;
+      while (angleDeg < -180) angleDeg += 360;
+
+      if (moveEvt.shiftKey) {
+        angleDeg = Math.round(angleDeg / 15) * 15;
+      }
+
+      if (onUpdatePosition) {
+        onUpdatePosition(clip.id, {
+          rotation: angleDeg,
+          position: {
+            ...(clip.position || {}),
+            rotation: angleDeg
+          }
+        }, false);
+      }
+    };
+
+    const handleMouseUp = () => {
+      setIsRotating(false);
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+      if (onEndTransform) onEndTransform();
+    };
+
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+  };
+
+  // 4. Drag Side Handles (West / East) to Adjust Box Width without changing font size
+  const handleStartResizeWidth = (e, handleId) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setIsResizingWidth(true);
+    if (onBeginTransform) onBeginTransform();
+
+    const initialBoxW = activeBoxWidth;
+    const startX = e.clientX;
+
+    const handleMouseMove = (moveEvt) => {
+      const deltaScreenX = moveEvt.clientX - startX;
+      // Convert screen delta to virtual reference coordinates
+      const deltaRefX = deltaScreenX / (previewScale * (anim.scale || 1.0) * monitorZoom);
+      // Symmetrical horizontal resizing: dragging right handle (e) expands width, left handle (w) expands when dragging left
+      const factor = handleId === 'e' ? 2 : -2;
+      const newWidth = Math.round(
+        Math.max(260, Math.min(maxSafeWidth, initialBoxW + deltaRefX * factor))
+      );
+
+      if (onUpdatePosition) {
+        onUpdatePosition(clip.id, {
+          boxWidth: newWidth,
+          position: {
+            ...(clip.position || {}),
+            boxWidth: newWidth
+          }
+        }, false);
+      }
+    };
+
+    const handleMouseUp = () => {
+      setIsResizingWidth(false);
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+      if (onEndTransform) onEndTransform();
+    };
+
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+  };
+
+  // Quick Action Buttons
+  const handleReset = (e) => {
+    e.stopPropagation();
+    const defaultY = isVertical ? 320 : 235;
+    if (onUpdatePosition) {
+      onUpdatePosition(clip.id, {
+        positionX: 0,
+        positionY: defaultY,
+        scale: 1.0,
+        rotation: 0,
+        boxWidth: defaultBoxWidth,
+        position: {
+          ...(clip.position || {}),
+          x: 0,
+          y: defaultY,
+          scale: 1.0,
+          rotation: 0,
+          boxWidth: defaultBoxWidth
+        }
+      }, true);
+    }
+  };
+
+  const handleCenter = (e) => {
+    e.stopPropagation();
+    if (onUpdatePosition) {
+      onUpdatePosition(clip.id, {
+        positionX: 0,
+        positionY: 0,
+        position: {
+          ...(clip.position || {}),
+          x: 0,
+          y: 0
+        }
+      }, true);
+    }
+  };
+
+  const handleDeselect = (e) => {
+    e.stopPropagation();
+    if (onSelect) onSelect(null);
+  };
+
+  const handleCommitText = () => {
+    const trimmed = draftText.trim();
+    setIsEditingText(false);
+    if (!trimmed || trimmed === (clip.title || clip.text)) return;
+
+    if (onUpdatePosition) {
+      onUpdatePosition(clip.id, {
+        title: trimmed,
+        text: trimmed,
+        name: `Sub: ${trimmed.slice(0, 28)}`
+      }, true);
+    }
+  };
+
+  const handleCancelText = () => {
+    setIsEditingText(false);
+    setDraftText(clip.title || clip.text || '');
+  };
+
+  const curPosX = clip.positionX ?? clip.position?.x ?? 0;
+  const curPosY = clip.positionY ?? clip.position?.y ?? 0;
+  const curScale = clip.scale ?? clip.position?.scale ?? 1.0;
+  const curRotation = clip.rotation ?? clip.position?.rotation ?? 0;
+  const isSubClip = clip.graphicType === 'subtitle_caption' || clip.isSubtitle;
 
   const transformStyle = `translate(${anim.offsetX * previewScale}px, ${anim.offsetY * previewScale}px) scale(${anim.scale * previewScale}) ${anim.rotate ? `rotate(${anim.rotate}deg)` : ''}`;
 
@@ -92,54 +379,416 @@ export function AnimatedGraphicOverlay({
         e.stopPropagation();
         if (onSelect) onSelect(clip.id);
       }}
-      onMouseDown={handleMouseDown}
+      onDoubleClick={(e) => {
+        e.stopPropagation();
+        if (onSelect) onSelect(clip.id);
+        setDraftText(clip.title || clip.text || '');
+        setIsEditingText(true);
+      }}
+      onMouseDown={isEditingText ? undefined : handleMouseDown}
       style={{
         position: 'absolute',
         top: '50%',
         left: '50%',
         transform: `translate(-50%, -50%) ${transformStyle}`,
         transformOrigin: 'center center',
-        width: 'max-content',
-        maxWidth: `${refW}px`,
+        width: isSubClip ? `${activeBoxWidth}px` : (clip.boxWidth ? `${activeBoxWidth}px` : 'fit-content'),
+        maxWidth: `${maxSafeWidth}px`,
+        boxSizing: 'border-box',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        justifyContent: 'center',
         opacity: anim.opacity,
-        zIndex: 50,
+        zIndex: isSelected ? 160 : 120,
         cursor: isDragging ? 'grabbing' : 'pointer',
         userSelect: 'none',
         pointerEvents: 'auto',
-        transition: isDragging ? 'none' : 'transform 0.05s ease-out'
+        transition: isDragging || isScaling || isRotating || isResizingWidth ? 'none' : 'transform 0.05s ease-out'
       }}
     >
-      {/* Selection Bounding Box Indicator */}
-      {isSelected && (
+      {/* 1. Normal Transform Gizmo (Only visible when NOT in text editing mode) */}
+      {isSelected && !isEditingText && (
         <div
-          className="graphic-selection-outline"
+          className="graphic-transform-gizmo-wireframe"
           style={{
             position: 'absolute',
-            inset: '-10px',
-            border: '1.5px dashed #06b6d4',
-            borderRadius: '12px',
+            inset: `${-6 * counterScale}px`,
+            border: `${Math.max(1.5, 1.5 * counterScale)}px solid #3898ff`,
+            boxShadow: '0 0 0 1px rgba(0, 0, 0, 0.7), 0 0 12px rgba(56, 152, 255, 0.45)',
+            borderRadius: clip.backdropGlass ? `${12 * counterScale}px` : `${4 * counterScale}px`,
             pointerEvents: 'none',
-            boxShadow: '0 0 15px rgba(6, 182, 212, 0.3)'
+            zIndex: 140
           }}
         >
+          {/* Top Label Badge */}
           <div
             style={{
               position: 'absolute',
-              top: '-14px',
-              left: '8px',
-              background: '#06b6d4',
-              color: '#000000',
+              top: 0,
+              left: 0,
+              transform: `translate(0, -100%) translateY(${-4 * counterScale}px) scale(${counterScale})`,
+              transformOrigin: 'bottom left',
+              background: '#3898ff',
+              color: '#ffffff',
               fontSize: '10px',
-              fontWeight: '700',
-              padding: '1px 6px',
+              fontWeight: 700,
+              padding: '2px 8px',
               borderRadius: '4px',
+              boxShadow: '0 2px 6px rgba(0, 0, 0, 0.5)',
               display: 'flex',
               alignItems: 'center',
-              gap: '4px'
+              gap: '4px',
+              whiteSpace: 'nowrap',
+              maxWidth: `${Math.max(140, maxSafeWidth * 0.5)}px`,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              pointerEvents: 'none'
             }}
           >
-            <Move size={10} />
-            <span>{clip.name || 'Gráfico'} • Arrastra para mover</span>
+            <Type size={11} />
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>
+              {clip.name || (clip.isSubtitle ? 'Subtítulo' : 'Gráfico')}
+            </span>
+          </div>
+
+          {/* Center Anchor Target (+) - subtle whisper */}
+          <div
+            style={{
+              position: 'absolute',
+              left: '50%',
+              top: '50%',
+              transform: `translate(-50%, -50%) scale(${counterScale})`,
+              transformOrigin: 'center center',
+              width: '8px',
+              height: '8px',
+              pointerEvents: 'none',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              opacity: 0.25
+            }}
+          >
+            <div style={{ position: 'absolute', width: '6px', height: '1px', background: '#3898ff' }} />
+            <div style={{ position: 'absolute', height: '6px', width: '1px', background: '#3898ff' }} />
+          </div>
+
+          {/* Rotation Stem & Top Circular Knob */}
+          <div
+            style={{
+              position: 'absolute',
+              left: '50%',
+              top: `${-22 * counterScale}px`,
+              width: `${Math.max(1, 1.5 * counterScale)}px`,
+              height: `${22 * counterScale}px`,
+              background: '#3898ff',
+              transform: 'translateX(-50%)',
+              pointerEvents: 'none'
+            }}
+          />
+          <div
+            onMouseDown={handleStartRotate}
+            title="Arrastra para rotar • Mantén Shift para pasos de 15°"
+            style={{
+              position: 'absolute',
+              left: '50%',
+              top: `${-22 * counterScale}px`,
+              transform: `translate(-50%, -100%) scale(${counterScale})`,
+              transformOrigin: 'center center',
+              width: '20px',
+              height: '20px',
+              borderRadius: '50%',
+              background: isRotating ? '#2563eb' : '#3898ff',
+              border: '2px solid #ffffff',
+              boxShadow: '0 2px 8px rgba(0, 0, 0, 0.6)',
+              cursor: 'crosshair',
+              pointerEvents: 'auto',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              color: '#ffffff'
+            }}
+          >
+            <RotateCw size={10} strokeWidth={2.6} />
+          </div>
+
+          {/* 4 Corner Scale Handles */}
+          {[
+            { id: 'nw', style: { top: 0, left: 0, transform: `translate(-50%, -50%) scale(${counterScale})`, cursor: 'nwse-resize' } },
+            { id: 'ne', style: { top: 0, right: 0, transform: `translate(50%, -50%) scale(${counterScale})`, cursor: 'nesw-resize' } },
+            { id: 'se', style: { bottom: 0, right: 0, transform: `translate(50%, 50%) scale(${counterScale})`, cursor: 'nwse-resize' } },
+            { id: 'sw', style: { bottom: 0, left: 0, transform: `translate(-50%, 50%) scale(${counterScale})`, cursor: 'nesw-resize' } }
+          ].map((h) => (
+            <div
+              key={h.id}
+              onMouseDown={(e) => handleStartScale(e, h.id)}
+              title="Arrastra para escalar proporcionalmente"
+              style={{
+                position: 'absolute',
+                width: '9px',
+                height: '9px',
+                background: '#ffffff',
+                border: '1.5px solid #3898ff',
+                borderRadius: '2px',
+                pointerEvents: 'auto',
+                boxShadow: '0 1px 4px rgba(0, 0, 0, 0.7)',
+                zIndex: 140,
+                ...h.style
+              }}
+            />
+          ))}
+
+          {/* 2 Side Handles (West / East) for Horizontal Box Width Resize */}
+          {[
+            { id: 'w', title: 'Arrastra horizontalmente para ensanchar o reducir el espacio del texto (2 líneas)', style: { top: '50%', left: 0, transform: `translate(-50%, -50%) scale(${counterScale})`, cursor: 'ew-resize' } },
+            { id: 'e', title: 'Arrastra horizontalmente para ensanchar o reducir el espacio del texto (2 líneas)', style: { top: '50%', right: 0, transform: `translate(50%, -50%) scale(${counterScale})`, cursor: 'ew-resize' } }
+          ].map((h) => (
+            <div
+              key={h.id}
+              onMouseDown={(e) => handleStartResizeWidth(e, h.id)}
+              title={h.title}
+              style={{
+                position: 'absolute',
+                width: '6px',
+                height: '18px',
+                background: '#ffffff',
+                border: '1.5px solid #3898ff',
+                borderRadius: '3px',
+                pointerEvents: 'auto',
+                boxShadow: '0 1px 4px rgba(0, 0, 0, 0.7)',
+                zIndex: 145,
+                ...h.style
+              }}
+            />
+          ))}
+
+          {/* Live HUD Tooltip during dragging / scaling / rotating / resizing width */}
+          {(isDragging || isRotating || isScaling || isResizingWidth) && (
+            <div
+              style={{
+                position: 'absolute',
+                top: 0,
+                left: '50%',
+                transform: `translateX(-50%) translateY(${-44 * counterScale}px) rotate(${-curRotation}deg) scale(${counterScale})`,
+                transformOrigin: 'bottom center',
+                background: 'rgba(15, 23, 42, 0.95)',
+                border: '1px solid #3898ff',
+                borderRadius: '6px',
+                padding: '3px 8px',
+                fontSize: '11px',
+                fontWeight: 700,
+                color: '#ffffff',
+                whiteSpace: 'nowrap',
+                boxShadow: '0 4px 14px rgba(0, 0, 0, 0.7)',
+                pointerEvents: 'none',
+                zIndex: 250
+              }}
+            >
+              {isDragging && <span>↔ X: {curPosX}px &nbsp; ↕ Y: {curPosY}px</span>}
+              {isScaling && <span>⤢ Escala: {Math.round(curScale * 100)}% ({curScale.toFixed(2)}x)</span>}
+              {isRotating && <span>↻ Rotación: {curRotation}°</span>}
+              {isResizingWidth && <span>↔ Espacio ancho: {activeBoxWidth}px</span>}
+            </div>
+          )}
+
+          {/* Quick Actions Floating Toolbar (Positioned adaptively above or below) */}
+          <div
+            className="graphic-quick-actions-toolbar"
+            onMouseDown={(e) => e.stopPropagation()}
+            style={{
+              position: 'absolute',
+              ...(curPosY > 40
+                ? {
+                    top: 0,
+                    transform: `translate(-50%, -100%) translateY(${-30 * counterScale}px) scale(${counterScale})`,
+                    transformOrigin: 'bottom center'
+                  }
+                : {
+                    bottom: 0,
+                    transform: `translate(-50%, 100%) translateY(${10 * counterScale}px) scale(${counterScale})`,
+                    transformOrigin: 'top center'
+                  }),
+              left: '50%',
+              background: 'rgba(15, 23, 42, 0.94)',
+              border: '1px solid rgba(255, 255, 255, 0.16)',
+              borderRadius: '6px',
+              padding: '3px 8px',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              boxShadow: '0 4px 14px rgba(0, 0, 0, 0.5)',
+              pointerEvents: 'auto',
+              zIndex: 140,
+              whiteSpace: 'nowrap',
+              width: 'max-content'
+            }}
+          >
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setDraftText(clip.title || clip.text || '');
+                setIsEditingText(true);
+              }}
+              title="Editar palabras de este subtítulo directamente (o haz doble clic)"
+              style={{
+                background: 'rgba(56, 152, 255, 0.18)',
+                border: '1px solid rgba(56, 152, 255, 0.45)',
+                color: '#3898ff',
+                cursor: 'pointer',
+                fontSize: '10px',
+                fontWeight: 700,
+                display: 'flex',
+                alignItems: 'center',
+                gap: '3px',
+                padding: '2px 6px',
+                borderRadius: '4px'
+              }}
+            >
+              <Type size={11} />
+              <span>Editar Texto</span>
+            </button>
+
+            <div style={{ width: '1px', height: '10px', background: 'rgba(255, 255, 255, 0.12)' }} />
+
+            <button
+              type="button"
+              onClick={handleReset}
+              title="Restablecer posición, escala y rotación iniciales"
+              style={{
+                background: 'transparent',
+                border: 'none',
+                color: '#94a3b8',
+                cursor: 'pointer',
+                fontSize: '10px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '3px',
+                padding: '2px 4px',
+                borderRadius: '4px'
+              }}
+              onMouseEnter={(e) => (e.currentTarget.style.color = '#3898ff')}
+              onMouseLeave={(e) => (e.currentTarget.style.color = '#94a3b8')}
+            >
+              <RotateCcw size={10} />
+              <span>Reset</span>
+            </button>
+
+            <div style={{ width: '1px', height: '10px', background: 'rgba(255, 255, 255, 0.12)' }} />
+
+            <button
+              type="button"
+              onClick={handleCenter}
+              title="Centrar en el monitor"
+              style={{
+                background: 'transparent',
+                border: 'none',
+                color: '#94a3b8',
+                cursor: 'pointer',
+                fontSize: '10px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '3px',
+                padding: '2px 4px',
+                borderRadius: '4px'
+              }}
+              onMouseEnter={(e) => (e.currentTarget.style.color = '#3898ff')}
+              onMouseLeave={(e) => (e.currentTarget.style.color = '#94a3b8')}
+            >
+              <Move size={10} />
+              <span>Centrar</span>
+            </button>
+
+            <div style={{ width: '1px', height: '10px', background: 'rgba(255, 255, 255, 0.12)' }} />
+
+            <button
+              type="button"
+              onClick={handleDeselect}
+              title="Deseleccionar recurso (Esc)"
+              style={{
+                background: 'transparent',
+                border: 'none',
+                color: '#94a3b8',
+                cursor: 'pointer',
+                fontSize: '10px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '3px',
+                padding: '2px 4px',
+                borderRadius: '4px'
+              }}
+              onMouseEnter={(e) => (e.currentTarget.style.color = '#f43f5e')}
+              onMouseLeave={(e) => (e.currentTarget.style.color = '#94a3b8')}
+            >
+              <X size={10} />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* 2. Text Editing Focus Ring (Clean & Minimalist, exactly like CapCut / Canva) */}
+      {isSelected && isEditingText && (
+        <div
+          style={{
+            position: 'absolute',
+            inset: `${-4 * counterScale}px`,
+            border: `${Math.max(1.5, 2 * counterScale)}px dashed #3898ff`,
+            borderRadius: `${6 * counterScale}px`,
+            pointerEvents: 'none',
+            zIndex: 140
+          }}
+        >
+          {/* Top Floating Pill Hint */}
+          <div
+            onMouseDown={(e) => e.stopPropagation()}
+            style={{
+              position: 'absolute',
+              bottom: '100%',
+              left: '50%',
+              transform: `translateX(-50%) translateY(${-8 * counterScale}px) scale(${counterScale})`,
+              transformOrigin: 'bottom center',
+              background: '#0f172a',
+              border: '1px solid #3898ff',
+              borderRadius: '20px',
+              padding: '3px 10px',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              fontSize: '11px',
+              fontWeight: 600,
+              color: '#ffffff',
+              whiteSpace: 'nowrap',
+              width: 'max-content',
+              boxShadow: '0 4px 14px rgba(0, 0, 0, 0.7)',
+              pointerEvents: 'auto'
+            }}
+          >
+            <span style={{ color: '#38bdf8', fontWeight: 700 }}>Enter</span>
+            <span style={{ color: '#94a3b8' }}>guardar</span>
+            <span style={{ color: '#475569' }}>•</span>
+            <span style={{ color: '#f43f5e', fontWeight: 700 }}>Esc</span>
+            <span style={{ color: '#94a3b8' }}>cancelar</span>
+            <button
+              type="button"
+              onClick={handleCommitText}
+              style={{
+                marginLeft: '4px',
+                background: '#10b981',
+                border: 'none',
+                borderRadius: '12px',
+                color: '#ffffff',
+                padding: '2px 8px',
+                fontSize: '10px',
+                fontWeight: 700,
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '2px'
+              }}
+            >
+              <Check size={11} />
+              <span>Listo</span>
+            </button>
           </div>
         </div>
       )}
@@ -149,7 +798,8 @@ export function AnimatedGraphicOverlay({
         <div
           style={{
             textAlign: 'center',
-            maxWidth: '920px',
+            width: 'fit-content',
+            maxWidth: `${maxSafeWidth}px`,
             padding: '12px 24px',
             background: clip.backdropGlass ? (clip.bgColor || 'rgba(0, 0, 0, 0.65)') : 'transparent',
             backdropFilter: clip.backdropGlass ? 'blur(12px)' : 'none',
@@ -211,7 +861,8 @@ export function AnimatedGraphicOverlay({
         <div
           style={{
             textAlign: 'center',
-            maxWidth: '960px',
+            width: 'fit-content',
+            maxWidth: `${maxSafeWidth}px`,
             padding: '12px 24px',
             background: clip.backdropGlass ? (clip.bgColor || 'rgba(0, 0, 0, 0.65)') : 'transparent',
             backdropFilter: clip.backdropGlass ? 'blur(12px)' : 'none',
@@ -271,7 +922,8 @@ export function AnimatedGraphicOverlay({
         <div
           style={{
             textAlign: 'center',
-            maxWidth: '920px',
+            width: 'fit-content',
+            maxWidth: `${maxSafeWidth}px`,
             padding: '12px 24px',
             background: clip.backdropGlass ? (clip.bgColor || 'rgba(0, 0, 0, 0.65)') : 'transparent',
             backdropFilter: clip.backdropGlass ? 'blur(12px)' : 'none',
@@ -313,8 +965,8 @@ export function AnimatedGraphicOverlay({
       {clip.graphicType === 'doc_timeline' && (
         <div
           style={{
-            width: '840px',
-            maxWidth: '94vw',
+            width: 'fit-content',
+            maxWidth: `${maxSafeWidth}px`,
             padding: '24px 20px',
             background: clip.backdropGlass ? (clip.bgColor || 'rgba(8, 16, 32, 0.75)') : 'transparent',
             backdropFilter: clip.backdropGlass ? 'blur(12px)' : 'none',
@@ -776,7 +1428,7 @@ export function AnimatedGraphicOverlay({
       )}
 
       {clip.graphicType === 'title_hero' && (
-        <div style={{ textAlign: 'center', maxWidth: '820px', padding: '16px' }}>
+        <div style={{ textAlign: 'center', width: 'fit-content', maxWidth: `${maxSafeWidth}px`, padding: '16px' }}>
           {clip.badgeText && (
             <div style={{ marginBottom: '8px' }}>
               <span
@@ -825,6 +1477,139 @@ export function AnimatedGraphicOverlay({
             >
               {clip.subtitle}
             </div>
+          )}
+        </div>
+      )}
+
+      {/* Subtitles & Captions Overlay (Hormozi, MrBeast, Minimal & Custom) */}
+      {(clip.graphicType === 'subtitle_caption' || clip.isSubtitle) && (
+        <div
+          style={{
+            textAlign: 'center',
+            width: '100%',
+            maxWidth: `${activeBoxWidth}px`,
+            padding: clip.backdropGlass ? '8px 20px' : '4px 12px',
+            background: clip.backdropGlass ? (clip.bgColor || 'rgba(0, 0, 0, 0.78)') : 'transparent',
+            backdropFilter: clip.backdropGlass ? 'blur(10px)' : undefined,
+            WebkitBackdropFilter: clip.backdropGlass ? 'blur(10px)' : undefined,
+            borderRadius: clip.backdropGlass ? '12px' : undefined,
+            border: clip.backdropGlass ? `1px solid ${clip.strokeColor || 'rgba(255, 255, 255, 0.15)'}` : 'none',
+            display: 'block',
+            wordBreak: 'normal',
+            overflowWrap: 'break-word',
+            userSelect: isEditingText ? 'text' : 'none'
+          }}
+        >
+          {isEditingText ? (
+            <textarea
+              ref={textInputRef}
+              value={draftText}
+              onChange={(e) => {
+                const nextVal = e.target.value;
+                setDraftText(nextVal);
+                if (onUpdatePosition) {
+                  onUpdatePosition(clip.id, {
+                    title: nextVal,
+                    text: nextVal,
+                    name: `Sub: ${nextVal.slice(0, 28)}`
+                  }, false);
+                }
+              }}
+              onBlur={handleCommitText}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  handleCommitText();
+                } else if (e.key === 'Escape') {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  handleCancelText();
+                }
+              }}
+              rows={Math.max(1, (draftText || '').split('\n').length)}
+              style={{
+                width: '100%',
+                background: 'transparent',
+                color: textColor || '#ffffff',
+                fontFamily: fontFam,
+                fontSize: `${fontSize}px`,
+                fontWeight: '900',
+                textAlign: 'center',
+                padding: '2px 0',
+                margin: '0',
+                border: 'none',
+                outline: 'none',
+                resize: 'none',
+                lineHeight: '1.25',
+                boxSizing: 'border-box',
+                textTransform: clip.textTransform === 'uppercase' ? 'uppercase' : 'none',
+                letterSpacing: `${clip.letterSpacing || 0.5}px`,
+                caretColor: '#3898ff',
+                display: 'block',
+                textShadow: `0 2px 8px ${clip.strokeColor || '#000000'}`
+              }}
+              placeholder="Escribe el texto del subtítulo..."
+            />
+          ) : (
+            (() => {
+              const rawWords = (titleText || '').trim().split(/\s+/).filter(Boolean);
+              if (rawWords.length === 0) return null;
+
+              const strokeW = Number(clip.strokeWidth !== undefined ? clip.strokeWidth : 5);
+              const strokeColor = clip.strokeColor || '#000000';
+              const textStrokeStyle = strokeW > 0 ? `${strokeW}px ${strokeColor}` : undefined;
+              const textShadowStyle = `${strokeColor} 0px 3px 8px, ${strokeColor} 0px 0px 10px`;
+
+              if (!clip.highlightWordMode || rawWords.length <= 1) {
+                return (
+                  <span
+                    style={{
+                      fontFamily: fontFam,
+                      fontSize: `${fontSize}px`,
+                      fontWeight: '900',
+                      color: textColor,
+                      WebkitTextStroke: textStrokeStyle,
+                      paintOrder: 'stroke fill',
+                      textShadow: textShadowStyle,
+                      letterSpacing: `${clip.letterSpacing || 0.5}px`,
+                      lineHeight: '1.25',
+                      display: 'inline-block'
+                    }}
+                  >
+                    {titleText}
+                  </span>
+                );
+              }
+
+              // Hormozi / Viral caption style: highlight key/last word
+              const highlightIdx = Math.max(0, rawWords.length - 1);
+
+              return rawWords.map((word, wIdx) => {
+                const isHighlight = wIdx === highlightIdx;
+                return (
+                  <span
+                    key={wIdx}
+                    style={{
+                      fontFamily: fontFam,
+                      fontSize: `${isHighlight ? fontSize * 1.05 : fontSize}px`,
+                      fontWeight: '900',
+                      color: isHighlight ? (accentColor || '#facc15') : textColor,
+                      WebkitTextStroke: textStrokeStyle,
+                      paintOrder: 'stroke fill',
+                      textShadow: textShadowStyle,
+                      letterSpacing: `${clip.letterSpacing || 0.5}px`,
+                      lineHeight: '1.25',
+                      transform: isHighlight ? 'scale(1.05)' : 'none',
+                      display: 'inline-block',
+                      margin: '0 4px'
+                    }}
+                  >
+                    {word}
+                  </span>
+                );
+              });
+            })()
           )}
         </div>
       )}

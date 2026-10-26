@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<title>Playback bench</title>
+<style>
+  body { font: 13px/1.4 monospace; background: #0b0f17; color: #cbd5e1; padding: 12px; }
+  video { width: 240px; background: #000; margin-right: 8px; }
+  pre { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h3>Playback bench (?urls=a,b,c&clipLen=0.6&clips=8)</h3>
+<div id="stage"></div>
+<pre id="out">running…</pre>
+<script type="module">
+const q = new URLSearchParams(location.search);
+const urls = (q.get('urls') || '').split(',').filter(Boolean);
+const clipLen = parseFloat(q.get('clipLen') || '0.6');
+const nClips = parseInt(q.get('clips') || '8', 10);
+const stage = document.getElementById('stage');
+const out = document.getElementById('out');
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const now = () => performance.now();
+
+function mk(url) {
+  const v = document.createElement('video');
+  v.muted = true; v.playsInline = true; v.preload = 'auto'; v.crossOrigin = 'anonymous';
+  v.src = url; stage.appendChild(v);
+  return v;
+}
+function loaded(v, timeoutMs = 8000) {
+  return new Promise((res, rej) => {
+    if (v.readyState >= 2) return res();
+    const to = setTimeout(() => rej(new Error('load timeout ' + timeoutMs + 'ms (readyState=' + v.readyState + ', networkState=' + v.networkState + ') -> codec probably unsupported')), timeoutMs);
+    v.addEventListener('loadeddata', () => { clearTimeout(to); res(); }, { once: true });
+    v.addEventListener('error', () => { clearTimeout(to); rej(new Error('media error ' + (v.error && v.error.code) + ' ' + (v.error && v.error.message))); }, { once: true });
+  });
+}
+// Resolves when the element has actually advanced playback past `from` (first real frame after a cut).
+function nextFrame(v, from) {
+  const base = (typeof from === 'number') ? from : v.currentTime;
+  return new Promise(res => {
+    const t0 = now();
+    const iv = setInterval(() => {
+      if (!v.seeking && v.readyState >= 2 && v.currentTime > base + 0.012) { clearInterval(iv); res(true); }
+      else if (now() - t0 > 3000) { clearInterval(iv); res(null); }
+    }, 2);
+  });
+}
+async function seekReady(v, t) {
+  const t0 = now();
+  await new Promise(res => { v.addEventListener('seeked', res, { once: true }); v.currentTime = t; });
+  if (v.readyState < 2) await new Promise(res => v.addEventListener('canplay', res, { once: true }));
+  return now() - t0;
+}
+const pct = (arr, p) => { const s = [...arr].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.floor(s.length * p))]; };
+const r = (n) => Math.round(n * 10) / 10;
+
+function pickStarts(dur) {
+  // deterministic pseudo-random jumps across the whole file (like auto-cut removing silences)
+  const starts = []; let seed = 7;
+  for (let i = 0; i < nClips; i++) {
+    seed = (seed * 9301 + 49297) % 233280;
+    starts.push(Math.max(0, (seed / 233280) * Math.max(0.1, dur - clipLen - 0.2)));
+  }
+  return starts;
+}
+
+async function benchUrl(url) {
+  const res = { url, canPlayHevc: null };
+  const probe = document.createElement('video');
+  res.canPlayHevc = probe.canPlayType('video/mp4; codecs="hvc1.2.4.L120.B0"');
+  res.canPlayH264 = probe.canPlayType('video/mp4; codecs="avc1.640028"');
+
+  const t0 = now();
+  const a = mk(url);
+  try { await loaded(a); } catch (e) { res.error = String(e.message || e); return res; }
+  res.loadMs = r(now() - t0);
+  res.dur = r(a.duration); res.size = a.videoWidth + 'x' + a.videoHeight;
+  const starts = pickStarts(a.duration);
+
+  // 1) raw seek latency (paused, to first decoded frame)
+  const seeks = [];
+  for (const s of starts) { seeks.push(await seekReady(a, s)); }
+  res.seekMs = { p50: r(pct(seeks, 0.5)), p95: r(pct(seeks, 0.95)), max: r(Math.max(...seeks)) };
+
+  // 2) SINGLE element: at each cut seek + play (what the player did)
+  {
+    const stalls = [];
+    for (const s of starts) {
+      const tc = now();
+      a.pause();
+      a.currentTime = s;
+      const p = a.play();
+      await nextFrame(a, s);                  // first real progress after cut
+      stalls.push(now() - tc);
+      await sleep(clipLen * 1000);
+      await p.catch(() => {});
+    }
+    res.single = { stallP50: r(pct(stalls, 0.5)), stallMax: r(Math.max(...stalls)), totalStall: r(stalls.reduce((x, y) => x + y, 0)) };
+    a.pause();
+  }
+
+  // 3) DOUBLE-BUFFER: second element pre-seeks next clip while first plays
+  {
+    const b = mk(url); await loaded(b);
+    let cur = a, nxt = b;
+    const stalls = [];
+    await seekReady(cur, starts[0]);
+    cur.play();
+    for (let i = 0; i < starts.length; i++) {
+      const ready = i + 1 < starts.length ? seekReady(nxt, starts[i + 1]) : Promise.resolve();
+      await sleep(clipLen * 1000);                       // play current clip for its duration
+      if (i + 1 >= starts.length) break;
+      await ready;                                       // normally already done long ago
+      const tc = now();
+      const startAt = starts[i + 1];
+      const fp = nextFrame(nxt, startAt);
+      nxt.play(); cur.pause();
+      await fp;
+      stalls.push(now() - tc);
+      [cur, nxt] = [nxt, cur];
+    }
+    res.double = { stallP50: r(pct(stalls, 0.5)), stallMax: r(Math.max(...stalls)), totalStall: r(stalls.reduce((x, y) => x + y, 0)) };
+    a.pause(); b.pause();
+    const q2 = cur.getVideoPlaybackQuality && cur.getVideoPlaybackQuality();
+    if (q2) res.double.dropped = q2.droppedVideoFrames + '/' + q2.totalVideoFrames;
+  }
+  stage.innerHTML = '';
+  return res;
+}
+
+const all = [];
+for (const u of urls) { all.push(await benchUrl(u)); out.textContent = JSON.stringify(all, null, 2); }
+window.__benchDone = true;
+out.textContent = 'DONE\n' + JSON.stringify(all, null, 2);
+document.title = 'BENCH_DONE';
+</script>
+</body>
+</html>

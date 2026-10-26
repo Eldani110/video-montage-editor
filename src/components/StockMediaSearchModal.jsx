@@ -57,11 +57,18 @@ export function StockMediaSearchModal({
   const [selectedFolder, setSelectedFolder] = useState(() => getProjectMediaFolder(project));
   const [isEditingFolder, setIsEditingFolder] = useState(false);
 
+  const videoTracks = useMemo(() => {
+    return (project?.tracks || []).filter(t => t.type === 'video');
+  }, [project?.tracks]);
+
+  const [destinationTrackId, setDestinationTrackId] = useState('auto');
+
   useEffect(() => {
     if (isOpen) {
       const folder = getProjectMediaFolder(project);
       setSelectedFolder(folder);
       getStorageDiskInfo(folder).then(info => setDiskInfo(info));
+      setDestinationTrackId('auto');
     }
   }, [isOpen, project]);
 
@@ -90,10 +97,34 @@ export function StockMediaSearchModal({
         initialKeywords = scene.searchKeywords.map(k => k.toLowerCase().replace(/laia/g, 'ia'));
       }
 
-      // Prioritize strong composite terms over single ambiguous words
-      let initialQuery = initialKeywords.length > 0
-        ? initialKeywords.slice(0, 3).join(' ')
-        : (scene.title || 'tecnologia');
+      // Filter out conversational stop words and generic boilerplates
+      const isMeaningful = (txt) => {
+        if (!txt || typeof txt !== 'string') return false;
+        const clean = txt.trim().toLowerCase();
+        if (clean.length < 3) return false;
+        if (/^(escena|momento|toma|clip)\s*\d*$/i.test(clean)) return false;
+        if (/^(brewery beer craft|craft beer brewery|laboratory science research|vintage historic|business money investment)$/i.test(clean)) return false;
+        if (/^(alguna|alguno|algún|vez|veces|has|este|esta|para|como|pero|porque|cuando|donde)$/i.test(clean)) return false;
+        return true;
+      };
+
+      // 1. Clean scene title (e.g. "Botella verde con condensación")
+      const cleanTitle = (scene.title || '').replace(/^\[E\d+\]\s*/i, '').split(/[:(]/)[0].trim();
+      // 2. Scene visual anchor (e.g. "Botella verde condensación")
+      const cleanAnchor = (scene.visualAnchor || '').trim();
+      // 3. Meaningful specific keyword
+      const specificKeyword = initialKeywords.find(k => isMeaningful(k));
+
+      let initialQuery = '';
+      if (isMeaningful(cleanTitle)) {
+        initialQuery = cleanTitle;
+      } else if (isMeaningful(cleanAnchor)) {
+        initialQuery = cleanAnchor;
+      } else if (specificKeyword) {
+        initialQuery = specificKeyword;
+      } else {
+        initialQuery = cleanTitle || cleanAnchor || (initialKeywords[0] || 'video').trim();
+      }
 
       // If query was 'ia enfrenta problema' or 'laia enfrenta problema', give a high-value default
       if (/ia.*problema|laia.*problema/i.test(initialQuery)) {
@@ -139,6 +170,30 @@ export function StockMediaSearchModal({
         page: pageToSearch,
         perPage: limit
       });
+
+      if (!isAppend && (!data.results || data.results.length === 0)) {
+        // Fallback: try with broader anchor or clean title if specific term returned 0 results
+        const fallbackTerm = (scene.visualAnchor || scene.title || initialKeywords[1] || 'cerveceria').split(/[:(]/)[0].trim();
+        if (fallbackTerm && fallbackTerm.toLowerCase() !== searchQuery.toLowerCase()) {
+          const fallbackData = await searchStockMedia({
+            query: fallbackTerm,
+            type: typeToSearch,
+            provider: providerToSearch,
+            apiKey: providerToSearch === 'pexels' ? stockConfig.pexelsApiKey : stockConfig.pixabayApiKey,
+            orientation: stockConfig.preferredOrientation || 'landscape',
+            page: 1,
+            perPage: limit
+          });
+          if (fallbackData?.results?.length > 0) {
+            setResults(fallbackData.results);
+            setQuery(fallbackTerm);
+            setPage(1);
+            setTotalResults(fallbackData.totalResults || 0);
+            setHasMore(Boolean(fallbackData.hasMore));
+            return;
+          }
+        }
+      }
 
       if (isAppend) {
         setResults(prev => [...prev, ...(data.results || [])]);
@@ -188,11 +243,13 @@ export function StockMediaSearchModal({
     setErrorMessage(null);
     try {
       const effectiveFolder = (selectedFolder || getProjectMediaFolder(project)).trim();
+      const isNewV2 = destinationTrackId === 'new-v2';
       const { updatedProject, newAsset } = await assignStockMediaToScene({
         project,
         scene,
         mediaItem,
-        trackPreference: stockConfig.targetTrack || 'v2',
+        targetTrackId: isNewV2 ? null : destinationTrackId,
+        trackPreference: isNewV2 ? 'v2' : 'v1',
         projectFolder: effectiveFolder
       });
 
@@ -274,21 +331,52 @@ export function StockMediaSearchModal({
             </div>
             <div>
               <h3 style={{ margin: 0, fontSize: '15px', fontWeight: 600 }}>
-                Buscar B-Roll para [E{scene.sceneNumber}] &ldquo;{scene.title}&rdquo;
+                Buscar B-Roll para [E{scene?.sceneNumber || 1}] &ldquo;{scene?.title || 'Escena'}&rdquo;
               </h3>
               <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '3px', fontSize: '11px', color: 'var(--text-secondary)' }}>
-                <span>Duración escena: <strong>{scene.duration}s</strong></span>
+                <span>Duración escena: <strong>{(scene?.duration || (scene?.endTime ? scene.endTime - (scene?.startTime || 0) : 4.0)).toFixed(1)}s</strong></span>
                 <span>•</span>
-                <span className="timecode">[{scene.startTime}s - {scene.endTime}s]</span>
+                <span className="timecode">
+                  [{Number((scene?.startTime || 0).toFixed(2))}s - {Number((typeof scene?.endTime === 'number' ? scene.endTime : (scene?.startTime || 0) + (scene?.duration || 4.0)).toFixed(2))}s]
+                </span>
                 <span>•</span>
-                <span style={{ color: '#06b6d4', display: 'flex', alignItems: 'center', gap: '4px' }}>
-                  <HardDrive size={11} /> Descarga directa a disco (/projects_media)
+                <span style={{ color: '#06b6d4', display: 'flex', alignItems: 'center', gap: '4px' }} title={`Ruta en disco: ${diskInfo?.mediaDir || 'projects_media'}`}>
+                  <HardDrive size={11} /> Descarga directa a disco
                 </span>
               </div>
             </div>
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            {videoTracks.length > 0 && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '5px', fontSize: '11px', color: 'var(--text-secondary)' }}>
+                <span style={{ fontWeight: 600 }}>Pista destino:</span>
+                <select
+                  value={destinationTrackId || ''}
+                  onChange={(e) => setDestinationTrackId(e.target.value)}
+                  style={{
+                    height: '28px',
+                    padding: '0 8px',
+                    borderRadius: '6px',
+                    fontSize: '11px',
+                    background: 'var(--bg-input)',
+                    color: '#38bdf8',
+                    fontWeight: 600,
+                    border: '1px solid rgba(56, 189, 248, 0.4)'
+                  }}
+                  title="Pista donde se insertará el clip de video"
+                >
+                  <option value="auto">🎯 Auto (Hueco de la escena / Pista activa)</option>
+                  {videoTracks.map(t => (
+                    <option key={t.id} value={t.id}>
+                      {t.name || t.id} ({t.clips?.length || 0} clips)
+                    </option>
+                  ))}
+                  <option value="new-v2">+ Pista V2 (Superposición)</option>
+                </select>
+              </div>
+            )}
+
             <button
               type="button"
               className="btn-secondary btn-xs"
@@ -667,6 +755,16 @@ export function StockMediaSearchModal({
                           <img
                             src={item.thumbnail || item.previewUrl}
                             alt={item.title}
+                            loading="lazy"
+                            referrerPolicy="no-referrer"
+                            crossOrigin="anonymous"
+                            onError={(e) => {
+                              if (item.keyFrames?.[0] && e.target.src !== item.keyFrames[0]) {
+                                e.target.src = item.keyFrames[0];
+                              } else if (item.previewUrl && e.target.src !== item.previewUrl && item.type === 'image') {
+                                e.target.src = item.previewUrl;
+                              }
+                            }}
                             style={{ width: '100%', height: '100%', objectFit: 'cover' }}
                           />
                         )}
@@ -794,7 +892,12 @@ export function StockMediaSearchModal({
             <span>Carpeta de destino:</span>
             {isEditingFolder ? (
               <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                <span style={{ color: 'var(--text-dim)', fontFamily: 'monospace' }}>projects_media/</span>
+                <span
+                  style={{ color: 'var(--text-dim)', fontFamily: 'monospace' }}
+                  title={`Ruta base: ${diskInfo?.mediaDir || 'projects_media'}`}
+                >
+                  {(diskInfo?.mediaDir ? diskInfo.mediaDir.split('/').filter(Boolean).pop() : 'projects_media')}/
+                </span>
                 <input
                   type="text"
                   value={selectedFolder}
@@ -824,8 +927,11 @@ export function StockMediaSearchModal({
               </div>
             ) : (
               <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                <strong style={{ color: '#38bdf8', fontFamily: 'monospace' }}>
-                  projects_media/{selectedFolder}/
+                <strong
+                  style={{ color: '#38bdf8', fontFamily: 'monospace' }}
+                  title={`Ruta completa: ${(diskInfo?.mediaDir || 'projects_media').replace(/\/+$/, '')}/${selectedFolder}/`}
+                >
+                  {(diskInfo?.mediaDir || 'projects_media').replace(/\/+$/, '')}/{selectedFolder}/
                 </strong>
                 <button
                   type="button"

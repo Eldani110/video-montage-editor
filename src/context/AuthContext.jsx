@@ -8,6 +8,7 @@ import {
   onAuthStateChanged
 } from 'firebase/auth';
 import { auth } from '../firebase/config';
+import { loadUserSettings, clearUserSessionSettings } from '../services/userSettingsService';
 
 const AuthContext = createContext(null);
 
@@ -16,17 +17,27 @@ export function AuthProvider({ children }) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    // Timeout safeguard: never block the app for more than 1.2s if Firebase is slow/blocked/offline
+    // Timeout safeguard: never block the app for more than 3.5s if Firebase is slow/blocked/offline
     const timer = setTimeout(() => {
       setLoading(false);
-    }, 1200);
+    }, 3500);
 
     const unsubscribe = onAuthStateChanged(
       auth,
-      (currentUser) => {
+      async (currentUser) => {
         clearTimeout(timer);
         setUser(currentUser);
         setLoading(false);
+        if (currentUser) {
+          try {
+            await loadUserSettings(currentUser);
+          } catch (syncErr) {
+            console.warn('[AuthContext] Error loading user settings from cloud:', syncErr);
+          }
+        } else {
+          // When no user is logged in, immediately wipe any session keys to prevent leakage
+          clearUserSessionSettings();
+        }
       },
       (error) => {
         console.warn('Firebase onAuthStateChanged notice:', error);
@@ -56,6 +67,8 @@ export function AuthProvider({ children }) {
   };
 
   const logout = async () => {
+    clearUserSessionSettings();
+    setUser(null);
     return await signOut(auth);
   };
 
