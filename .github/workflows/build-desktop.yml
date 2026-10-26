@@ -43,21 +43,15 @@ jobs:
 
       - name: Empaquetar instaladores (Linux)
         if: runner.os == 'Linux'
-        run: npx electron-builder --linux deb AppImage
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx electron-builder --linux deb AppImage --publish never
 
       - name: Empaquetar instalador (Windows)
         if: runner.os == 'Windows'
-        run: npx electron-builder --win nsis
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx electron-builder --win nsis --publish never
 
       - name: Empaquetar instalador (macOS)
         if: runner.os == 'macOS'
-        run: npx electron-builder --mac dmg
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx electron-builder --mac dmg --publish never
 
       - name: Subir artefactos de compilación
         uses: actions/upload-artifact@v4
@@ -86,9 +80,8 @@ jobs:
         run: ls -la all-dist/
 
       - name: Publicar Release unificada en GitHub
-        uses: softprops/action-gh-release@v2
-        with:
-          files: all-dist/*
-          generate_release_notes: true
+        run: |
+          gh release upload "${{ github.ref_name }}" all-dist/* --clobber || \
+          gh release create "${{ github.ref_name }}" all-dist/* --title "${{ github.ref_name }}" --generate-notes
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
