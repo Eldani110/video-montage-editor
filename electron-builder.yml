@@ -33,6 +33,7 @@ linux:
   synopsis: Editor de video y montajes profesional
   description: Aplicación de escritorio para edición de secuencias, sincronización de audio y montaje de video.
   icon: build-resources/icon.png
+  artifactName: Montage-Studio-${version}.${ext}
 
 # Windows (10, 11)
 win:
@@ -41,7 +42,7 @@ win:
       arch:
         - x64
   icon: build-resources/icon.ico
-  artifactName: ${productName}-Setup-${version}.${ext}
+  artifactName: Montage-Studio-Setup-${version}.${ext}
 
 nsis:
   oneClick: false
@@ -57,10 +58,15 @@ mac:
     - target: zip
       arch:
         - x64
+    - target: dmg
+      arch:
+        - x64
   category: public.app-category.video
   icon: build-resources/icon.icns
   hardenedRuntime: true
   gatekeeperAssess: false
+  artifactName: Montage-Studio-${version}.${ext}
+
 
 dmg:
   title: Instalador Montage Studio

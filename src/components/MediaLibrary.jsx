@@ -347,16 +347,18 @@ export const MediaLibrary = React.memo(function MediaLibrary({
 
       {/* Assets Container (Premiere Icon View or List View) */}
       <div
-        className="assets-grid"
+        className={`assets-grid ${viewMode === 'list' ? 'is-list-view' : ''}`}
         style={{
           flex: 1,
+          minHeight: 0,
           overflowY: 'auto',
           padding: '8px',
           display: viewMode === 'grid' ? 'grid' : 'flex',
           flexDirection: viewMode === 'list' ? 'column' : undefined,
           gridTemplateColumns: viewMode === 'grid' ? `repeat(auto-fill, minmax(${thumbScale}px, 1fr))` : undefined,
+          gridAutoRows: viewMode === 'grid' ? 'max-content' : undefined,
           alignContent: 'start',
-          gap: '8px',
+          gap: viewMode === 'grid' ? '8px' : '4px',
           background: isDragging ? 'rgba(43, 125, 233, 0.08)' : '#191919'
         }}
       >
@@ -384,7 +386,7 @@ export const MediaLibrary = React.memo(function MediaLibrary({
             return (
               <div
                 key={asset.id}
-                className="asset-card"
+                className={`asset-card ${isSel ? 'is-selected' : ''} ${viewMode === 'list' ? 'is-list' : ''}`}
                 draggable
                 onClick={() => setSelectedAssetId(asset.id)}
                 onDoubleClick={() => onAddToTimeline(asset)}
@@ -402,22 +404,26 @@ export const MediaLibrary = React.memo(function MediaLibrary({
                   window.__draggedAsset = null;
                 }}
                 style={{
-                  background: isSel ? '#363636' : '#232323',
-                  border: isSel ? '1px solid #2b7de9' : '1px solid #121212',
+                  background: isSel ? '#2f3642' : '#232323',
+                  border: isSel ? '1px solid #2b7de9' : '1px solid #1a1a1a',
                   borderRadius: '3px',
                   padding: viewMode === 'list' ? '4px 8px' : '5px',
                   display: 'flex',
                   flexDirection: viewMode === 'list' ? 'row' : 'column',
                   alignItems: viewMode === 'list' ? 'center' : 'stretch',
-                  gap: '5px',
-                  cursor: 'grab'
+                  minHeight: 'fit-content',
+                  gap: viewMode === 'list' ? '8px' : '5px',
+                  cursor: 'grab',
+                  position: 'relative'
                 }}
               >
                 <div
                   className="asset-thumbnail"
                   style={{
-                    height: viewMode === 'list' ? '32px' : '78px',
+                    height: viewMode === 'list' ? '32px' : 'auto',
+                    aspectRatio: '16 / 9',
                     width: viewMode === 'list' ? '56px' : '100%',
+                    minHeight: viewMode === 'list' ? '32px' : '60px',
                     borderRadius: '2px',
                     background: '#111111',
                     position: 'relative',
@@ -426,19 +432,35 @@ export const MediaLibrary = React.memo(function MediaLibrary({
                   }}
                 >
                   {asset.type === 'image' && (
-                    <img src={asset.thumbnail || asset.url} alt={asset.name} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                    <img
+                      src={asset.thumbnail || asset.url}
+                      alt={asset.name}
+                      loading="lazy"
+                      style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
+                    />
                   )}
                   {asset.type === 'audio' && (
-                    <div className="audio-card-preview" style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                      <Music size={22} style={{ color: '#10b981' }} />
+                    <div
+                      className="audio-card-preview"
+                      style={{ height: '100%', width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#121815' }}
+                    >
+                      <Music size={viewMode === 'list' ? 16 : 24} style={{ color: '#10b981' }} />
                     </div>
                   )}
                   {asset.type === 'video' && (
                     asset.thumbnail ? (
-                      <img src={asset.thumbnail} alt={asset.name} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                      <img
+                        src={asset.thumbnail}
+                        alt={asset.name}
+                        loading="lazy"
+                        style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
+                      />
                     ) : (
-                      <div className="video-card-preview" style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                        <Film size={22} style={{ color: '#3898ff' }} />
+                      <div
+                        className="video-card-preview"
+                        style={{ height: '100%', width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#12141a' }}
+                      >
+                        <Film size={viewMode === 'list' ? 16 : 24} style={{ color: '#3898ff' }} />
                       </div>
                     )
                   )}
@@ -447,21 +469,24 @@ export const MediaLibrary = React.memo(function MediaLibrary({
                   <div
                     style={{
                       position: 'absolute',
-                      right: '4px',
-                      bottom: '4px',
-                      background: 'rgba(17, 17, 17, 0.85)',
-                      border: '1px solid rgba(56, 152, 255, 0.45)',
+                      right: '3px',
+                      bottom: '3px',
+                      background: 'rgba(12, 12, 12, 0.88)',
+                      border: '1px solid rgba(255, 255, 255, 0.12)',
                       borderRadius: '2px',
                       padding: '1px 3px',
                       display: 'inline-flex',
                       alignItems: 'center',
                       gap: '2px',
-                      color: '#3898ff'
+                      color: asset.type === 'audio' ? '#10b981' : (asset.type === 'image' ? '#c084fc' : '#3898ff'),
+                      fontSize: '9px',
+                      lineHeight: 1,
+                      pointerEvents: 'none'
                     }}
                   >
-                    {asset.type === 'video' && <Film size={10} />}
-                    {asset.type === 'image' && <ImageIcon size={10} />}
-                    {asset.type === 'audio' && <Music size={10} style={{ color: '#10b981' }} />}
+                    {asset.type === 'video' && <Film size={9} />}
+                    {asset.type === 'image' && <ImageIcon size={9} />}
+                    {asset.type === 'audio' && <Music size={9} />}
                   </div>
                 </div>
 
@@ -472,37 +497,50 @@ export const MediaLibrary = React.memo(function MediaLibrary({
                   justifyContent: 'space-between',
                   gap: '4px',
                   minWidth: 0,
-                  flex: 1
+                  flex: 1,
+                  padding: viewMode === 'list' ? 0 : '1px 2px 0 2px'
                 }}>
                   <span
                     className="asset-title"
                     title={asset.name}
                     style={{
                       fontSize: '11px',
-                      color: '#dcdcdc',
+                      color: isSel ? '#ffffff' : '#dcdcdc',
                       fontWeight: 400,
                       whiteSpace: 'nowrap',
                       overflow: 'hidden',
-                      textOverflow: 'ellipsis'
+                      textOverflow: 'ellipsis',
+                      flex: 1
                     }}
                   >
                     {asset.name}
                   </span>
                   <span style={{
                     fontFamily: 'var(--font-mono)',
-                    fontSize: '10.5px',
-                    color: '#9e9e9e',
+                    fontSize: '10px',
+                    color: '#8e8e8e',
                     flexShrink: 0
                   }}>
                     {formatShortDuration(asset.duration)}
                   </span>
                 </div>
 
-                <div className="asset-card-actions" style={{ top: '6px', right: '6px' }}>
+                <div
+                  className="asset-card-actions"
+                  style={viewMode === 'grid' ? {
+                    position: 'absolute',
+                    top: '8px',
+                    right: '8px',
+                    zIndex: 6
+                  } : {
+                    marginLeft: 'auto'
+                  }}
+                >
                   <button
                     className="btn-ghost icon-only btn-sm"
                     title="Insertar en secuencia"
                     onClick={(e) => { e.stopPropagation(); onAddToTimeline(asset); }}
+                    style={{ width: '20px', height: '20px', padding: 0 }}
                   >
                     <Plus size={13} style={{ color: '#3898ff' }} />
                   </button>
@@ -510,6 +548,7 @@ export const MediaLibrary = React.memo(function MediaLibrary({
                     className="btn-ghost icon-only btn-sm text-dim"
                     title="Eliminar del Bin"
                     onClick={(e) => { e.stopPropagation(); onDeleteAsset(asset.id); }}
+                    style={{ width: '20px', height: '20px', padding: 0 }}
                   >
                     <Trash2 size={12} />
                   </button>

@@ -10,8 +10,8 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: Compilar para ${{ matrix.os }}
+  build-and-publish:
+    name: Compilar y Publicar para ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
 
     strategy:
@@ -41,54 +41,20 @@ jobs:
       - name: Compilar frontend Vite
         run: npm run build
 
-      - name: Empaquetar instaladores (Linux)
+      - name: Empaquetar y Publicar en GitHub Releases (Linux)
         if: runner.os == 'Linux'
-        run: npx electron-builder --linux deb AppImage
+        run: npx electron-builder --linux deb AppImage --publish always
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Empaquetar instalador (Windows)
+      - name: Empaquetar y Publicar en GitHub Releases (Windows)
         if: runner.os == 'Windows'
-        run: npx electron-builder --win nsis
+        run: npx electron-builder --win nsis --publish always
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Empaquetar instalador (macOS)
+      - name: Empaquetar y Publicar en GitHub Releases (macOS)
         if: runner.os == 'macOS'
-        run: npx electron-builder --mac dmg
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Subir artefactos de compilación
-        uses: actions/upload-artifact@v4
-        with:
-          name: installers-${{ matrix.os }}
-          path: |
-            release/*.*
-            release/*.yml
-            release/*.blockmap
-          if-no-files-found: warn
-
-  publish:
-    name: Publicar Release Oficial en GitHub
-    needs: build
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
-
-    steps:
-      - name: Descargar todos los instaladores compilados
-        uses: actions/download-artifact@v4
-        with:
-          path: all-dist
-          merge-multiple: true
-
-      - name: Listar archivos para release
-        run: ls -la all-dist/
-
-      - name: Publicar Release unificada en GitHub
-        uses: softprops/action-gh-release@v2
-        with:
-          files: all-dist/*
-          generate_release_notes: true
+        run: npx electron-builder --mac dmg --publish always
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
