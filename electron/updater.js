@@ -93,17 +93,29 @@ export function setupAutoUpdater(mainWindow) {
     }
     try {
       sendStatus({ status: 'checking', error: null });
-      const result = await autoUpdater.checkForUpdates();
-      return { success: true, result };
+      const checkResult = await autoUpdater.checkForUpdates();
+      return {
+        success: true,
+        version: checkResult?.updateInfo?.version || null,
+        files: checkResult?.updateInfo?.files?.map(f => f.url) || []
+      };
     } catch (err) {
-      sendStatus({ status: 'error', error: err.message });
-      return { success: false, error: err.message };
+      const errMsg = err?.message || String(err);
+      console.warn('[AutoUpdater] Error en comprobación manual:', errMsg);
+      sendStatus({ status: 'error', error: errMsg });
+      return { success: false, error: errMsg };
     }
   });
 
   ipcMain.handle('updater:install', () => {
     console.log('[AutoUpdater] Aplicando actualización y reiniciando aplicación...');
-    autoUpdater.quitAndInstall(false, true);
+    try {
+      autoUpdater.quitAndInstall(false, true);
+      return { success: true };
+    } catch (err) {
+      console.error('[AutoUpdater] Error al aplicar actualización:', err);
+      return { success: false, error: err?.message || String(err) };
+    }
   });
 
   ipcMain.handle('app:version', () => {
@@ -111,7 +123,7 @@ export function setupAutoUpdater(mainWindow) {
   });
 
   ipcMain.handle('updater:getStatus', () => {
-    return updateStatus;
+    return { ...updateStatus };
   });
 
   // Auto-check 8 seconds after window startup in packaged production releases

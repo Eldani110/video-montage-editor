@@ -77,12 +77,26 @@ export function GlobalSettingsModal({ isOpen, onClose }) {
   const [appVersion, setAppVersion] = useState('1.0.0');
   const [checkingUpdates, setCheckingUpdates] = useState(false);
   const [updateCheckResult, setUpdateCheckResult] = useState(null);
+  const [liveUpdateStatus, setLiveUpdateStatus] = useState(null);
 
   useEffect(() => {
     if (typeof window !== 'undefined' && window.electronAPI?.getAppVersion) {
       window.electronAPI.getAppVersion().then(v => {
         if (v) setAppVersion(v);
       }).catch(() => {});
+    }
+    if (typeof window !== 'undefined' && window.electronAPI?.getUpdateStatus) {
+      window.electronAPI.getUpdateStatus().then(st => {
+        if (st) setLiveUpdateStatus(st);
+      }).catch(() => {});
+    }
+    if (typeof window !== 'undefined' && window.electronAPI?.onUpdateStatus) {
+      const unsub = window.electronAPI.onUpdateStatus(data => {
+        if (data) setLiveUpdateStatus(data);
+      });
+      return () => {
+        if (typeof unsub === 'function') unsub();
+      };
     }
   }, []);
 
@@ -106,7 +120,9 @@ export function GlobalSettingsModal({ isOpen, onClose }) {
       } else if (res?.success) {
         setUpdateCheckResult({
           type: 'success',
-          message: 'Petición enviada. Si existe una versión más reciente, comenzará a descargarse en segundo plano.'
+          message: res.version
+            ? `Versión encontrada en GitHub Releases: v${res.version}. Si es más reciente que v${appVersion}, se descargará automáticamente.`
+            : 'Comprobación enviada a GitHub Releases con éxito. Si hay una nueva versión, se descargará en segundo plano.'
         });
       } else {
         setUpdateCheckResult({
@@ -117,7 +133,7 @@ export function GlobalSettingsModal({ isOpen, onClose }) {
     } catch (err) {
       setUpdateCheckResult({
         type: 'error',
-        message: err.message || 'Error al conectar con GitHub Releases'
+        message: err?.message || 'Error al conectar con GitHub Releases'
       });
     } finally {
       setCheckingUpdates(false);
@@ -1305,6 +1321,53 @@ export function GlobalSettingsModal({ isOpen, onClose }) {
                     {checkingUpdates ? 'Buscando...' : 'Buscar Actualizaciones'}
                   </button>
                 </div>
+
+                {liveUpdateStatus?.status === 'downloading' && (
+                  <div style={{ marginTop: '14px', padding: '12px', background: 'rgba(99, 102, 241, 0.08)', borderRadius: '6px', border: '1px solid rgba(99, 102, 241, 0.25)' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11.5px', color: '#c7d2fe', marginBottom: '6px' }}>
+                      <span>Descargando actualización en segundo plano...</span>
+                      <strong>{liveUpdateStatus.progress || 0}%</strong>
+                    </div>
+                    <div style={{ width: '100%', height: '6px', background: 'rgba(255,255,255,0.1)', borderRadius: '3px', overflow: 'hidden' }}>
+                      <div style={{ width: `${liveUpdateStatus.progress || 0}%`, height: '100%', background: 'linear-gradient(90deg, #6366f1, #06b6d4)', transition: 'width 0.2s' }} />
+                    </div>
+                  </div>
+                )}
+
+                {liveUpdateStatus?.status === 'downloaded' && (
+                  <div style={{
+                    marginTop: '14px',
+                    padding: '12px 14px',
+                    borderRadius: '6px',
+                    background: 'rgba(16, 185, 129, 0.15)',
+                    border: '1px solid rgba(16, 185, 129, 0.35)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: '12px'
+                  }}>
+                    <span style={{ fontSize: '12.5px', color: '#6ee7b7', fontWeight: 500 }}>
+                      ¡Nueva versión v{liveUpdateStatus.newVersion} descargada y lista para aplicar!
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => window.electronAPI?.quitAndInstallUpdate && window.electronAPI.quitAndInstallUpdate()}
+                      style={{
+                        padding: '6px 14px',
+                        background: '#10b981',
+                        color: '#fff',
+                        border: 'none',
+                        borderRadius: '4px',
+                        fontWeight: 600,
+                        fontSize: '11.5px',
+                        cursor: 'pointer',
+                        whiteSpace: 'nowrap'
+                      }}
+                    >
+                      Reiniciar y Actualizar
+                    </button>
+                  </div>
+                )}
 
                 {updateCheckResult && (
                   <div style={{
