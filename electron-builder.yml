@@ -21,6 +21,7 @@ files:
 
 # Linux (Kubuntu, Ubuntu, Debian, etc.)
 linux:
+  executableName: video-montage-editor
   target:
     - target: deb
       arch:
